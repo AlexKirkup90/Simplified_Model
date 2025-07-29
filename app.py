@@ -5,16 +5,17 @@ import traceback
 # --- Page Configuration ---
 st.set_page_config(
     layout="wide",
-    page_title="Momentum Portfolio Generator"
+    page_title="Optimal Momentum Portfolio Generator"
 )
 
 # --- App UI ---
-st.title("🚀 Long-Only Momentum Portfolio Generator")
+st.title("🚀 Optimal Momentum Portfolio Generator")
 st.markdown("""
-This application generates a portfolio based on our validated **long-only momentum** strategy, which proved to be the most robust model in backtesting.
-- **Universe:** NASDAQ 100+
-- **Strategy:** Each month, it identifies the top 10 stocks with the highest 6-month price momentum.
-- **Allocation:** The model recommends an equal weight for each stock in the portfolio.
+This application generates a portfolio based on the **Momentum-Score (25% Cap)** strategy, which was the winning model from our rigorous backtesting process.
+
+- **Strategy:** Ranks NASDAQ 100+ stocks by 6-month momentum and weights the top 10 based on their score, with a 25% cap on any single stock.
+- **Result:** This approach aims to "let winners run" while maintaining a prudent level of diversification.
+
 Click the button below to get the recommended portfolio for the upcoming month.
 """)
 
