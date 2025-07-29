@@ -1,38 +1,62 @@
 import streamlit as st
-import backend  # Our final backend.py file
+import backend
 import traceback
+from datetime import date
 
 # --- Page Configuration ---
 st.set_page_config(
     layout="wide",
-    page_title="Optimal Momentum Portfolio Generator"
+    page_title="Optimal Momentum Portfolio Manager"
 )
 
 # --- App UI ---
-st.title("🚀 Optimal Momentum Portfolio Generator")
-st.markdown("""
-This application generates a portfolio based on the **Momentum-Score (25% Cap)** strategy, which was the winning model from our rigorous backtesting process.
+st.title("🚀 Optimal Momentum Portfolio Manager")
+st.markdown("This application generates a new momentum portfolio and shows you the exact trades needed to rebalance from your previous portfolio.")
 
-- **Strategy:** Ranks NASDAQ 100+ stocks by 6-month momentum and weights the top 10 based on their score, with a 25% cap on any single stock.
-- **Result:** This approach aims to "let winners run" while maintaining a prudent level of diversification.
+# --- Monthly Reminder ---
+if 'last_run' not in st.session_state:
+    st.session_state.last_run = None
+today = date.today()
+if today.day <= 5 and st.session_state.last_run != today:
+    st.info("🔔 It's the start of the month—time for your portfolio review!")
 
-Click the button below to get the recommended portfolio for the upcoming month.
-""")
-
-# --- Button and Backend Logic ---
-if st.button("Generate Live Portfolio", type="primary", use_container_width=True):
+# --- Main Logic ---
+if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_container_width=True):
+    st.session_state.last_run = today
+    
     with st.spinner("Generating portfolio... This may take a moment."):
         try:
-            # Call the backend function to get the live portfolio
-            portfolio_df = backend.generate_live_portfolio()
+            prev_portfolio = backend.load_previous_portfolio()
+            new_portfolio_display, new_portfolio_raw = backend.generate_live_portfolio()
 
-            # Display the result if successful
-            if portfolio_df is not None and not portfolio_df.empty:
-                st.subheader("✅ Recommended Portfolio Allocation")
-                st.dataframe(portfolio_df, use_container_width=True)
-                st.success("Portfolio generation complete. These are the recommended holdings for the next month.")
+            if new_portfolio_raw is not None and not new_portfolio_raw.empty:
+                st.subheader("📊 Rebalancing Plan")
+                signals = backend.diff_portfolios(prev_portfolio, new_portfolio_raw)
+
+                if not any(signals.values()):
+                    st.success("✅ No changes needed—your portfolio is up to date!")
+                else:
+                    cols = st.columns(3)
+                    with cols[0]:
+                        if signals['sell']:
+                            st.error("🔴 Sell Completely")
+                            for ticker in signals['sell']:
+                                st.markdown(f"- **{ticker}**")
+                    with cols[1]:
+                        if signals['buy']:
+                            st.success("🟢 New Buys")
+                            for ticker in signals['buy']:
+                                weight = new_portfolio_raw.at[ticker, 'Weight']
+                                st.markdown(f"- **{ticker}** (Target: {weight:.2%})")
+                    with cols[2]:
+                        if signals['rebalance']:
+                            st.info("🔄 Rebalance")
+                            for ticker, old_w, new_w in signals['rebalance']:
+                                st.markdown(f"- **{ticker}**: {old_w:.2%} → **{new_w:.2%}**")
+
+                st.subheader("✅ New Target Portfolio")
+                st.dataframe(new_portfolio_display, use_container_width=True)
             else:
-                # The backend will show specific warnings/errors. This is a fallback.
                 st.error("Portfolio generation failed. Please see messages above for details.")
 
         except Exception as e:
