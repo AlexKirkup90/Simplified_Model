@@ -35,10 +35,9 @@ def fetch_market_data(tickers, start_date, end_date):
 
 # --- Live Portfolio Generation ---
 
-def generate_live_portfolio(momentum_window=6, top_n=10):
+def generate_live_portfolio(momentum_window=6, top_n=10, cap=0.25):
     """
-    Calculates the current top N momentum stocks to hold for the upcoming month.
-    This is the "long_only" strategy.
+    Calculates the live portfolio based on the Momentum-Score (25% Cap) strategy.
     """
     st.info("Fetching the latest market data...")
     
@@ -47,8 +46,7 @@ def generate_live_portfolio(momentum_window=6, top_n=10):
     if not universe:
         return pd.DataFrame()
 
-    # 2. Fetch recent price data
-    # We need ~7 months of data to calculate 6-month momentum.
+    # 2. Fetch recent price data (we need ~7 months for 6-month momentum)
     start_date = (datetime.today() - relativedelta(months=momentum_window + 1)).strftime('%Y-%m-%d')
     end_date = datetime.today().strftime('%Y-%m-%d')
     
@@ -61,33 +59,37 @@ def generate_live_portfolio(momentum_window=6, top_n=10):
     st.info("Calculating momentum scores...")
     monthly_prices = prices.resample('M').last()
     
-    # Check if we have enough monthly data points
     if len(monthly_prices) < momentum_window:
-        st.warning(f"Not enough data for a {momentum_window}-month lookback. Need at least {momentum_window} months of data.")
+        st.warning(f"Not enough data for a {momentum_window}-month lookback.")
         return pd.DataFrame()
 
     momentum = monthly_prices.pct_change(periods=momentum_window)
-    
-    # Get the most recent momentum scores available
     latest_momentum = momentum.iloc[-1].dropna()
     
     if latest_momentum.empty:
         st.warning("Could not calculate momentum scores.")
         return pd.DataFrame()
 
-    # 4. Select the top N stocks
-    st.info(f"Selecting the top {top_n} stocks...")
-    top_performers = latest_momentum.nlargest(top_n)
+    # 4. Select top N stocks with positive momentum
+    st.info(f"Selecting the top {top_n} stocks with positive momentum...")
+    positive_momentum = latest_momentum[latest_momentum > 0]
+    top_performers = positive_momentum.nlargest(top_n)
 
-    # 5. Format the output
-    portfolio_df = pd.DataFrame(top_performers)
-    portfolio_df.columns = ['6-Month Momentum']
-    portfolio_df['Weight'] = 1 / top_n # Assign equal weight
+    if top_performers.empty:
+        st.warning("No stocks with positive momentum found. Recommending cash.")
+        return pd.DataFrame()
+
+    # 5. Calculate weights using the Momentum-Score Capped method
+    st.info("Calculating portfolio weights...")
+    weights = top_performers / top_performers.sum()
+    weights = weights.clip(upper=cap) # Apply the 25% cap
+    weights = weights / weights.sum() # Re-normalize weights to sum to 1
+
+    # 6. Format the output DataFrame
+    portfolio_df = pd.DataFrame(weights, columns=['Weight'])
+    portfolio_df['6-Month Momentum'] = top_performers
     
-    # Reorder columns for display
     portfolio_df = portfolio_df[['Weight', '6-Month Momentum']]
-    
-    # Format for display
     portfolio_df['Weight'] = portfolio_df['Weight'].map('{:.2%}'.format)
     portfolio_df['6-Month Momentum'] = portfolio_df['6-Month Momentum'].map('{:.2%}'.format)
     
