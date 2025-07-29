@@ -3,9 +3,22 @@ import backend
 import traceback
 from datetime import date
 import numpy as np
+import yfinance as yf
 
 # --- Page Configuration ---
 st.set_page_config(layout="wide", page_title="Momentum Portfolio V2")
+
+# --- Volatility Check Function ---
+def check_volatility_override():
+    try:
+        qqq = yf.download("QQQ", period="15d", interval="1d", auto_adjust=True)["Close"]
+        daily_returns = qqq.pct_change().dropna()
+        vol = daily_returns.std()
+        if vol > 0.025:  # 2.5% daily volatility (~40% annualized)
+            return True, f"{vol:.2%}"
+        return False, f"{vol:.2%}"
+    except:
+        return False, "N/A"
 
 # --- V2: Sidebar Controls ---
 st.sidebar.header("⚙️ V2 Strategy Parameters")
@@ -24,6 +37,11 @@ if 'last_run' not in st.session_state:
 today = date.today()
 if today.day <= 5 and st.session_state.last_run != today:
     st.info("🔔 It's the start of the month—time for your portfolio review!")
+
+# --- Volatility-Aware Override Notification ---
+should_override, qqq_vol = check_volatility_override()
+if should_override:
+    st.warning(f"⚠️ High market volatility detected (QQQ 10-day vol = {qqq_vol}). Consider overriding model settings (e.g., shorter lookback or more frequent rebalancing).")
 
 # --- Main Logic ---
 if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_container_width=True):
@@ -45,11 +63,11 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     st.success(f"✅ No major rebalancing needed! Average weight shift was only {avg_shift:.2%}.")
                 else:
                     cols = st.columns(3)
-                    # Display rebalancing plan...
                     with cols[0]:
                         if signals['sell']:
                             st.error("🔴 Sell Completely")
-                            for ticker in signals['sell']: st.markdown(f"- **{ticker}**")
+                            for ticker in signals['sell']:
+                                st.markdown(f"- **{ticker}**")
                     with cols[1]:
                         if signals['buy']:
                             st.success("🟢 New Buys")
