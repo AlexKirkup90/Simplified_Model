@@ -4,6 +4,8 @@ import traceback
 from datetime import date
 import numpy as np
 import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
 
 # --- Page Configuration ---
 st.set_page_config(layout="wide", page_title="Momentum Portfolio V2")
@@ -11,14 +13,13 @@ st.set_page_config(layout="wide", page_title="Momentum Portfolio V2")
 # --- Volatility Check Function ---
 def check_volatility_override():
     try:
-        qqq = yf.download("QQQ", period="15d", interval="1d", auto_adjust=True)["Close"]
+        qqq = yf.download("QQQ", period="30d", interval="1d", auto_adjust=True)["Close"]
         daily_returns = qqq.pct_change().dropna()
-        vol = daily_returns.std()
-        if vol > 0.025:  # 2.5% daily volatility (~40% annualized)
-            return True, f"{vol:.2%}"
-        return False, f"{vol:.2%}"
+        vol_series = daily_returns.rolling(window=10).std().dropna()
+        current_vol = vol_series.iloc[-1]
+        return current_vol > 0.025, f"{current_vol:.2%}", vol_series
     except:
-        return False, "N/A"
+        return False, "N/A", pd.Series(dtype=float)
 
 # --- V2: Sidebar Controls ---
 st.sidebar.header("⚙️ V2 Strategy Parameters")
@@ -39,9 +40,23 @@ if today.day <= 5 and st.session_state.last_run != today:
     st.info("🔔 It's the start of the month—time for your portfolio review!")
 
 # --- Volatility-Aware Override Notification ---
-should_override, qqq_vol = check_volatility_override()
+should_override, qqq_vol, vol_series = check_volatility_override()
 if should_override:
     st.warning(f"⚠️ High market volatility detected (QQQ 10-day vol = {qqq_vol}). Consider overriding model settings (e.g., shorter lookback or more frequent rebalancing).")
+else:
+    st.info(f"✅ Market volatility is within normal range (QQQ 10-day vol = {qqq_vol}).")
+
+# --- Visualize Volatility Plot ---
+if not vol_series.empty:
+    st.subheader("📉 10-Day Rolling Volatility of QQQ (Past 30 Days)")
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(vol_series.index, vol_series.values, label='10-Day Rolling Volatility')
+    ax.axhline(y=0.025, color='red', linestyle='--', label='Override Trigger (2.5%)')
+    ax.set_ylabel("Daily Volatility")
+    ax.set_xlabel("Date")
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.5)
+    st.pyplot(fig)
 
 # --- Main Logic ---
 if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_container_width=True):
