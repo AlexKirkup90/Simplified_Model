@@ -33,8 +33,9 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 st.subheader("📊 Rebalancing Plan")
                 signals = backend.diff_portfolios(prev_portfolio, new_portfolio_raw)
 
-                if not any(signals.values()):
-                    st.success("✅ No changes needed—your portfolio is up to date!")
+                # UI POLISH: Use a more positive message for no-change months.
+                if not any(s for s in signals.values()):
+                    st.success("✅ No changes needed this month—your portfolio is perfectly balanced!")
                 else:
                     cols = st.columns(3)
                     with cols[0]:
