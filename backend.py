@@ -14,7 +14,7 @@ GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}"
 HEADERS = {'Authorization': f'token {GITHUB_TOKEN}'}
 FILENAME = 'portfolio.json'
 
-# --- Data Fetching (Unchanged) ---
+# --- Data Fetching ---
 @st.cache_data(ttl=86400)
 def get_nasdaq_100_plus_tickers():
     try:
@@ -75,7 +75,9 @@ def generate_live_portfolio(momentum_window=6, top_n=10, cap=0.25):
     
     # Save the raw weights to the Gist
     try:
-        data_to_save = {'files': {FILENAME: {'content': portfolio_df.to_json()}}}
+        # BUG FIX: Use orient="index" to save the tickers as the primary index
+        json_content = portfolio_df.to_json(orient="index")
+        data_to_save = {'files': {FILENAME: {'content': json_content}}}
         response = requests.patch(GIST_API_URL, headers=HEADERS, json=data_to_save)
         response.raise_for_status()
         st.sidebar.success("Successfully saved portfolio for next month's comparison.")
@@ -99,11 +101,11 @@ def load_previous_portfolio():
         gist_content = response.json()['files'][FILENAME]['content']
         if not gist_content or gist_content == '{}':
             return pd.DataFrame(columns=['Weight'])
-        # Load from JSON string
-        prev_portfolio = pd.read_json(gist_content)
+        # BUG FIX: Use orient="index" to correctly load the JSON
+        prev_portfolio = pd.read_json(gist_content, orient="index")
         return prev_portfolio
     except Exception as e:
-        st.sidebar.warning(f"Could not load previous portfolio. Assuming no prior positions. (Error: {e})")
+        st.sidebar.warning(f"Could not load previous portfolio. (Error: {e})")
         return pd.DataFrame(columns=['Weight'])
 
 def diff_portfolios(prev_df, curr_df, tol=0.01):
