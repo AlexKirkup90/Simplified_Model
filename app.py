@@ -2,12 +2,10 @@ import streamlit as st
 import backend
 import traceback
 from datetime import date
+import numpy as np
 
 # --- Page Configuration ---
-st.set_page_config(
-    layout="wide",
-    page_title="Optimal Momentum Portfolio Manager"
-)
+st.set_page_config(layout="wide", page_title="Optimal Momentum Portfolio Manager")
 
 # --- App UI ---
 st.title("🚀 Optimal Momentum Portfolio Manager")
@@ -33,9 +31,12 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 st.subheader("📊 Rebalancing Plan")
                 signals = backend.diff_portfolios(prev_portfolio, new_portfolio_raw)
 
-                # UI POLISH: Use a more positive message for no-change months.
                 if not any(s for s in signals.values()):
-                    st.success("✅ No changes needed this month—your portfolio is perfectly balanced!")
+                    # ENHANCED: Calculate average weight shift for the "no-change" message
+                    avg_shift = 0
+                    if 'rebalance' in signals and signals['rebalance']:
+                         avg_shift = np.mean([abs(new - old) for _, old, new in signals['rebalance']])
+                    st.success(f"✅ No major rebalancing needed this month! Average weight shift was only {avg_shift:.2%}.")
                 else:
                     cols = st.columns(3)
                     with cols[0]:
