@@ -6,3 +6,4 @@ matplotlib
 requests
 lxml
 quantstats
+IPython
