@@ -194,8 +194,11 @@ def run_backtest_for_app(momentum_window, top_n, cap):
     
     prices = fetch_market_data(all_tickers, start_date, end_date)
     if prices.empty or 'QQQ' not in prices.columns: return None, None
+    
+    # --- FIX: Only use tickers that were successfully downloaded ---
+    valid_universe_tickers = [ticker for ticker in universe if ticker in prices.columns]
         
-    daily_prices = prices[universe]
+    daily_prices = prices[valid_universe_tickers]
     qqq_prices = prices['QQQ']
 
     # Run both strategies
