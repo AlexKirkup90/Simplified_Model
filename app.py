@@ -1,4 +1,7 @@
 import streamlit as st
+import sys
+st.write(f"This app is using Python from: {sys.executable}")
+import streamlit as st
 import backend
 import traceback
 import yfinance as yf
