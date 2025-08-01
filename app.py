@@ -37,14 +37,13 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
             tab1, tab2, tab3, tab4 = st.tabs(["📊 Rebalancing Plan", "✅ New Portfolio", "📈 Performance Chart", "📉 Market Volatility"])
 
             if new_portfolio_raw is not None and not new_portfolio_raw.empty:
-                with tab1: # Rebalancing Plan
+                with tab1:
                     st.subheader("Rebalancing Plan")
                     signals = backend.diff_portfolios(prev_portfolio, new_portfolio_raw, tol)
                     if not any(s for s in signals.values()):
                          st.success("✅ No major rebalancing needed!")
                     else:
                         cols = st.columns(3)
-                        # Display signals...
                         with cols[0]:
                             if signals['sell']:
                                 st.error("🔴 Sell Completely")
@@ -61,13 +60,13 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                                 for ticker, old_w, new_w in signals['rebalance']:
                                     st.markdown(f"- **{ticker}**: {old_w:.2%} → **{new_w:.2%}**")
 
-                with tab2: # New Portfolio
+                with tab2:
                     st.subheader("New Target Portfolio")
                     st.dataframe(new_portfolio_display, use_container_width=True)
                     st.subheader("Portfolio Weights Visualized")
                     st.bar_chart(new_portfolio_raw['Weight'])
 
-                with tab3: # Performance Chart
+                with tab3:
                     st.subheader(f"Backtest: Your Strategy vs. QQQ (Since 2018)")
                     if strategy_perf is not None and qqq_perf is not None:
                         fig, ax = plt.subplots(figsize=(10, 5))
@@ -81,12 +80,19 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     else:
                         st.warning("Could not generate backtest chart.")
 
-                with tab4: # Market Volatility
+                with tab4:
                     st.subheader("QQQ 10-Day Rolling Volatility")
                     try:
-                        qqq_vol_data = yf.download("QQQ", period="60d", auto_adjust=True)['Close']
-                        vol_series = qqq_vol_data.pct_change().rolling(window=10).std().dropna()
+                        qqq_vol_data = yf.download("QQQ", period="60d", auto_adjust=True)
+                        
+                        # Ensure we are working with the 'Close' price Series
+                        qqq_close_prices = qqq_vol_data['Close']
+                        
+                        vol_series = qqq_close_prices.pct_change().rolling(window=10).std().dropna()
+                        
+                        # BUG FIX: Extract the single scalar value using .item()
                         current_vol = vol_series.iloc[-1]
+                        
                         if current_vol > 0.025:
                             st.warning(f"High market volatility detected: {current_vol:.2%}")
                         else:
@@ -101,7 +107,6 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     except Exception as e:
                         st.error(f"Could not fetch volatility data: {e}")
 
-                # V3: Add explicit save button to sidebar
                 st.session_state.latest_portfolio = new_portfolio_raw
             else:
                 st.error("Portfolio generation failed. Please see messages above.")
@@ -110,7 +115,7 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
             st.error(f"An unexpected error occurred: {e}")
             st.code(traceback.format_exc())
 
-# V3: Logic for the save button
+# Logic for the save button
 if 'latest_portfolio' in st.session_state and not st.session_state.latest_portfolio.empty:
     st.sidebar.header("💾 Save Portfolio")
     if st.sidebar.button("Save this portfolio for next month"):
