@@ -55,21 +55,34 @@ def cap_weights(weights: pd.Series, cap: float = 0.25) -> pd.Series:
             w[under_cap] += w[under_cap] / w[under_cap].sum() * excess_weight
     return w
 
+import quantstats as qs
+import pandas as pd
+
 def get_performance_metrics(returns: pd.Series) -> dict:
     """Calculates a dictionary of advanced performance metrics using quantstats."""
     if not isinstance(returns, pd.Series) or returns.empty or returns.isnull().all() or len(returns) < 2:
-        return {'Annual Return': 'N/A', 'Sharpe Ratio': 'N/A', 'Max Drawdown': 'N/A', 'Sortino Ratio': 'N/A', 'Calmar Ratio': 'N/A'}
+        return {'Annual Return': 'N/A', 'Sharpe Ratio': 'N/A', 'Max Drawdown': 'N/A',
+                'Sortino Ratio': 'N/A', 'Calmar Ratio': 'N/A'}
     
-    # QuantStats requires returns as a simple Series, not percentages
-    # Ensure monthly frequency is set for correct annualization
-    returns.index = returns.index.to_period('M')
+    # --- FIX: Use correct arguments for quantstats functions ---
+    
+    # The cagr function automatically annualizes based on the dates in the index
+    annual_return = qs.stats.cagr(returns)
+    
+    # For sharpe and sortino, specify periods per year for annualization (12 for monthly)
+    sharpe_ratio = qs.stats.sharpe(returns, periods=12)
+    sortino_ratio = qs.stats.sortino(returns, periods=12)
+    
+    # Calmar and max_drawdown don't require period arguments
+    calmar_ratio = qs.stats.calmar(returns)
+    max_drawdown = qs.stats.max_drawdown(returns)
     
     return {
-        'Annual Return': f"{qs.stats.cagr(returns, period='monthly'):.2%}",
-        'Sharpe Ratio': f"{qs.stats.sharpe(returns, period='monthly'):.2f}",
-        'Sortino Ratio': f"{qs.stats.sortino(returns, period='monthly'):.2f}",
-        'Calmar Ratio': f"{qs.stats.calmar(returns):.2f}",
-        'Max Drawdown': f"{qs.stats.max_drawdown(returns):.2%}"
+        'Annual Return': f"{annual_return:.2%}",
+        'Sharpe Ratio': f"{sharpe_ratio:.2f}",
+        'Sortino Ratio': f"{sortino_ratio:.2f}",
+        'Calmar Ratio': f"{calmar_ratio:.2f}",
+        'Max Drawdown': f"{max_drawdown:.2%}"
     }
 
 # --- Strategy Implementation Functions ---
