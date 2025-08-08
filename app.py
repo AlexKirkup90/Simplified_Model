@@ -309,6 +309,38 @@ with tab4:
 
         st.markdown("**Breadth (share of tickers with positive 6-month return):** "
                     f"{metrics.get('breadth_pos_6m', np.nan)*100:.1f}%")
+        # === Regime Advice (simple, opinionated rules) ===
+try:
+    label, m = backend.get_market_regime()
+    breadth = float(m.get("breadth_pos_6m", np.nan))      # share > 0 means 0..1
+    vol10   = float(m.get("qqq_vol_10d", np.nan))          # daily vol (std)
+    qqq_abv = bool(m.get("qqq_above_200dma", 0.0) >= 1.0)  # True/False
+
+    # Default recommendations (you can tweak thresholds)
+    target_equity = 1.0
+    headline = "Risk-On — full equity allocation recommended."
+    box = st.success
+
+    # Extreme risk-off: trend weak + breadth poor OR volatility spike while below 200DMA
+    if ((not qqq_abv and (breadth < 0.35)) or (vol10 > 0.035 and not qqq_abv)):
+        target_equity = 0.0
+        headline = "Extreme Risk-Off — consider 100% cash."
+        box = st.error
+
+    # Plain risk-off: either below 200DMA or weak breadth
+    elif (not qqq_abv) or (breadth < 0.45):
+        target_equity = 0.50
+        headline = "Risk-Off — scale to ~50% equity / 50% cash."
+        box = st.warning
+
+    box(
+        f"**Regime advice:** {headline}  \n"
+        f"**Targets:** equity **{target_equity*100:.0f}%**, cash **{(1-target_equity)*100:.0f}%**.  \n"
+        f"_Context — Breadth (6m>0): {breadth:.0%} • 10-day vol: {vol10:.2%} • QQQ >200DMA: {'Yes' if qqq_abv else 'No'}_"
+    )
+    st.caption("Note: The ISA Dynamic preset already scales exposure automatically; use this as a sanity check for monthly decisions.")
+except Exception as _e:
+    st.info(f"Could not compute regime advice: {_e}")
     except Exception as e:
         st.error(f"Failed to load regime data: {e}")
 
