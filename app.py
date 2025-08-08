@@ -286,57 +286,57 @@ with tab4:
     st.subheader("Market Regime (Breadth, Vol, Trend)")
 
     try:
-        # Fetch regime metrics from backend
-        regime_data = backend.get_market_regime()
-        if not regime_data:
-            st.warning("No regime data available.")
-        else:
-            # Extract values
-            breadth = regime_data.get("universe_above_200dma", 0)
-            qqq_above = regime_data.get("qqq_above_200dma", 0)
-            vol_10d = regime_data.get("qqq_vol_10d", 0)
-            breadth_pos_6m = regime_data.get("breadth_pos_6m", 0)
-            slope_50dma = regime_data.get("qqq_50dma_slope_10d", 0)
+        # Pull a 12-month slice for speed
+        universe = backend.get_nasdaq_100_plus_tickers()
+        end = datetime.today().strftime("%Y-%m-%d")
+        start = (datetime.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
+        prices = backend.fetch_market_data(universe, start, end)
 
-            # Classification logic
-            if breadth > 0.6 and slope_50dma > 0 and vol_10d < 0.02:
+        if prices is None or prices.empty:
+            st.warning("Could not fetch market data for regime metrics.")
+        else:
+            # Use your existing backend metric builder
+            regime_data = backend.compute_regime_metrics(prices)
+
+            # Extract values safely
+            breadth = float(regime_data.get("universe_above_200dma", 0.0))
+            qqq_above = float(regime_data.get("qqq_above_200dma", 0.0))
+            vol_10d = float(regime_data.get("qqq_vol_10d", 0.0))
+            slope_50dma = float(regime_data.get("qqq_50dma_slope_10d", 0.0))
+            breadth_pos_6m = float(regime_data.get("breadth_pos_6m", 0.0))
+
+            # Simple classification (tweak thresholds to taste)
+            if breadth > 0.60 and slope_50dma > 0 and vol_10d < 0.02:
                 regime = "Bull"
                 colour = "🟢"
-                summary = (
-                    "Conditions are bullish — broad participation, positive trend, "
-                    "and low volatility. Environment supportive for taking risk."
-                )
-            elif breadth > 0.4 and slope_50dma >= 0:
+                summary = ("Broad participation, positive trend, and low volatility. "
+                           "Environment supportive for taking risk.")
+            elif breadth >= 0.40 and slope_50dma >= 0:
                 regime = "Caution"
                 colour = "🟡"
-                summary = (
-                    "Mixed signals — trend remains positive but breadth or volatility "
-                    "is not ideal. Maintain positions but avoid aggressive buying."
-                )
+                summary = ("Mixed signals — trend ok but breadth/volatility not ideal. "
+                           "Maintain positions; avoid aggressive new risk.")
             else:
                 regime = "Bear"
                 colour = "🔴"
-                summary = (
-                    "Defensive conditions — weak breadth or negative trend with higher volatility. "
-                    "Reduce risk and protect capital."
-                )
+                summary = ("Weak breadth or negative trend with elevated volatility. "
+                           "Be defensive; reduce risk where appropriate.")
 
-            # Display
+            # Header + summary
             st.markdown(f"### {colour} {regime} Regime")
             st.write(summary)
 
-            with st.expander("View raw regime metrics"):
+            # Quick gauges
+            st.progress(min(max(breadth, 0.0), 1.0))
+            st.caption(f"Breadth now: **{breadth:.1%}** of universe above 200DMA "
+                       f"(6-month breadth: {breadth_pos_6m:.1%}).")
+            cols = st.columns(3)
+            cols[0].metric("QQQ above 200DMA", "Yes" if qqq_above >= 1 else "No")
+            cols[1].metric("QQQ 10-day vol", f"{vol_10d:.2%}")
+            cols[2].metric("QQQ 50DMA slope (10d)", f"{slope_50dma:.2%}")
+
+            with st.expander("Raw regime metrics"):
                 st.json(regime_data)
-
-            # Optional: breadth gauge
-            st.progress(min(max(breadth, 0), 1))
-            st.caption(f"Breadth: {breadth:.1%} of universe above 200DMA")
-
-            # Snapshot
-            note = st.text_input("Add a note to live snapshot (optional)")
-            if st.button("Record Live Snapshot"):
-                backend.save_regime_snapshot(regime_data, note)
-                st.success("Snapshot saved.")
 
     except Exception as e:
         st.error(f"Failed to load regime data: {e}")
