@@ -91,7 +91,7 @@ if go:
                 )
 
             st.session_state.latest_portfolio = live_raw if live_raw is not None else pd.DataFrame(columns=["Weight"])
-            st.session_state.latest_decision = decision
+            st.session_state.latest_decision  = decision
 
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}")
@@ -109,10 +109,7 @@ with tab1:
     st.subheader("📊 Rebalancing Plan")
 
     prev_port = backend.load_previous_portfolio()
-    if "latest_portfolio" in st.session_state:
-        candidate = st.session_state.latest_portfolio
-    else:
-        candidate = None
+    candidate = st.session_state.get("latest_portfolio", None)
 
     if candidate is None or candidate.empty:
         st.info("Generate a portfolio to see the rebalancing plan.")
@@ -217,7 +214,7 @@ with tab2:
                         else:
                             close = close[[]]
 
-                    # Build regime-aware preview
+                    # Build regime-aware preview (weights already scaled by regime in backend)
                     preset = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
                     preview_w, preview_trigger, preview_regime, _ = backend.build_isa_dynamic_with_regime(close, preset)
 
@@ -294,7 +291,7 @@ with tab4:
         univ = backend.get_nasdaq_100_plus_tickers()
         end = datetime.today().strftime("%Y-%m-%d")
         start = (datetime.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
-        px = backend.fetch_market_data(univ, start, end)
+        _px = backend.fetch_market_data(univ, start, end)
 
         label, metrics = backend.get_market_regime()
 
@@ -309,38 +306,35 @@ with tab4:
 
         st.markdown("**Breadth (share of tickers with positive 6-month return):** "
                     f"{metrics.get('breadth_pos_6m', np.nan)*100:.1f}%")
+
         # === Regime Advice (simple, opinionated rules) ===
-try:
-    label, m = backend.get_market_regime()
-    breadth = float(m.get("breadth_pos_6m", np.nan))      # share > 0 means 0..1
-    vol10   = float(m.get("qqq_vol_10d", np.nan))          # daily vol (std)
-    qqq_abv = bool(m.get("qqq_above_200dma", 0.0) >= 1.0)  # True/False
+        label, m = backend.get_market_regime()
+        breadth = float(m.get("breadth_pos_6m", np.nan))      # 0..1
+        vol10   = float(m.get("qqq_vol_10d", np.nan))          # daily std
+        qqq_abv = bool(m.get("qqq_above_200dma", 0.0) >= 1.0)  # True/False
 
-    # Default recommendations (you can tweak thresholds)
-    target_equity = 1.0
-    headline = "Risk-On — full equity allocation recommended."
-    box = st.success
+        target_equity = 1.0
+        headline = "Risk-On — full equity allocation recommended."
+        box = st.success
 
-    # Extreme risk-off: trend weak + breadth poor OR volatility spike while below 200DMA
-    if ((not qqq_abv and (breadth < 0.35)) or (vol10 > 0.035 and not qqq_abv)):
-        target_equity = 0.0
-        headline = "Extreme Risk-Off — consider 100% cash."
-        box = st.error
+        # Extreme risk-off (go flat)
+        if ((not qqq_abv and (breadth < 0.35)) or (vol10 > 0.035 and not qqq_abv)):
+            target_equity = 0.0
+            headline = "Extreme Risk-Off — consider 100% cash."
+            box = st.error
+        # Risk-off (halve exposure)
+        elif (not qqq_abv) or (breadth < 0.45):
+            target_equity = 0.50
+            headline = "Risk-Off — scale to ~50% equity / 50% cash."
+            box = st.warning
 
-    # Plain risk-off: either below 200DMA or weak breadth
-    elif (not qqq_abv) or (breadth < 0.45):
-        target_equity = 0.50
-        headline = "Risk-Off — scale to ~50% equity / 50% cash."
-        box = st.warning
+        box(
+            f"**Regime advice:** {headline}  \n"
+            f"**Targets:** equity **{target_equity*100:.0f}%**, cash **{(1-target_equity)*100:.0f}%**.  \n"
+            f"_Context — Breadth (6m>0): {breadth:.0%} • 10-day vol: {vol10:.2%} • QQQ >200DMA: {'Yes' if qqq_abv else 'No'}_"
+        )
+        st.caption("Note: The ISA Dynamic preset already scales exposure automatically; use this as a sanity check for monthly decisions.")
 
-    box(
-        f"**Regime advice:** {headline}  \n"
-        f"**Targets:** equity **{target_equity*100:.0f}%**, cash **{(1-target_equity)*100:.0f}%**.  \n"
-        f"_Context — Breadth (6m>0): {breadth:.0%} • 10-day vol: {vol10:.2%} • QQQ >200DMA: {'Yes' if qqq_abv else 'No'}_"
-    )
-    st.caption("Note: The ISA Dynamic preset already scales exposure automatically; use this as a sanity check for monthly decisions.")
-except Exception as _e:
-    st.info(f"Could not compute regime advice: {_e}")
     except Exception as e:
         st.error(f"Failed to load regime data: {e}")
 
@@ -354,7 +348,6 @@ with tab5:
         if curr_df is None or curr_df.empty:
             st.info("Generate the portfolio to view changes.")
         else:
-            # Fetch prices for just the relevant tickers (fast)
             tickers = sorted(set(curr_df.index) | (set(prev_df.index) if prev_df is not None else set()))
             if tickers:
                 end = datetime.today().strftime("%Y-%m-%d")
