@@ -264,6 +264,6 @@ if live_raw is not None and not live_raw.empty:
     if st.button("📝 Record Live Snapshot"):
         res = backend.record_live_snapshot(live_raw, note=note)
         if res.get("ok", False):
-            st.success(f"Recorded snapshot for {res.get('rows','?')} day(s).")
+            st.success(f"Recorded snapshot for {res.get('rows', '?')} day(s).")
         else:
-            st.error(res.get("msg",
+            st.error(res.get("msg", "Failed to log snapshot."))
