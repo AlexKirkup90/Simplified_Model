@@ -261,14 +261,38 @@ with tab3:
     if strategy_cum_gross is None or qqq_cum is None:
         st.info("Generate to see backtest results.")
     else:
-        # KPIs (gross & net)
+        # KPIs (monthly series inferred)
         st.markdown("#### Key Performance (monthly series inferred)")
+
         krows = []
-        krows.append(backend.kpi_row("Strategy (Gross)", strategy_cum_gross.pct_change()))
+        # Pass turnover_series=hybrid_tno so Turnover/yr populates correctly
+        krows.append(
+            backend.kpi_row(
+                "Strategy (Gross)",
+                strategy_cum_gross.pct_change(),
+                turnover_series=hybrid_tno
+            )
+        )
         if strategy_cum_net is not None and show_net:
-            krows.append(backend.kpi_row("Strategy (Net of costs)", strategy_cum_net.pct_change()))
-        krows.append(backend.kpi_row("QQQ Benchmark", qqq_cum.pct_change()))
-        kdf = pd.DataFrame(krows, columns=["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity x"])
+            krows.append(
+                backend.kpi_row(
+                    "Strategy (Net of costs)",
+                    strategy_cum_net.pct_change(),
+                    turnover_series=hybrid_tno  # same turnover, just netted returns
+                )
+            )
+        krows.append(
+            backend.kpi_row(
+                "QQQ Benchmark",
+                qqq_cum.pct_change(),
+                turnover_series=None  # benchmark has no turnover
+            )
+        )
+
+        kdf = pd.DataFrame(
+            krows,
+            columns=["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity x"]
+        )
         st.dataframe(kdf, use_container_width=True)
 
         # Equity curves
