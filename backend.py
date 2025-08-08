@@ -38,7 +38,7 @@ def get_nasdaq_100_plus_tickers() -> list:
         payload = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')
         nasdaq_100 = payload[4]['Ticker'].tolist()
         extras = ['TSLA', 'SHOP', 'SNOW', 'PLTR', 'ETSY', 'RIVN', 'COIN']
-        if 'SQ' in extras:  # SQ acquired/changed
+        if 'SQ' in extras:
             extras.remove('SQ')
         full_list = sorted(list(set(nasdaq_100 + extras)))
         return full_list
@@ -235,7 +235,7 @@ def combine_hybrid(mom_rets: pd.Series, mr_rets: pd.Series, mom_tno: pd.Series |
     return combo, tno
 
 # =========================
-# ISA Dynamic sleeves (live & backtest-equivalent signals)
+# ISA Dynamic (live) helpers
 # =========================
 def _momentum_scores_monthly(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Series:
     mom = monthly_prices.pct_change(periods=lookback_m).iloc[-1]
@@ -253,6 +253,7 @@ def generate_live_portfolio_classic(momentum_window, top_n, cap):
     universe = get_nasdaq_100_plus_tickers()
     if not universe:
         return None, None
+
     start_date = (datetime.today() - relativedelta(months=momentum_window + 8)).strftime('%Y-%m-%d')
     end_date = datetime.today().strftime('%Y-%m-%d')
     prices = fetch_market_data(universe, start_date, end_date)
@@ -388,15 +389,14 @@ def run_backtest_isa_dynamic():
     daily = prices[valid_universe]
     qqq = prices['QQQ']
 
-    # sleeves (same as classic runners but with preset params)
     monthly = daily.resample('ME').last()
-    mom_rets = monthly.pct_change(periods=params['mom_lb']).shift(1)
-    # Strategy returns from selecting top N each month
-    portfolio_rets = pd.Series(index=monthly.index, dtype=float)
     fwd = monthly.pct_change().shift(-1)
 
+    mom_scores_all = monthly.pct_change(periods=params['mom_lb']).shift(1)
+
+    portfolio_rets = pd.Series(index=monthly.index, dtype=float)
     for m in monthly.index:
-        scores = mom_rets.loc[m].dropna()
+        scores = mom_scores_all.loc[m].dropna()
         scores = scores[scores > 0]
         if scores.empty:
             portfolio_rets.loc[m] = 0.0
