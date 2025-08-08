@@ -509,21 +509,28 @@ def generate_live_portfolio_isa(preset: Dict, prev_portfolio: Optional[pd.DataFr
 def run_backtest_for_app(momentum_window: int, top_n: int, cap: float,
                          roundtrip_bps: float = 0.0,
                          min_dollar_volume: float = 0.0,
-                         show_net: bool = False) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
-    """Classic 90/10 hybrid vs QQQ (since 2018), liquidity filter & costs."""
+                         show_net: bool = False):
     start_date = '2018-01-01'
     end_date = datetime.today().strftime('%Y-%m-%d')
     universe = get_nasdaq_100_plus_tickers()
     tickers = universe + ['QQQ']
+
     close, vol = fetch_price_volume(tickers, start_date, end_date)
     if close.empty or 'QQQ' not in close.columns:
         return None, None, None, None
 
-    if min_dollar_volume > 0:
-        keep = filter_by_liquidity(close[universe], vol[universe], min_dollar_volume)
+    # Only keep tickers we actually have data for
+    available = [t for t in universe if t in close.columns]
+
+    # Liquidity filter (on available only)
+    if min_dollar_volume > 0 and available:
+        keep = filter_by_liquidity(close[available], vol[available], min_dollar_volume)
         valid_universe = keep
     else:
-        valid_universe = [t for t in universe if t in close.columns]
+        valid_universe = available
+
+    if not valid_universe:
+        return None, None, None, None
 
     daily = close[valid_universe]
     qqq = close['QQQ']
@@ -536,26 +543,34 @@ def run_backtest_for_app(momentum_window: int, top_n: int, cap: float,
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
     strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod()
     qqq_cum = (1 + qqq.resample('ME').last().pct_change()).cumprod()
+
     return strat_cum_gross, strat_cum_net, qqq_cum.reindex(strat_cum_gross.index, method='ffill'), hybrid_tno
 
-def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
+ def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
                              min_dollar_volume: float = 0.0,
-                             show_net: bool = False) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
-    """ISA preset backtest (since 2018) with liquidity filter & costs; trigger is not applied here."""
+                             show_net: bool = False):
     params = STRATEGY_PRESETS["ISA Dynamic (0.75)"]
     start_date = '2018-01-01'
     end_date = datetime.today().strftime('%Y-%m-%d')
     universe = get_nasdaq_100_plus_tickers()
     tickers = universe + ['QQQ']
+
     close, vol = fetch_price_volume(tickers, start_date, end_date)
     if close.empty or 'QQQ' not in close.columns:
         return None, None, None, None
 
-    if min_dollar_volume > 0:
-        keep = filter_by_liquidity(close[universe], vol[universe], min_dollar_volume)
+    # Only keep tickers we actually have data for
+    available = [t for t in universe if t in close.columns]
+
+    # Liquidity filter (on available only)
+    if min_dollar_volume > 0 and available:
+        keep = filter_by_liquidity(close[available], vol[available], min_dollar_volume)
         valid_universe = keep
     else:
-        valid_universe = [t for t in universe if t in close.columns]
+        valid_universe = available
+
+    if not valid_universe:
+        return None, None, None, None
 
     daily = close[valid_universe]
     qqq = close['QQQ']
@@ -584,7 +599,8 @@ def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
         # MR sleeve
         if m in st_ret.index and m in lt_ma.index:
             quality = monthly.loc[m] > lt_ma.loc[m]
-            mr_pool = st_ret.loc[m, quality[quality].index].dropna()
+            pool = quality[quality].index
+            mr_pool = st_ret.loc[m, pool.intersection(st_ret.columns)].dropna()
             dips = mr_pool.nsmallest(params['mr_topn'])
             w_r = pd.Series(1/len(dips), index=dips.index) if len(dips) > 0 else pd.Series(dtype=float)
         else:
