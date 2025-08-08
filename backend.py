@@ -1,8 +1,10 @@
 # backend.py
 import os
 import io
-import pandas as pd
+from typing import Optional, Tuple, Dict, List
+
 import numpy as np
+import pandas as pd
 import yfinance as yf
 import requests
 import streamlit as st
@@ -10,20 +12,20 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 # =========================
-# Gist API Constants
+# Gist API (optional)
 # =========================
 GIST_ID = st.secrets.get("GIST_ID")
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
 GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}" if GIST_ID else None
 HEADERS = {'Authorization': f'token {GITHUB_TOKEN}'} if GITHUB_TOKEN else {}
-FILENAME = 'portfolio.json'
+GIST_PORTF_FILE = 'portfolio.json'
 LIVE_PERF_FILE = "live_perf.csv"
 
 # Local persistence fallback
 LOCAL_PORTF_FILE = "last_portfolio.csv"
 
 # =========================
-# Presets
+# ISA preset
 # =========================
 STRATEGY_PRESETS = {
     "ISA Dynamic (0.75)": {
@@ -37,26 +39,25 @@ STRATEGY_PRESETS = {
 REGIME_MA = 200
 
 # =========================
-# Cached Data Fetch
+# Universe & Data
 # =========================
 @st.cache_data(ttl=86400)
-def get_nasdaq_100_plus_tickers() -> list:
-    """Fetch list of Nasdaq-100 + a few extra tech names."""
+def get_nasdaq_100_plus_tickers() -> List[str]:
+    """Fetch Nasdaq-100 tickers and add a few common tech names."""
     try:
         payload = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')
         nasdaq_100 = payload[4]['Ticker'].tolist()
         extras = ['TSLA', 'SHOP', 'SNOW', 'PLTR', 'ETSY', 'RIVN', 'COIN']
         if 'SQ' in extras:
-            extras.remove('SQ')
-        full_list = sorted(list(set(nasdaq_100 + extras)))
-        return full_list
+            extras.remove('SQ')  # acquired
+        return sorted(list(set(nasdaq_100 + extras)))
     except Exception as e:
         st.error(f"Failed to fetch ticker list: {e}")
         return []
 
 @st.cache_data(ttl=43200)
-def fetch_market_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
-    """Fetch daily Close prices for tickers (auto-adjusted)."""
+def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """Daily Close (auto-adjusted)."""
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime('%Y-%m-%d')
         data = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)['Close']
@@ -68,27 +69,23 @@ def fetch_market_data(tickers: list, start_date: str, end_date: str) -> pd.DataF
         return pd.DataFrame()
 
 @st.cache_data(ttl=43200)
-def fetch_price_volume(tickers: list, start_date: str, end_date: str):
-    """Fetch daily Close and Volume as two aligned DataFrames."""
+def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Daily Close & Volume as aligned DataFrames."""
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime('%Y-%m-%d')
-        data = yf.download(
+        df = yf.download(
             tickers, start=fetch_start, end=end_date,
             auto_adjust=True, progress=False
         )[['Close','Volume']]
+        if isinstance(df, pd.Series):
+            df = df.to_frame()
 
-        # MultiIndex vs single
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-
-        if isinstance(data.columns, pd.MultiIndex):
-            close = data['Close']
-            vol   = data['Volume']
+        if isinstance(df.columns, pd.MultiIndex):
+            close = df['Close']
+            vol   = df['Volume']
         else:
-            # Single ticker to DataFrame wrappers
-            close = data[['Close']]
-            vol   = data[['Volume']]
-            # Name columns if single ticker
+            close = df[['Close']]
+            vol   = df[['Volume']]
             if len(tickers) == 1:
                 close.columns = [tickers[0]]
                 vol.columns   = [tickers[0]]
@@ -101,50 +98,47 @@ def fetch_price_volume(tickers: list, start_date: str, end_date: str):
         return pd.DataFrame(), pd.DataFrame()
 
 # =========================
-# Persistence: Portfolio (Gist + Local Fallback)
+# Persistence (Gist + Local)
 # =========================
 def save_portfolio_to_gist(portfolio_df: pd.DataFrame):
-    """Saves the provided portfolio DataFrame to the GitHub Gist (JSON)."""
+    """Save portfolio weights to Gist (JSON)."""
     if not GIST_API_URL or not GITHUB_TOKEN:
         st.sidebar.warning("Gist secrets not configured; skipping Gist save.")
         return
     try:
         json_content = portfolio_df.to_json(orient="index")
-        data_to_save = {'files': {FILENAME: {'content': json_content}}}
-        response = requests.patch(GIST_API_URL, headers=HEADERS, json=data_to_save)
-        response.raise_for_status()
+        payload = {'files': {GIST_PORTF_FILE: {'content': json_content}}}
+        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp.raise_for_status()
         st.sidebar.success("✅ Successfully saved portfolio to Gist.")
     except Exception as e:
         st.sidebar.error(f"Gist save failed: {e}")
 
-def load_previous_portfolio() -> pd.DataFrame | None:
-    """Loads last saved portfolio from Gist (if configured) else local CSV; returns None if absent."""
+def load_previous_portfolio() -> Optional[pd.DataFrame]:
+    """Load last saved portfolio from Gist (if configured) else local CSV."""
     # Try Gist first
     if GIST_API_URL and GITHUB_TOKEN:
         try:
             resp = requests.get(GIST_API_URL, headers=HEADERS)
             resp.raise_for_status()
             files = resp.json().get('files', {})
-            gist_content = files.get(FILENAME, {}).get('content', '')
-            if gist_content and gist_content != '{}':
-                df = pd.read_json(io.StringIO(gist_content), orient="index")
-                return df
+            content = files.get(GIST_PORTF_FILE, {}).get('content', '')
+            if content and content != '{}':
+                return pd.read_json(io.StringIO(content), orient="index")
         except Exception:
-            pass  # fall through to local
-
-    # Local CSV fallback
+            pass
+    # Local fallback
     if os.path.exists(LOCAL_PORTF_FILE):
         try:
             df = pd.read_csv(LOCAL_PORTF_FILE)
             if 'Weight' in df.columns and 'Ticker' in df.columns:
-                df = df.set_index('Ticker')
-            return df
+                return df.set_index('Ticker')
         except Exception:
             return None
     return None
 
 def save_current_portfolio(df: pd.DataFrame):
-    """Save the latest portfolio to local CSV for fallback comparison."""
+    """Save latest portfolio locally for diffs."""
     try:
         out = df.copy()
         if out.index.name is None:
@@ -154,7 +148,7 @@ def save_current_portfolio(df: pd.DataFrame):
         st.sidebar.warning(f"Could not save local portfolio: {e}")
 
 # =========================
-# Utilities & KPIs
+# Math utils & KPIs
 # =========================
 def cap_weights(weights: pd.Series, cap: float = 0.25) -> pd.Series:
     """Iterative 'waterfall' cap."""
@@ -189,7 +183,7 @@ def _infer_periods_per_year(idx: pd.Index) -> float:
         if f.startswith('M'):       return 12.0
         if f.startswith('Q'):       return 4.0
         if f.startswith(('A','Y')): return 1.0
-    # fallback by spacing
+    # fallback: median spacing
     deltas = np.diff(idx.view('i8')) / 1e9
     med_days = np.median(deltas) / 86400.0
     if med_days <= 2.5:  return 252.0
@@ -213,7 +207,9 @@ def equity_curve(returns: pd.Series) -> pd.Series:
 def drawdown(curve: pd.Series) -> pd.Series:
     return curve / curve.cummax() - 1
 
-def kpi_row(name: str, rets: pd.Series, trade_log: pd.DataFrame | None = None, turnover_series: pd.Series | None = None) -> list:
+def kpi_row(name: str, rets: pd.Series,
+            trade_log: Optional[pd.DataFrame] = None,
+            turnover_series: Optional[pd.Series] = None) -> List[str]:
     r = pd.Series(rets).dropna().astype(float)
     if r.empty:
         return [name, "-", "-", "-", "-", "-", "-", "-", "-", "-"]
@@ -229,8 +225,7 @@ def kpi_row(name: str, rets: pd.Series, trade_log: pd.DataFrame | None = None, t
     calmar  = ann_ret / abs(dd) if dd != 0 else np.nan
     eq_mult = float(eq.iloc[-1])
 
-    # Activity
-    tpy  = 0.0
+    tpy = 0.0
     if trade_log is not None and len(trade_log) > 0 and 'date' in trade_log.columns:
         tl = trade_log.copy()
         tl['year'] = pd.to_datetime(tl['date']).dt.year
@@ -240,7 +235,7 @@ def kpi_row(name: str, rets: pd.Series, trade_log: pd.DataFrame | None = None, t
 
     topy = 0.0
     if turnover_series is not None and len(turnover_series) > 0:
-        s = pd.Series(turnover_series).copy()
+        s = pd.Series(turnover_series)
         s.index = pd.to_datetime(s.index)
         grp = s.groupby(s.index.year).sum()
         if len(grp) > 0:
@@ -259,7 +254,7 @@ def kpi_row(name: str, rets: pd.Series, trade_log: pd.DataFrame | None = None, t
     ]
 
 # =========================
-# Liquidity filter
+# Liquidity
 # =========================
 def median_dollar_volume(close_df: pd.DataFrame, vol_df: pd.DataFrame, window: int = 60) -> pd.Series:
     aligned_vol = vol_df.reindex_like(close_df).fillna(0)
@@ -267,14 +262,14 @@ def median_dollar_volume(close_df: pd.DataFrame, vol_df: pd.DataFrame, window: i
     med = dollar.rolling(window).median().iloc[-1]
     return med.dropna()
 
-def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar: float) -> list:
+def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar: float) -> List[str]:
     if close_df.empty or vol_df.empty:
         return []
     med = median_dollar_volume(close_df, vol_df, window=60)
     return med[med >= min_dollar].index.tolist()
 
 # =========================
-# Blended momentum (3/6/12m z-blend)
+# Signals: blended momentum
 # =========================
 def blended_momentum_scores(monthly_prices: pd.DataFrame) -> pd.Series:
     m = monthly_prices
@@ -282,9 +277,9 @@ def blended_momentum_scores(monthly_prices: pd.DataFrame) -> pd.Series:
     r6  = m.pct_change(6).iloc[-1]
     r12 = m.pct_change(12).iloc[-1]
 
-    def z(s):
+    def z(s: pd.Series) -> pd.Series:
         s = s.replace([np.inf, -np.inf], np.nan).dropna()
-        if s.std(ddof=0) == 0 or s.empty:
+        if s.empty or s.std(ddof=0) == 0:
             return pd.Series(0.0, index=m.columns)
         zs = (s - s.mean()) / (s.std(ddof=0) + 1e-9)
         return zs.reindex(m.columns).fillna(0.0)
@@ -294,92 +289,85 @@ def blended_momentum_scores(monthly_prices: pd.DataFrame) -> pd.Series:
     return score.dropna()
 
 # =========================
-# Classic strategy (with turnover + costs)
+# Sleeves (with turnover)
 # =========================
 def _weights_to_turnover(prev_w: pd.Series, new_w: pd.Series) -> float:
-    """Turnover fraction = 0.5 * sum(|Δw|)."""
     prev = prev_w.reindex(new_w.index, fill_value=0.0)
-    delta = (new_w - prev).abs().sum()
-    return 0.5 * float(delta)
+    return 0.5 * float((new_w - prev).abs().sum())
 
-def run_backtest_gross(daily_prices: pd.DataFrame, momentum_window: int = 6, top_n: int = 15, cap: float = 0.25) -> tuple[pd.Series, pd.Series]:
-    """Momentum sleeve (classic single lookback), returns monthly series and turnover series."""
-    monthly_prices = daily_prices.resample('ME').last()
-    future_returns = monthly_prices.pct_change().shift(-1)
-    momentum = monthly_prices.pct_change(periods=momentum_window).shift(1)
+def run_backtest_gross(daily_prices: pd.DataFrame,
+                       momentum_window: int = 6,
+                       top_n: int = 15,
+                       cap: float = 0.25) -> Tuple[pd.Series, pd.Series]:
+    """Momentum sleeve (single lookback) → returns, turnover."""
+    monthly = daily_prices.resample('ME').last()
+    fwd = monthly.pct_change().shift(-1)
+    mom = monthly.pct_change(momentum_window).shift(1)
 
-    portfolio_returns = pd.Series(index=momentum.index, dtype=float)
-    turnover_series   = pd.Series(index=momentum.index, dtype=float)
+    rets = pd.Series(index=mom.index, dtype=float)
+    tno  = pd.Series(index=mom.index, dtype=float)
     prev_w = pd.Series(dtype=float)
 
-    for month in momentum.index:
-        scores = momentum.loc[month].dropna()
+    for m in mom.index:
+        scores = mom.loc[m].dropna()
         scores = scores[scores > 0]
         if scores.empty:
-            portfolio_returns.loc[month] = 0.0
-            turnover_series.loc[month]   = 0.0
-            continue
+            rets.loc[m] = 0.0; tno.loc[m] = 0.0; continue
 
         top = scores.nlargest(top_n)
         raw = top / top.sum()
         w = cap_weights(raw, cap=cap)
         w = w / w.sum() if w.sum() > 0 else w
 
-        valid = w.index.intersection(future_returns.columns)
-        month_ret = (future_returns.loc[month, valid] * w[valid]).sum()
-        portfolio_returns.loc[month] = float(month_ret)
+        valid = w.index.intersection(fwd.columns)
+        rets.loc[m] = float((fwd.loc[m, valid] * w[valid]).sum())
 
-        tno = _weights_to_turnover(prev_w, w)
-        turnover_series.loc[month] = tno
+        tno.loc[m] = _weights_to_turnover(prev_w, w)
         prev_w = w
 
-    return portfolio_returns.fillna(0.0), turnover_series.fillna(0.0)
+    return rets.fillna(0.0), tno.fillna(0.0)
 
-def run_backtest_mean_reversion(daily_prices: pd.DataFrame, lookback_period_mr: int = 21, top_n_mr: int = 5, long_ma_days: int = 200) -> tuple[pd.Series, pd.Series]:
-    monthly_prices = daily_prices.resample('ME').last()
-    future_returns = monthly_prices.pct_change().shift(-1)
-    short_term_returns = daily_prices.pct_change(periods=lookback_period_mr)
-    monthly_short = short_term_returns.resample('ME').last()
-    long_trend = daily_prices.rolling(window=long_ma_days).mean().resample('ME').last()
+def run_backtest_mean_reversion(daily_prices: pd.DataFrame,
+                                lookback_period_mr: int = 21,
+                                top_n_mr: int = 5,
+                                long_ma_days: int = 200) -> Tuple[pd.Series, pd.Series]:
+    monthly = daily_prices.resample('ME').last()
+    fwd = monthly.pct_change().shift(-1)
+    st = daily_prices.pct_change(lookback_period_mr).resample('ME').last()
+    lt = daily_prices.rolling(long_ma_days).mean().resample('ME').last()
 
-    portfolio_returns = pd.Series(index=monthly_prices.index, dtype=float)
-    turnover_series   = pd.Series(index=monthly_prices.index, dtype=float)
+    rets = pd.Series(index=monthly.index, dtype=float)
+    tno  = pd.Series(index=monthly.index, dtype=float)
     prev_w = pd.Series(dtype=float)
 
-    for month in monthly_prices.index:
-        quality = monthly_prices.loc[month] > long_trend.loc[month]
-        quality_stocks = quality[quality].index
-        if len(quality_stocks) == 0:
-            portfolio_returns.loc[month] = 0.0
-            turnover_series.loc[month]   = 0.0
-            continue
+    for m in monthly.index:
+        quality = monthly.loc[m] > lt.loc[m]
+        pool = quality[quality].index
+        if len(pool) == 0:
+            rets.loc[m] = 0.0; tno.loc[m] = 0.0; continue
 
-        mr_candidates = monthly_short.loc[month, quality_stocks].dropna()
-        if mr_candidates.empty:
-            portfolio_returns.loc[month] = 0.0
-            turnover_series.loc[month]   = 0.0
-            continue
+        cand = st.loc[m, pool].dropna()
+        if cand.empty:
+            rets.loc[m] = 0.0; tno.loc[m] = 0.0; continue
 
-        dips = mr_candidates.nsmallest(top_n_mr)
+        dips = cand.nsmallest(top_n_mr)
         if dips.empty:
-            portfolio_returns.loc[month] = 0.0
-            turnover_series.loc[month]   = 0.0
-            continue
+            rets.loc[m] = 0.0; tno.loc[m] = 0.0; continue
 
         w = pd.Series(1/len(dips), index=dips.index)
-        valid = w.index.intersection(future_returns.columns)
-        month_ret = (future_returns.loc[month, valid] * w[valid]).sum()
-        portfolio_returns.loc[month] = float(month_ret)
 
-        tno = _weights_to_turnover(prev_w, w)
-        turnover_series.loc[month] = tno
+        valid = w.index.intersection(fwd.columns)
+        rets.loc[m] = float((fwd.loc[m, valid] * w[valid]).sum())
+
+        tno.loc[m] = _weights_to_turnover(prev_w, w)
         prev_w = w
 
-    return portfolio_returns.fillna(0.0), turnover_series.fillna(0.0)
+    return rets.fillna(0.0), tno.fillna(0.0)
 
 def combine_hybrid(mom_rets: pd.Series, mr_rets: pd.Series,
-                   mom_tno: pd.Series | None = None, mr_tno: pd.Series | None = None,
-                   mom_w: float = 0.9, mr_w: float = 0.1):
+                   mom_tno: Optional[pd.Series] = None,
+                   mr_tno: Optional[pd.Series] = None,
+                   mom_w: float = 0.9, mr_w: float = 0.1) -> Tuple[pd.Series, Optional[pd.Series]]:
     mom = pd.Series(mom_rets).reindex(mr_rets.index, fill_value=0.0)
     mr  = pd.Series(mr_rets).reindex(mom.index,    fill_value=0.0)
     combo = (mom * mom_w) + (mr * mr_w)
@@ -398,44 +386,37 @@ def apply_costs(gross_returns: pd.Series, turnover: pd.Series, roundtrip_bps: fl
     return net
 
 # =========================
-# ISA Dynamic (live) helpers
+# Live portfolio builders
 # =========================
-def _momentum_scores_monthly(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Series:
-    # use blended momentum for live robustness
-    return blended_momentum_scores(monthly_prices)
-
 def _mr_scores_daily_to_monthly(daily_prices: pd.DataFrame, lookback_days: int, long_ma_days: int) -> pd.Series:
     st_returns = daily_prices.pct_change(lookback_days).iloc[-1]
-    ltrend = daily_prices.rolling(long_ma_days).mean().iloc[-1]
-    quality = daily_prices.iloc[-1] > ltrend
-    mr = st_returns[quality[quality].index].dropna()
-    return mr
+    long_trend = daily_prices.rolling(long_ma_days).mean().iloc[-1]
+    quality = daily_prices.iloc[-1] > long_trend
+    return st_returns[quality[quality].index].dropna()
 
-def generate_live_portfolio_classic(momentum_window, top_n, cap,
-                                    min_dollar_volume: float = 0.0):
-    """Classic 90/10 live weights (liquidity filter + blended momentum for momentum sleeve)."""
+def generate_live_portfolio_classic(momentum_window: int, top_n: int, cap: float,
+                                    min_dollar_volume: float = 0.0) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Classic 90/10 live weights (blended momentum; optional liquidity filter)."""
     universe = get_nasdaq_100_plus_tickers()
     if not universe:
         return None, None
 
-    start_date = (datetime.today() - relativedelta(months=max(momentum_window, 12) + 8)).strftime('%Y-%m-%d')
-    end_date = datetime.today().strftime('%Y-%m-%d')
-    close, vol = fetch_price_volume(universe, start_date, end_date)
+    start = (datetime.today() - relativedelta(months=max(momentum_window, 12) + 8)).strftime('%Y-%m-%d')
+    end   = datetime.today().strftime('%Y-%m-%d')
+    close, vol = fetch_price_volume(universe, start, end)
     if close.empty:
         return None, None
 
-    # Liquidity filter
     if min_dollar_volume > 0:
         keep = filter_by_liquidity(close, vol, min_dollar_volume)
         if not keep:
             return None, None
         close = close[keep]
 
-    prices = close
-    monthly_prices_mom = prices.resample('ME').last()
+    monthly = close.resample('ME').last()
 
-    # Momentum sleeve (90%) using blended scores
-    mom_scores = blended_momentum_scores(monthly_prices_mom)
+    # Momentum sleeve (90%) with blended scores
+    mom_scores = blended_momentum_scores(monthly)
     mom_scores = mom_scores[mom_scores > 0]
     top_performers = mom_scores.nlargest(top_n)
     if top_performers.empty:
@@ -444,46 +425,41 @@ def generate_live_portfolio_classic(momentum_window, top_n, cap,
         raw = top_performers / top_performers.sum()
         mom_w = cap_weights(raw, cap=cap) * 0.90
 
-    # Mean reversion (10%)
-    short_term = prices.pct_change(21).iloc[-1]
-    long_trend = prices.rolling(200).mean().iloc[-1]
-    quality = prices.iloc[-1] > long_trend
-    mr_candidates = short_term[quality[quality].index].dropna()
-    dip_stocks = mr_candidates.nsmallest(5)
-    if dip_stocks.empty:
+    # MR sleeve (10%)
+    mr_scores = _mr_scores_daily_to_monthly(close, 21, 200)
+    dips = mr_scores.nsmallest(5)
+    if dips.empty:
         mr_w = pd.Series(dtype=float)
     else:
-        mr_w = pd.Series(1/len(dip_stocks), index=dip_stocks.index) * 0.10
+        mr_w = pd.Series(1/len(dips), index=dips.index) * 0.10
 
     final = mom_w.add(mr_w, fill_value=0.0)
     final = final / final.sum() if final.sum() > 0 else final
+
     display_df = pd.DataFrame({'Weight': final}).sort_values('Weight', ascending=False)
-    display_df_fmt = display_df.copy()
-    display_df_fmt['Weight'] = display_df_fmt['Weight'].map('{:.2%}'.format)
-    raw_df = display_df.copy()
+    display_fmt = display_df.copy()
+    display_fmt['Weight'] = display_fmt['Weight'].map('{:.2%}'.format)
+    return display_fmt, display_df
 
-    return display_df_fmt, raw_df
-
-def generate_live_portfolio_isa(preset: dict, prev_portfolio: pd.DataFrame | None,
-                                min_dollar_volume: float = 0.0):
+def generate_live_portfolio_isa(preset: Dict, prev_portfolio: Optional[pd.DataFrame],
+                                min_dollar_volume: float = 0.0) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     ISA Dynamic live weights with:
       - Momentum: blended 3/6/12m score, capped, top N
       - MR: worst short-term among stocks above long MA
       - Liquidity filter via median $ volume
-      - Trigger: hold vs rebalance
+      - Trigger decision vs previous portfolio
     """
     universe = get_nasdaq_100_plus_tickers()
     if not universe:
         return None, None, "No universe available."
 
-    start_date = (datetime.today() - relativedelta(months=max(preset['mom_lb'], 12) + 8)).strftime('%Y-%m-%d')
-    end_date = datetime.today().strftime('%Y-%m-%d')
-    close, vol = fetch_price_volume(universe, start_date, end_date)
+    start = (datetime.today() - relativedelta(months=max(preset['mom_lb'], 12) + 8)).strftime('%Y-%m-%d')
+    end   = datetime.today().strftime('%Y-%m-%d')
+    close, vol = fetch_price_volume(universe, start, end)
     if close.empty:
         return None, None, "No price data."
 
-    # Liquidity filter
     if min_dollar_volume > 0:
         keep = filter_by_liquidity(close, vol, min_dollar_volume)
         if not keep:
@@ -492,7 +468,7 @@ def generate_live_portfolio_isa(preset: dict, prev_portfolio: pd.DataFrame | Non
 
     monthly = close.resample('ME').last()
 
-    # Momentum selection (blended)
+    # Momentum selection
     mom_scores = blended_momentum_scores(monthly)
     mom_scores = mom_scores[mom_scores > 0]
     top_m = mom_scores.nlargest(preset['mom_topn'])
@@ -504,11 +480,9 @@ def generate_live_portfolio_isa(preset: dict, prev_portfolio: pd.DataFrame | Non
     dips = mr_scores.nsmallest(preset['mr_topn'])
     mr_w = (pd.Series(1/len(dips), index=dips.index) * preset['mr_w']) if len(dips) > 0 else pd.Series(dtype=float)
 
-    # Combine
     new_w = mom_w.add(mr_w, fill_value=0.0)
     new_w = new_w / new_w.sum() if new_w.sum() > 0 else new_w
 
-    # Trigger decision vs previous portfolio
     decision = "No previous portfolio found — proposing a full rebalance."
     if prev_portfolio is not None and not prev_portfolio.empty and 'Weight' in prev_portfolio.columns:
         prev_w = prev_portfolio['Weight'].astype(float)
@@ -524,22 +498,19 @@ def generate_live_portfolio_isa(preset: dict, prev_portfolio: pd.DataFrame | Non
         else:
             decision = "Momentum scores empty — holding previous portfolio."
 
-    # Display + raw
     display_df = pd.DataFrame({'Weight': new_w}).sort_values('Weight', ascending=False)
-    display_df_fmt = display_df.copy()
-    display_df_fmt['Weight'] = display_df_fmt['Weight'].map('{:.2%}'.format)
-    raw_df = display_df.copy()
-
-    return display_df_fmt, raw_df, decision
+    display_fmt = display_df.copy()
+    display_fmt['Weight'] = display_fmt['Weight'].map('{:.2%}'.format)
+    return display_fmt, display_df, decision
 
 # =========================
-# Quick backtests for app (with costs + liquidity + blended momentum)
+# Backtests for app (with costs & liquidity)
 # =========================
-def run_backtest_for_app(momentum_window, top_n, cap,
+def run_backtest_for_app(momentum_window: int, top_n: int, cap: float,
                          roundtrip_bps: float = 0.0,
                          min_dollar_volume: float = 0.0,
-                         show_net: bool = False):
-    """Classic 90/10 hybrid vs QQQ (since 2018), with liquidity filter & costs."""
+                         show_net: bool = False) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+    """Classic 90/10 hybrid vs QQQ (since 2018), liquidity filter & costs."""
     start_date = '2018-01-01'
     end_date = datetime.today().strftime('%Y-%m-%d')
     universe = get_nasdaq_100_plus_tickers()
@@ -548,7 +519,6 @@ def run_backtest_for_app(momentum_window, top_n, cap,
     if close.empty or 'QQQ' not in close.columns:
         return None, None, None, None
 
-    # Liquidity filter
     if min_dollar_volume > 0:
         keep = filter_by_liquidity(close[universe], vol[universe], min_dollar_volume)
         valid_universe = keep
@@ -558,24 +528,20 @@ def run_backtest_for_app(momentum_window, top_n, cap,
     daily = close[valid_universe]
     qqq = close['QQQ']
 
-    # Sleeves
     mom_rets, mom_tno = run_backtest_gross(daily, momentum_window, top_n, cap)
     mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, 21, 5, 200)
-
-    # Hybrid
     hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mom_w=0.90, mr_w=0.10)
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
     strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod()
     qqq_cum = (1 + qqq.resample('ME').last().pct_change()).cumprod()
-
     return strat_cum_gross, strat_cum_net, qqq_cum.reindex(strat_cum_gross.index, method='ffill'), hybrid_tno
 
 def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
                              min_dollar_volume: float = 0.0,
-                             show_net: bool = False):
-    """ISA preset backtest (since 2018) with liquidity filter & costs; trigger is not applied in backtest."""
+                             show_net: bool = False) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+    """ISA preset backtest (since 2018) with liquidity filter & costs; trigger is not applied here."""
     params = STRATEGY_PRESETS["ISA Dynamic (0.75)"]
     start_date = '2018-01-01'
     end_date = datetime.today().strftime('%Y-%m-%d')
@@ -585,7 +551,6 @@ def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
     if close.empty or 'QQQ' not in close.columns:
         return None, None, None, None
 
-    # Liquidity filter
     if min_dollar_volume > 0:
         keep = filter_by_liquidity(close[universe], vol[universe], min_dollar_volume)
         valid_universe = keep
@@ -598,7 +563,6 @@ def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
     monthly = daily.resample('ME').last()
     fwd = monthly.pct_change().shift(-1)
 
-    # Precompute MR tensors
     st_ret = daily.pct_change(params['mr_lb']).resample('ME').last()
     lt_ma  = daily.rolling(params['mr_ma']).mean().resample('ME').last()
 
@@ -607,13 +571,11 @@ def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
     prev_w = pd.Series(dtype=float)
 
     for m in monthly.index:
-        # Momentum: blended
-        mom_scores = blended_momentum_scores(monthly.loc[:m].iloc[-13:])  # last ~12+ months for stability
+        # Momentum blended
+        mom_scores = blended_momentum_scores(monthly.loc[:m].iloc[-13:])
         mom_scores = mom_scores[mom_scores > 0]
         if mom_scores.empty:
-            portfolio_rets.loc[m] = 0.0
-            turnover_series.loc[m] = 0.0
-            continue
+            portfolio_rets.loc[m] = 0.0; turnover_series.loc[m] = 0.0; continue
 
         top = mom_scores.nlargest(params['mom_topn'])
         raw = top / top.sum()
@@ -636,8 +598,7 @@ def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
         ret_m = (fwd.loc[m, valid] * w[valid]).sum() if m in fwd.index else 0.0
         portfolio_rets.loc[m] = float(ret_m)
 
-        tno = _weights_to_turnover(prev_w, w)
-        turnover_series.loc[m] = tno
+        turnover_series.loc[m] = _weights_to_turnover(prev_w, w)
         prev_w = w
 
     gross = portfolio_rets.fillna(0.0)
@@ -649,7 +610,137 @@ def run_backtest_isa_dynamic(roundtrip_bps: float = 0.0,
     return strat_cum_gross, strat_cum_net, qqq_cum.reindex(strat_cum_gross.index, method='ffill'), turnover_series
 
 # =========================
-# Regime & Live Tracking
+# Diff engine (for Plan tab)
+# =========================
+def diff_portfolios(prev_df: Optional[pd.DataFrame],
+                    curr_df: Optional[pd.DataFrame],
+                    tol: float = 0.01) -> Dict[str, object]:
+    """
+    Compare two portfolios (index=tickers, column 'Weight') and return:
+      - sells: tickers in prev but not in curr
+      - buys: tickers in curr but not in prev
+      - rebalances: list[(ticker, old_w, new_w)] where |Δ| >= tol
+    """
+    if prev_df is None or prev_df.empty:
+        prev_df = pd.DataFrame(columns=['Weight'])
+    if curr_df is None or curr_df.empty:
+        curr_df = pd.DataFrame(columns=['Weight'])
+
+    prev_w = prev_df['Weight'] if 'Weight' in prev_df.columns else pd.Series(dtype=float)
+    curr_w = curr_df['Weight'] if 'Weight' in curr_df.columns else pd.Series(dtype=float)
+
+    tickers_prev = set(prev_w.index)
+    tickers_curr = set(curr_w.index)
+    sells = sorted(list(tickers_prev - tickers_curr))
+    buys  = sorted(list(tickers_curr - tickers_prev))
+
+    overlap = tickers_prev & tickers_curr
+    rebalances = []
+    for t in overlap:
+        w_old = float(prev_w.get(t, 0.0))
+        w_new = float(curr_w.get(t, 0.0))
+        if abs(w_new - w_old) >= tol:
+            rebalances.append((t, w_old, w_new))
+    rebalances.sort(key=lambda x: abs(x[2] - x[1]), reverse=True)
+    return {'sell': sells, 'buy': buys, 'rebalance': rebalances}
+
+# =========================
+# Explainability (“what changed & why”)
+# =========================
+def _signal_snapshot_for_explain(daily_prices: pd.DataFrame, params: Dict) -> pd.DataFrame:
+    if daily_prices.empty:
+        return pd.DataFrame()
+
+    monthly = daily_prices.resample('ME').last()
+    r3  = monthly.pct_change(3).iloc[-1]
+    r6  = monthly.pct_change(6).iloc[-1]
+    r12 = monthly.pct_change(12).iloc[-1]
+
+    def z(s):
+        s = s.replace([np.inf,-np.inf], np.nan).dropna()
+        if s.std(ddof=0) == 0 or s.empty:
+            return pd.Series(0.0, index=monthly.columns)
+        zs = (s - s.mean()) / (s.std(ddof=0) + 1e-9)
+        return zs.reindex(monthly.columns).fillna(0.0)
+
+    mom_score = 0.2*z(r3) + 0.4*z(r6) + 0.4*z(r12)
+    mom_rank  = mom_score.rank(ascending=False, method='min')
+
+    st_ret = daily_prices.pct_change(params['mr_lb']).iloc[-1]
+    long_ma = daily_prices.rolling(params['mr_ma']).mean().iloc[-1]
+    above_ma = (daily_prices.iloc[-1] > long_ma).astype(int)
+
+    snap = pd.DataFrame({
+        'mom_score': mom_score,
+        'mom_rank': mom_rank,
+        f'st_ret_{params["mr_lb"]}d': st_ret,
+        f'above_{params["mr_ma"]}dma': above_ma
+    })
+    return snap.sort_index()
+
+def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
+                              curr_df: Optional[pd.DataFrame],
+                              daily_prices: pd.DataFrame,
+                              params: Dict) -> pd.DataFrame:
+    prev_df = prev_df if prev_df is not None else pd.DataFrame(columns=['Weight'])
+    curr_df = curr_df if curr_df is not None else pd.DataFrame(columns=['Weight'])
+    prev_w = prev_df['Weight'].astype(float) if 'Weight' in prev_df.columns else pd.Series(dtype=float)
+    curr_w = curr_df['Weight'].astype(float) if 'Weight' in curr_df.columns else pd.Series(dtype=float)
+
+    all_tickers = sorted(set(prev_w.index) | set(curr_w.index))
+    if not all_tickers:
+        return pd.DataFrame(columns=[
+            'Ticker','Action','Old Wt','New Wt','Δ Wt (bps)',
+            'Mom Rank','Mom Score',f'ST Return ({params["mr_lb"]}d)',f'Above {params["mr_ma"]}DMA'
+        ])
+
+    snap = _signal_snapshot_for_explain(daily_prices[all_tickers].dropna(axis=1, how='all'), params)
+
+    rows = []
+    for t in all_tickers:
+        old_w = float(prev_w.get(t, 0.0))
+        new_w = float(curr_w.get(t, 0.0))
+        if abs(new_w - old_w) < 1e-9:
+            continue
+
+        if old_w == 0 and new_w > 0:
+            action = 'Buy'
+        elif new_w == 0 and old_w > 0:
+            action = 'Sell'
+        else:
+            action = 'Rebalance'
+
+        mom_rank = snap.at[t, 'mom_rank'] if t in snap.index else np.nan
+        mom_score = snap.at[t, 'mom_score'] if t in snap.index else np.nan
+        st_key = f'st_ret_{params["mr_lb"]}d'
+        stv = snap.at[t, st_key] if t in snap.index else np.nan
+        above_key = f'above_{params["mr_ma"]}dma'
+        ab = snap.at[t, above_key] if t in snap.index else np.nan
+
+        rows.append({
+            'Ticker': t,
+            'Action': action,
+            'Old Wt': old_w,
+            'New Wt': new_w,
+            'Δ Wt (bps)': int(round((new_w - old_w) * 10000)),
+            'Mom Rank': int(mom_rank) if pd.notna(mom_rank) else np.nan,
+            'Mom Score': mom_score,
+            f'ST Return ({params["mr_lb"]}d)': stv,
+            f'Above {params["mr_ma"]}DMA': bool(ab) if pd.notna(ab) else None
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    action_order = pd.Categorical(out['Action'], categories=['Buy','Rebalance','Sell'], ordered=True)
+    out = out.assign(ActionOrder=action_order).sort_values(['ActionOrder','Δ Wt (bps)'], ascending=[True, False]).drop(columns=['ActionOrder'])
+    out['Old Wt'] = out['Old Wt'].map(lambda x: f"{x:.2%}")
+    out['New Wt'] = out['New Wt'].map(lambda x: f"{x:.2%}")
+    return out.reset_index(drop=True)
+
+# =========================
+# Regime & Live paper tracking
 # =========================
 def _safe_series(obj):
     return obj.squeeze() if isinstance(obj, (pd.DataFrame,)) else obj
@@ -659,7 +750,7 @@ def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
     px = _safe_series(px)
     return pd.Series(px).dropna()
 
-def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> dict:
+def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
     if universe_prices_daily.empty:
         return {}
     start = (universe_prices_daily.index.min() - pd.DateOffset(days=5)).strftime('%Y-%m-%d')
@@ -687,7 +778,7 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> dict:
     }
 
 def load_live_perf() -> pd.DataFrame:
-    # Gist first
+    # Try Gist
     if GIST_API_URL and GITHUB_TOKEN:
         try:
             resp = requests.get(GIST_API_URL, headers=HEADERS); resp.raise_for_status()
@@ -700,7 +791,7 @@ def load_live_perf() -> pd.DataFrame:
             return df
         except Exception:
             pass
-    # Local fallback (optional)
+    # Local start (empty)
     return pd.DataFrame(columns=['date','strat_ret','qqq_ret','note'])
 
 def save_live_perf(df: pd.DataFrame):
@@ -721,7 +812,7 @@ def calc_one_day_live_return(weights: pd.Series, daily_prices: pd.DataFrame) -> 
     rets = aligned.pct_change().iloc[-1]
     return float((rets * weights).sum())
 
-def record_live_snapshot(weights_df: pd.DataFrame, note: str = "") -> dict:
+def record_live_snapshot(weights_df: pd.DataFrame, note: str = "") -> Dict[str, object]:
     try:
         universe = get_nasdaq_100_plus_tickers()
         end_date = datetime.today().strftime('%Y-%m-%d')
@@ -756,95 +847,3 @@ def get_live_equity() -> pd.DataFrame:
     df['strat_eq'] = (1 + df['strat_ret'].fillna(0)).cumprod()
     df['qqq_eq']   = (1 + df['qqq_ret'].fillna(0)).cumprod()
     return df[['date','strat_eq','qqq_eq']]
-
-# =========================
-# Explanations: "What changed and why"
-# =========================
-def _signal_snapshot_for_explain(daily_prices: pd.DataFrame, params: dict) -> pd.DataFrame:
-    if daily_prices.empty:
-        return pd.DataFrame()
-
-    monthly = daily_prices.resample('ME').last()
-    # Momentum components for explain
-    r3  = monthly.pct_change(3).iloc[-1]
-    r6  = monthly.pct_change(6).iloc[-1]
-    r12 = monthly.pct_change(12).iloc[-1]
-    def z(s):
-        s = s.replace([np.inf,-np.inf], np.nan).dropna()
-        if s.std(ddof=0) == 0 or s.empty:
-            return pd.Series(0.0, index=monthly.columns)
-        zs = (s - s.mean()) / (s.std(ddof=0) + 1e-9)
-        return zs.reindex(monthly.columns).fillna(0.0)
-    mom_score = 0.2*z(r3) + 0.4*z(r6) + 0.4*z(r12)
-    mom_rank  = mom_score.rank(ascending=False, method='min')
-
-    st_ret = daily_prices.pct_change(params['mr_lb']).iloc[-1]
-    long_ma = daily_prices.rolling(params['mr_ma']).mean().iloc[-1]
-    above_ma = (daily_prices.iloc[-1] > long_ma).astype(int)
-
-    snap = pd.DataFrame({
-        'mom_score': mom_score,
-        'mom_rank': mom_rank,
-        f'st_ret_{params["mr_lb"]}d': st_ret,
-        f'above_{params["mr_ma"]}dma': above_ma
-    })
-    return snap.sort_index()
-
-def explain_portfolio_changes(prev_df, curr_df, daily_prices, params: dict) -> pd.DataFrame:
-    prev_df = prev_df if prev_df is not None else pd.DataFrame(columns=['Weight'])
-    curr_df = curr_df if curr_df is not None else pd.DataFrame(columns=['Weight'])
-    prev_w = prev_df['Weight'].astype(float) if 'Weight' in prev_df.columns else pd.Series(dtype=float)
-    curr_w = curr_df['Weight'].astype(float) if 'Weight' in curr_df.columns else pd.Series(dtype=float)
-
-    all_tickers = sorted(set(prev_w.index) | set(curr_w.index))
-    if not all_tickers:
-        return pd.DataFrame(columns=[
-            'Ticker','Action','Old Wt','New Wt','Δ Wt (bps)',
-            'Mom Rank','Mom Score',f'ST Return ({params["mr_lb"]}d)',f'Above {params["mr_ma"]}DMA'
-        ])
-
-    snap = _signal_snapshot_for_explain(daily_prices[all_tickers].dropna(axis=1, how='all'), params)
-
-    rows = []
-    for t in all_tickers:
-        old_w = float(prev_w.get(t, 0.0))
-        new_w = float(curr_w.get(t, 0.0))
-        if abs(new_w - old_w) < 1e-9:
-            continue
-
-        if old_w == 0 and new_w > 0:
-            action = 'Buy'
-        elif new_w == 0 and old_w > 0:
-            action = 'Sell'
-        else:
-            action = 'Rebalance'
-
-        mom_rank = snap.at[t, 'mom_rank'] if t in snap.index else np.nan
-        mom_score = snap.at[t, 'mom_score'] if t in snap.index else np.nan
-        st_key = f'st_ret_{params["mr_lb"]}d'
-        stv = snap.at[t, st_key] if t in snap.index else np.nan
-        above_ma_key = f'above_{params["mr_ma"]}dma'
-        above_ma = snap.at[t, above_ma_key] if t in snap.index else np.nan
-
-        rows.append({
-            'Ticker': t,
-            'Action': action,
-            'Old Wt': old_w,
-            'New Wt': new_w,
-            'Δ Wt (bps)': int(round((new_w - old_w) * 10000)),
-            'Mom Rank': int(mom_rank) if pd.notna(mom_rank) else np.nan,
-            'Mom Score': mom_score,
-            f'ST Return ({params["mr_lb"]}d)': stv,
-            f'Above {params["mr_ma"]}DMA': bool(above_ma) if pd.notna(above_ma) else None
-        })
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-
-    action_order = pd.Categorical(out['Action'], categories=['Buy','Rebalance','Sell'], ordered=True)
-    out = out.assign(ActionOrder=action_order).sort_values(['ActionOrder','Δ Wt (bps)'], ascending=[True, False]).drop(columns=['ActionOrder'])
-
-    out['Old Wt'] = out['Old Wt'].map(lambda x: f"{x:.2%}")
-    out['New Wt'] = out['New Wt'].map(lambda x: f"{x:.2%}")
-    return out.reset_index(drop=True)
