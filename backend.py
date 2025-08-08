@@ -164,6 +164,111 @@ def kpi_row(name: str, rets: pd.Series, trade_log: pd.DataFrame | None = None, t
         f"{topy:.2f}",
         f"{eq_mult:.2f}x"
     ]
+# =========================
+# Explanations: "What changed and why"
+# =========================
+
+def _signal_snapshot_for_explain(daily_prices: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """
+    Build a one-date snapshot of signals used for selection, for explanation only.
+    - Momentum score: M-month price change (using month-end resample)
+    - ST return: mr_lb-day % change (lower is "dip")
+    - Above long MA: > mr_ma-day MA
+    - Ranks: momentum (desc), dip rank (desc on -ST return)
+    """
+    if daily_prices.empty:
+        return pd.DataFrame()
+
+    monthly = daily_prices.resample('ME').last()
+    mom = monthly.pct_change(params['mom_lb']).iloc[-1]
+
+    st_ret = daily_prices.pct_change(params['mr_lb']).iloc[-1]
+    long_ma = daily_prices.rolling(params['mr_ma']).mean().iloc[-1]
+    above_ma = (daily_prices.iloc[-1] > long_ma).astype(int)
+
+    # For MR we pick the worst short-term performers among quality names
+    dip_score = -st_ret  # more negative st_ret => higher dip_score
+    mom_rank = mom.rank(ascending=False, method='min')
+    dip_rank = dip_score.rank(ascending=False, method='min')
+
+    snap = pd.DataFrame({
+        'mom_score': mom,
+        'mom_rank': mom_rank,
+        f'st_ret_{params["mr_lb"]}d': st_ret,
+        f'above_{params["mr_ma"]}dma': above_ma,
+        'dip_rank': dip_rank
+    })
+    return snap.sort_index()
+
+def explain_portfolio_changes(
+    prev_df: pd.DataFrame | None,
+    curr_df: pd.DataFrame | None,
+    daily_prices: pd.DataFrame,
+    params: dict
+) -> pd.DataFrame:
+    """
+    Return a tidy table explaining buys/sells/rebalances with the signals used.
+    Columns: Ticker, Action, Old Wt, New Wt, Δ Wt (bps), Momentum rank/score, ST return, Above MA flag.
+    """
+    prev_df = prev_df if prev_df is not None else pd.DataFrame(columns=['Weight'])
+    curr_df = curr_df if curr_df is not None else pd.DataFrame(columns=['Weight'])
+    prev_w = prev_df['Weight'].astype(float) if 'Weight' in prev_df.columns else pd.Series(dtype=float)
+    curr_w = curr_df['Weight'].astype(float) if 'Weight' in curr_df.columns else pd.Series(dtype=float)
+
+    all_tickers = sorted(set(prev_w.index) | set(curr_w.index))
+    if not all_tickers:
+        return pd.DataFrame(columns=[
+            'Ticker','Action','Old Wt','New Wt','Δ Wt (bps)',
+            'Mom Rank','Mom Score',f'ST Return ({params["mr_lb"]}d)',f'Above {params["mr_ma"]}DMA'
+        ])
+
+    snap = _signal_snapshot_for_explain(daily_prices[all_tickers].dropna(axis=1, how='all'), params)
+
+    rows = []
+    for t in all_tickers:
+        old_w = float(prev_w.get(t, 0.0))
+        new_w = float(curr_w.get(t, 0.0))
+        if abs(new_w - old_w) < 1e-9:
+            continue
+
+        if old_w == 0 and new_w > 0:
+            action = 'Buy'
+        elif new_w == 0 and old_w > 0:
+            action = 'Sell'
+        else:
+            action = 'Rebalance'
+
+        mom_rank = snap.at[t, 'mom_rank'] if t in snap.index else np.nan
+        mom_score = snap.at[t, 'mom_score'] if t in snap.index else np.nan
+        st_key = f'st_ret_{params["mr_lb"]}d'
+        st_ret = snap.at[t, st_key] if t in snap.index else np.nan
+        above_ma_key = f'above_{params["mr_ma"]}dma'
+        above_ma = snap.at[t, above_ma_key] if t in snap.index else np.nan
+
+        rows.append({
+            'Ticker': t,
+            'Action': action,
+            'Old Wt': old_w,
+            'New Wt': new_w,
+            'Δ Wt (bps)': int(round((new_w - old_w) * 10000)),
+            'Mom Rank': int(mom_rank) if pd.notna(mom_rank) else np.nan,
+            'Mom Score': mom_score,
+            f'ST Return ({params["mr_lb"]}d)': st_ret,
+            f'Above {params["mr_ma"]}DMA': bool(above_ma) if pd.notna(above_ma) else None
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # Sort: Buys first (largest increase), then Rebalances, then Sells
+    action_order = pd.Categorical(out['Action'], categories=['Buy','Rebalance','Sell'], ordered=True)
+    out = out.assign(ActionOrder=action_order).sort_values(['ActionOrder','Δ Wt (bps)'], ascending=[True, False]).drop(columns=['ActionOrder'])
+
+    # Nice formatting for weights; leave scores numeric (Streamlit will pretty-print)
+    out['Old Wt'] = out['Old Wt'].map(lambda x: f"{x:.2%}")
+    out['New Wt'] = out['New Wt'].map(lambda x: f"{x:.2%}")
+    return out.reset_index(drop=True)
 
 # =========================
 # Regime & Live Tracking
