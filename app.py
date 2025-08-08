@@ -254,10 +254,11 @@ with tab2:
                                     st.write("None")
             except Exception as e:
                 st.error(f"Preview failed: {e}")
-
+                
 # ---- Tab 3: Performance ----
 with tab3:
     st.subheader("📈 Backtest (since 2018)")
+
     if strategy_cum_gross is None or qqq_cum is None:
         st.info("Generate to see backtest results.")
     else:
@@ -265,12 +266,13 @@ with tab3:
         st.markdown("#### Key Performance (monthly series inferred)")
 
         krows = []
-        # Pass turnover_series=hybrid_tno so Turnover/yr populates correctly
+        # Use turnover series and estimate Trades/yr from an average single-leg trade size (2%)
         krows.append(
             backend.kpi_row(
                 "Strategy (Gross)",
                 strategy_cum_gross.pct_change(),
-                turnover_series=hybrid_tno
+                turnover_series=hybrid_tno,
+                avg_trade_size=0.02
             )
         )
         if strategy_cum_net is not None and show_net:
@@ -278,22 +280,29 @@ with tab3:
                 backend.kpi_row(
                     "Strategy (Net of costs)",
                     strategy_cum_net.pct_change(),
-                    turnover_series=hybrid_tno  # same turnover, just netted returns
+                    turnover_series=hybrid_tno,
+                    avg_trade_size=0.02
                 )
             )
         krows.append(
             backend.kpi_row(
                 "QQQ Benchmark",
-                qqq_cum.pct_change(),
-                turnover_series=None  # benchmark has no turnover
+                qqq_cum.pct_change()
             )
         )
 
         kdf = pd.DataFrame(
             krows,
-            columns=["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity x"]
+            columns=[
+                "Model","Freq","CAGR","Sharpe","Sortino","Calmar",
+                "MaxDD","Trades/yr","Turnover/yr","Equity x"
+            ]
         )
         st.dataframe(kdf, use_container_width=True)
+        st.caption(
+            "Trades/yr is **estimated** from turnover assuming ~2% average per single-leg trade "
+            "(set via `avg_trade_size=0.02`). Adjust if needed."
+        )
 
         # Equity curves
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -306,7 +315,7 @@ with tab3:
         ax.grid(True, ls="--", alpha=0.6)
         ax.legend()
         st.pyplot(fig)
-
+        
 # ---- Tab 4: Regime ----
 with tab4:
     st.subheader("🧭 Market Regime")
