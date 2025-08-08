@@ -33,11 +33,12 @@ STRATEGY_PRESETS = {
         "mr_lb": 21,  "mr_topn": 3, "mr_ma": 200,
         "mom_w": 0.85, "mr_w": 0.15,
         "trigger": 0.75,
-        "stability_days": 5  # must persist in top cohort this many consecutive trading days
+        # Entries must persist in the top cohort this many consecutive trading days
+        "stability_days": 5
     }
 }
 
-REGIME_MA = 200
+REGIME_MA = 200  # long-term MA used in regime metrics
 
 # =========================
 # Universe & Data
@@ -335,7 +336,6 @@ def blended_momentum_scores_daily(daily_prices: pd.DataFrame) -> pd.DataFrame:
     r252 = px.pct_change(252)
 
     def z_df(df: pd.DataFrame) -> pd.DataFrame:
-        # z-score cross-section by day
         mu = df.mean(axis=1)
         sd = df.std(axis=1).replace(0, np.nan)
         z = (df.sub(mu, axis=0)).div(sd, axis=0)
@@ -510,7 +510,7 @@ def _build_isa_weights(daily_close: pd.DataFrame, preset: Dict) -> pd.Series:
         # Restrict to intersection of current top_m and stable set
         top_m = top_m.reindex(stable).dropna()
         if top_m.empty:
-            # If nothing passes stability, fall back to top_m (no entries this month otherwise)
+            # If nothing passes stability, fall back to top_m
             top_m = mom_scores.nlargest(preset["mom_topn"])
 
     mom_raw = (top_m / top_m.sum()) if top_m.sum() > 0 else pd.Series(dtype=float)
@@ -530,6 +530,187 @@ def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
     display_fmt["Weight"] = display_fmt["Weight"].map("{:.2%}".format)
     return display_fmt, display_df
 
+# =========================
+# Regime & Live paper tracking
+# =========================
+def _safe_series(obj):
+    return obj.squeeze() if isinstance(obj, (pd.DataFrame,)) else obj
+
+def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
+    px = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    px = _safe_series(px)
+    return pd.Series(px).dropna()
+
+def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
+    if universe_prices_daily.empty:
+        return {}
+    start = (universe_prices_daily.index.min() - pd.DateOffset(days=5)).strftime("%Y-%m-%d")
+    end   = (universe_prices_daily.index.max() + pd.DateOffset(days=5)).strftime("%Y-%m-%d")
+    qqq = get_benchmark_series("QQQ", start, end).reindex(universe_prices_daily.index).ffill().dropna()
+
+    pct_above_ma = (universe_prices_daily.iloc[-1] >
+                    universe_prices_daily.rolling(REGIME_MA).mean().iloc[-1]).mean()
+
+    qqq_ma = qqq.rolling(REGIME_MA).mean()
+    qqq_above_ma = float(qqq.iloc[-1] > qqq_ma.iloc[-1]) if len(qqq_ma.dropna()) else np.nan
+
+    qqq_vol_10d = qqq.pct_change().rolling(10).std().iloc[-1]
+    qqq_slope_50 = (qqq.rolling(50).mean().iloc[-1] / qqq.rolling(50).mean().iloc[-10] - 1) if len(qqq) > 60 else np.nan
+
+    monthly = universe_prices_daily.resample("ME").last()
+    pos_6m = (monthly.pct_change(6).iloc[-1] > 0).mean()
+
+    return {
+        "universe_above_200dma": float(pct_above_ma),
+        "qqq_above_200dma": float(qqq_above_ma),
+        "qqq_vol_10d": float(qqq_vol_10d),
+        "breadth_pos_6m": float(pos_6m),
+        "qqq_50dma_slope_10d": float(qqq_slope_50) if pd.notna(qqq_slope_50) else np.nan
+    }
+
+def load_live_perf() -> pd.DataFrame:
+    # Try Gist
+    if GIST_API_URL and GITHUB_TOKEN:
+        try:
+            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp.raise_for_status()
+            files = resp.json().get("files", {})
+            content = files.get(LIVE_PERF_FILE, {}).get("content", "")
+            if not content:
+                return pd.DataFrame(columns=["date","strat_ret","qqq_ret","note"])
+            df = pd.read_csv(io.StringIO(content))
+            df["date"] = pd.to_datetime(df["date"])
+            return df
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["date","strat_ret","qqq_ret","note"])
+
+def save_live_perf(df: pd.DataFrame) -> None:
+    if not GIST_API_URL or not GITHUB_TOKEN:
+        return
+    try:
+        csv_str = df.to_csv(index=False)
+        payload = {"files": {LIVE_PERF_FILE: {"content": csv_str}}}
+        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp.raise_for_status()
+    except Exception as e:
+        st.sidebar.warning(f"Could not save live perf: {e}")
+
+def calc_one_day_live_return(weights: pd.Series, daily_prices: pd.DataFrame) -> float:
+    if weights is None or weights.empty or daily_prices.empty:
+        return 0.0
+    aligned = daily_prices[weights.index.intersection(daily_prices.columns)].dropna().iloc[-2:]
+    if len(aligned) < 2:
+        return 0.0
+    rets = aligned.pct_change().iloc[-1]
+    return float((rets * weights.reindex(aligned.columns).fillna(0.0)).sum())
+
+def record_live_snapshot(weights_df: pd.DataFrame, note: str = "") -> Dict[str, object]:
+    try:
+        universe = get_nasdaq_100_plus_tickers()
+        end_date = datetime.today().strftime("%Y-%m-%d")
+        start_date = (datetime.today() - relativedelta(days=40)).strftime("%Y-%m-%d")
+        px = fetch_market_data(universe + ["QQQ"], start_date, end_date)
+        if px.empty or "QQQ" not in px.columns:
+            return {"ok": False, "msg": "No price data for live snapshot."}
+
+        weights = weights_df["Weight"].astype(float)
+        weights = weights / weights.sum() if weights.sum() > 0 else weights
+        weights = weights.reindex(px.columns).dropna()
+        strat_1d = calc_one_day_live_return(weights, px[weights.index])
+        qqq_1d   = px["QQQ"].pct_change().iloc[-1]
+
+        log = load_live_perf()
+        new_row = pd.DataFrame([{
+            "date": pd.to_datetime(px.index[-1]).normalize(),
+            "strat_ret": strat_1d,
+            "qqq_ret": float(qqq_1d),
+            "note": note
+        }])
+        out = pd.concat([log, new_row], ignore_index=True).drop_duplicates(subset=["date"], keep="last")
+        save_live_perf(out)
+        return {"ok": True, "strat_ret": strat_1d, "qqq_ret": float(qqq_1d), "rows": len(out)}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+def get_live_equity() -> pd.DataFrame:
+    log = load_live_perf().sort_values("date")
+    if log.empty:
+        return pd.DataFrame(columns=["date","strat_eq","qqq_eq"])
+    df = log.copy()
+    df["strat_eq"] = (1 + df["strat_ret"].fillna(0)).cumprod()
+    df["qqq_eq"]   = (1 + df["qqq_ret"].fillna(0)).cumprod()
+    return df[["date","strat_eq","qqq_eq"]]
+
+# =========================
+# NEW: Regime detection + Regime-aware ISA wrapper
+# =========================
+def get_market_regime() -> Tuple[str, Dict[str, float]]:
+    """
+    Computes a simple Bull / Caution / Bear label from existing regime metrics.
+    Returns (label, metrics_dict).
+    """
+    try:
+        universe = get_nasdaq_100_plus_tickers()
+        end = datetime.today().strftime("%Y-%m-%d")
+        start = (datetime.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
+        prices = fetch_market_data(universe, start, end)
+        if prices is None or prices.empty:
+            return "Unknown", {}
+
+        metrics = compute_regime_metrics(prices)
+
+        breadth      = float(metrics.get("universe_above_200dma", 0.0))
+        slope_50dma  = float(metrics.get("qqq_50dma_slope_10d", 0.0))
+        vol_10d      = float(metrics.get("qqq_vol_10d", 0.0))
+
+        if breadth > 0.60 and slope_50dma > 0 and vol_10d < 0.02:
+            return "Bull", metrics
+        elif breadth >= 0.40 and slope_50dma >= 0:
+            return "Caution", metrics
+        else:
+            return "Bear", metrics
+    except Exception:
+        return "Unknown", {}
+
+def build_isa_dynamic_with_regime(close_prices: pd.DataFrame,
+                                  params: Optional[dict] = None
+                                  ) -> Tuple[pd.Series, float, str, Dict[str, float]]:
+    """
+    Wrap ISA Dynamic stock selection with regime-aware exposure & trigger.
+    Returns (adjusted_weights, trigger_threshold, regime_label, regime_metrics)
+    """
+    if params is None:
+        params = STRATEGY_PRESETS["ISA Dynamic (0.75)"].copy()
+
+    regime_label, regime_metrics = get_market_regime()
+
+    trigger_adj = float(params.get("trigger", 0.75))
+    exposure_scale = 1.00
+    if regime_label == "Bull":
+        exposure_scale = 1.00
+        # trigger as-is
+    elif regime_label == "Caution":
+        exposure_scale = 0.85
+        trigger_adj = max(0.85, trigger_adj)
+    elif regime_label == "Bear":
+        exposure_scale = 0.65
+        trigger_adj = max(0.90, trigger_adj)
+    else:
+        exposure_scale = 1.00
+
+    base_w = _build_isa_weights(close_prices, params)
+    if base_w is None or base_w.empty:
+        return pd.Series(dtype=float), trigger_adj, regime_label, regime_metrics
+
+    # Leave scaled (implies some cash in weak regimes).
+    adj_w = base_w * exposure_scale
+
+    return adj_w, trigger_adj, regime_label, regime_metrics
+
+# =========================
+# Live portfolio generators for the app
+# =========================
 def generate_live_portfolio_classic(momentum_window: int, top_n: int, cap: float,
                                     min_dollar_volume: float = 0.0) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Classic 90/10 live weights (blended momentum; liquidity filter). No trigger/lock."""
@@ -556,7 +737,7 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
                                         prev_portfolio: Optional[pd.DataFrame],
                                         min_dollar_volume: float = 0.0) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
-    ISA Dynamic live weights with MONTHLY LOCK + stability filter + trigger.
+    ISA Dynamic live weights with MONTHLY LOCK + stability filter + regime-aware trigger.
     If today is NOT the first trading day of the month, we **hold** the previous portfolio.
     """
     universe = get_nasdaq_100_plus_tickers()
@@ -578,8 +759,8 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
             disp, raw = _format_display(prev_portfolio["Weight"])
             return disp, raw, decision
         else:
-            # No previous portfolio; we have to propose initial weights but flag that next month lock applies
-            decision = "No saved portfolio; proposing initial allocation (monthly lock will apply from next month)."
+            # No previous portfolio; propose initial weights, lock applies from next month
+            decision = "No saved portfolio; proposing initial allocation (monthly lock applies from next month)."
 
     # Liquidity filter
     available = [t for t in universe if t in close.columns]
@@ -589,8 +770,8 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
             return None, None, "No tickers pass liquidity filter."
         close = close[keep]
 
-    # Build candidate weights
-    new_w = _build_isa_weights(close, preset)
+    # Build candidate weights WITH regime overlay (exposure scaling + adjusted trigger)
+    new_w, trigger_adj, regime_label, _reg_metrics = build_isa_dynamic_with_regime(close, preset)
 
     # Trigger vs previous portfolio (only if monthly check or no prev exists)
     if prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
@@ -602,21 +783,18 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
             prev_w = prev_portfolio["Weight"].astype(float)
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
-            if health >= preset["trigger"]:
+            if health >= trigger_adj:
                 # Hold existing
-                decision = f"Health {health:.2f} ≥ trigger {preset['trigger']:.2f} — holding existing portfolio."
+                decision = f"[{regime_label}] Health {health:.2f} ≥ trigger {trigger_adj:.2f} — holding existing portfolio."
                 return _format_display(prev_w)
             else:
-                decision = f"Health {health:.2f} < trigger {preset['trigger']:.2f} — rebalancing to new targets."
+                decision = f"[{regime_label}] Health {health:.2f} < trigger {trigger_adj:.2f} — rebalancing to new targets."
+    else:
+        # No previous portfolio exists or empty
+        decision = f"[{regime_label}] Initial allocation proposed."
 
-    return _format_display(new_w), decision  # NOTE: corrected below to return 3 values
-
-# (tiny fix: return signature should be 3-tuple consistently)
-def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    display_df = pd.DataFrame({"Weight": weights}).sort_values("Weight", ascending=False)
-    display_fmt = display_df.copy()
-    display_fmt["Weight"] = display_fmt["Weight"].map("{:.2%}".format)
-    return display_fmt, display_df
+    disp, raw = _format_display(new_w)
+    return disp, raw, decision
 
 # =========================
 # Backtests for app (with costs & liquidity)
@@ -873,115 +1051,3 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
     out["Old Wt"] = out["Old Wt"].map(lambda x: f"{x:.2%}")
     out["New Wt"] = out["New Wt"].map(lambda x: f"{x:.2%}")
     return out.reset_index(drop=True)
-
-# =========================
-# Regime & Live paper tracking
-# =========================
-def _safe_series(obj):
-    return obj.squeeze() if isinstance(obj, (pd.DataFrame,)) else obj
-
-def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
-    px = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)["Close"]
-    px = _safe_series(px)
-    return pd.Series(px).dropna()
-
-def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
-    if universe_prices_daily.empty:
-        return {}
-    start = (universe_prices_daily.index.min() - pd.DateOffset(days=5)).strftime("%Y-%m-%d")
-    end   = (universe_prices_daily.index.max() + pd.DateOffset(days=5)).strftime("%Y-%m-%d")
-    qqq = get_benchmark_series("QQQ", start, end).reindex(universe_prices_daily.index).ffill().dropna()
-
-    pct_above_ma = (universe_prices_daily.iloc[-1] >
-                    universe_prices_daily.rolling(REGIME_MA).mean().iloc[-1]).mean()
-
-    qqq_ma = qqq.rolling(REGIME_MA).mean()
-    qqq_above_ma = float(qqq.iloc[-1] > qqq_ma.iloc[-1]) if len(qqq_ma.dropna()) else np.nan
-
-    qqq_vol_10d = qqq.pct_change().rolling(10).std().iloc[-1]
-    qqq_slope_50 = (qqq.rolling(50).mean().iloc[-1] / qqq.rolling(50).mean().iloc[-10] - 1) if len(qqq) > 60 else np.nan
-
-    monthly = universe_prices_daily.resample("ME").last()
-    pos_6m = (monthly.pct_change(6).iloc[-1] > 0).mean()
-
-    return {
-        "universe_above_200dma": float(pct_above_ma),
-        "qqq_above_200dma": float(qqq_above_ma),
-        "qqq_vol_10d": float(qqq_vol_10d),
-        "breadth_pos_6m": float(pos_6m),
-        "qqq_50dma_slope_10d": float(qqq_slope_50) if pd.notna(qqq_slope_50) else np.nan
-    }
-
-def load_live_perf() -> pd.DataFrame:
-    # Try Gist
-    if GIST_API_URL and GITHUB_TOKEN:
-        try:
-            resp = requests.get(GIST_API_URL, headers=HEADERS)
-            resp.raise_for_status()
-            files = resp.json().get("files", {})
-            content = files.get(LIVE_PERF_FILE, {}).get("content", "")
-            if not content:
-                return pd.DataFrame(columns=["date","strat_ret","qqq_ret","note"])
-            df = pd.read_csv(io.StringIO(content))
-            df["date"] = pd.to_datetime(df["date"])
-            return df
-        except Exception:
-            pass
-    return pd.DataFrame(columns=["date","strat_ret","qqq_ret","note"])
-
-def save_live_perf(df: pd.DataFrame) -> None:
-    if not GIST_API_URL or not GITHUB_TOKEN:
-        return
-    try:
-        csv_str = df.to_csv(index=False)
-        payload = {"files": {LIVE_PERF_FILE: {"content": csv_str}}}
-        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
-        resp.raise_for_status()
-    except Exception as e:
-        st.sidebar.warning(f"Could not save live perf: {e}")
-
-def calc_one_day_live_return(weights: pd.Series, daily_prices: pd.DataFrame) -> float:
-    if weights is None or weights.empty or daily_prices.empty:
-        return 0.0
-    aligned = daily_prices[weights.index.intersection(daily_prices.columns)].dropna().iloc[-2:]
-    if len(aligned) < 2:
-        return 0.0
-    rets = aligned.pct_change().iloc[-1]
-    return float((rets * weights.reindex(aligned.columns).fillna(0.0)).sum())
-
-def record_live_snapshot(weights_df: pd.DataFrame, note: str = "") -> Dict[str, object]:
-    try:
-        universe = get_nasdaq_100_plus_tickers()
-        end_date = datetime.today().strftime("%Y-%m-%d")
-        start_date = (datetime.today() - relativedelta(days=40)).strftime("%Y-%m-%d")
-        px = fetch_market_data(universe + ["QQQ"], start_date, end_date)
-        if px.empty or "QQQ" not in px.columns:
-            return {"ok": False, "msg": "No price data for live snapshot."}
-
-        weights = weights_df["Weight"].astype(float)
-        weights = weights / weights.sum() if weights.sum() > 0 else weights
-        weights = weights.reindex(px.columns).dropna()
-        strat_1d = calc_one_day_live_return(weights, px[weights.index])
-        qqq_1d   = px["QQQ"].pct_change().iloc[-1]
-
-        log = load_live_perf()
-        new_row = pd.DataFrame([{
-            "date": pd.to_datetime(px.index[-1]).normalize(),
-            "strat_ret": strat_1d,
-            "qqq_ret": float(qqq_1d),
-            "note": note
-        }])
-        out = pd.concat([log, new_row], ignore_index=True).drop_duplicates(subset=["date"], keep="last")
-        save_live_perf(out)
-        return {"ok": True, "strat_ret": strat_1d, "qqq_ret": float(qqq_1d), "rows": len(out)}
-    except Exception as e:
-        return {"ok": False, "msg": str(e)}
-
-def get_live_equity() -> pd.DataFrame:
-    log = load_live_perf().sort_values("date")
-    if log.empty:
-        return pd.DataFrame(columns=["date","strat_eq","qqq_eq"])
-    df = log.copy()
-    df["strat_eq"] = (1 + df["strat_ret"].fillna(0)).cumprod()
-    df["qqq_eq"]   = (1 + df["qqq_ret"].fillna(0)).cumprod()
-    return df[["date","strat_eq","qqq_eq"]]
