@@ -9,14 +9,14 @@ from dateutil.relativedelta import relativedelta
 
 import backend
 
-# ---------------------------------
+# =========================
 # Page Config
-# ---------------------------------
+# =========================
 st.set_page_config(layout="wide", page_title="Hybrid Momentum Portfolio")
 
-# ---------------------------------
-# Auto-log 1-day performance on load
-# ---------------------------------
+# =========================
+# Sidebar: App + Strategy Controls
+# =========================
 st.sidebar.header("⚙️ App Controls")
 auto_log = st.sidebar.checkbox(
     "Auto-log 1-day performance on load",
@@ -24,47 +24,24 @@ auto_log = st.sidebar.checkbox(
     help="Logs 1-day return vs QQQ using last saved portfolio (from Gist or local CSV)."
 )
 
-auto_log_msg = ""
-if auto_log:
-    try:
-        prev_port = backend.load_previous_portfolio()
-        if prev_port is not None and not prev_port.empty:
-            out = backend.record_live_snapshot(prev_port, note="auto")
-            if out.get("ok"):
-                auto_log_msg = (
-                    f"📌 Auto-logged: Strategy {out['strat_ret']:.2%} "
-                    f"vs QQQ {out['qqq_ret']:.2%} (rows: {out['rows']})"
-                )
-            else:
-                auto_log_msg = f"⚠️ Auto-log skipped: {out.get('msg','No message')}"
-        else:
-            auto_log_msg = "ℹ️ Auto-log skipped (no saved portfolio found)."
-    except Exception as e:
-        auto_log_msg = f"⚠️ Auto-log error: {e}"
-
-if auto_log_msg:
-    st.sidebar.caption(auto_log_msg)
-
-# ---------------------------------
-# Strategy selection
-# ---------------------------------
 st.sidebar.header("🎛️ Strategy Mode")
 mode = st.sidebar.selectbox(
     "Choose a strategy",
     ["Classic 90/10 (sliders)", "ISA Dynamic (0.75)"]
 )
 
-# Costs & Liquidity controls
 st.sidebar.header("💸 Costs & Liquidity")
-apply_costs = st.sidebar.checkbox("Show net of costs", value=True)
-roundtrip_bps = st.sidebar.number_input("Round-trip trading cost (bps)", min_value=0, max_value=100, value=10, step=1)
+apply_costs = st.sidebar.checkbox("Show net of costs in backtest", value=True)
+roundtrip_bps = st.sidebar.number_input(
+    "Round-trip trading cost (bps)", min_value=0, max_value=100, value=10, step=1
+)
 min_dollar_volume = st.sidebar.number_input(
-    "Min median £ volume (60d)",
+    "Min median $ volume (60d)",
     min_value=0, value=10_000_000, step=1_000_000,
-    help="Filters illiquid names using median (Close×Volume) over 60 trading days."
+    help="Filters illiquid names using median (Close×Volume) over ~60 trading days."
 )
 
-# Classic controls
+# Classic parameters
 if mode == "Classic 90/10 (sliders)":
     st.sidebar.header("🧮 Classic Parameters (Momentum Sleeve)")
     momentum_window = st.sidebar.slider("Momentum Lookback (Months)", 3, 12, 6, 1)
@@ -80,32 +57,50 @@ else:
     st.sidebar.write(f"Trigger: {preset['trigger']:.2f}")
     tol = st.sidebar.slider("Rebalancing Tolerance (display diffs)", 0.005, 0.05, 0.01, 0.005, format="%.3f")
 
-# ---------------------------------
+# =========================
 # Title
-# ---------------------------------
+# =========================
 st.title("🚀 Hybrid Momentum Portfolio Manager")
 if mode == "Classic 90/10 (sliders)":
     st.markdown("Classic **90/10 Hybrid**: blended momentum (3/6/12m) + MR, with liquidity filter and optional trading costs.")
 else:
     st.markdown("ISA **Dynamic (0.75)** preset: lower churn via health trigger; blended momentum; liquidity filter; optional trading costs.")
 
-# ---------------------------------
-# Generate
-# ---------------------------------
+# =========================
+# Auto-log (1d)
+# =========================
+if auto_log:
+    msg = ""
+    try:
+        prev_port = backend.load_previous_portfolio()
+        if prev_port is not None and not prev_port.empty:
+            out = backend.record_live_snapshot(prev_port, note="auto")
+            if out.get("ok"):
+                msg = f"📌 Auto-logged: Strategy {out['strat_ret']:.2%} vs QQQ {out['qqq_ret']:.2%} (rows: {out['rows']})"
+            else:
+                msg = f"⚠️ Auto-log skipped: {out.get('msg','No message')}"
+        else:
+            msg = "ℹ️ Auto-log skipped (no saved portfolio found)."
+    except Exception as e:
+        msg = f"⚠️ Auto-log error: {e}"
+    st.sidebar.caption(msg)
+
+# =========================
+# Main button
+# =========================
 if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_container_width=True):
     with st.spinner("Crunching data…"):
         try:
             prev_portfolio = backend.load_previous_portfolio()
 
+            # --- Build live portfolio & run backtest ---
             if mode == "Classic 90/10 (sliders)":
-                # Live portfolio (classic)
                 new_portfolio_display, new_portfolio_raw = backend.generate_live_portfolio_classic(
                     momentum_window, top_n, cap,
                     min_dollar_volume=min_dollar_volume
                 )
                 decision_note = "Classic mode (no trigger)."
 
-                # Backtest (classic) with costs/liquidity
                 strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_for_app(
                     momentum_window, top_n, cap,
                     roundtrip_bps=roundtrip_bps,
@@ -113,7 +108,6 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     show_net=apply_costs
                 )
             else:
-                # Live portfolio (ISA Dynamic with trigger vs previous)
                 display_df, raw_df, decision_note = backend.generate_live_portfolio_isa(
                     backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"],
                     prev_portfolio if (prev_portfolio is not None and not prev_portfolio.empty) else None,
@@ -121,28 +115,33 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 )
                 new_portfolio_display, new_portfolio_raw = display_df, raw_df
 
-                # Backtest (ISA preset, trigger-free), with costs/liquidity
                 strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
                     roundtrip_bps=roundtrip_bps,
                     min_dollar_volume=min_dollar_volume,
                     show_net=apply_costs
                 )
 
-            # Persist the latest portfolio locally for next-run diff (Gist save still via button)
             if new_portfolio_raw is not None and not new_portfolio_raw.empty:
                 backend.save_current_portfolio(new_portfolio_raw)
+                st.session_state.latest_portfolio = new_portfolio_raw
 
-            # -------------------------
-            # Tabs
-            # -------------------------
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(
-                ["📊 Rebalancing Plan", "✅ New Portfolio", "📈 Performance", "📉 Market Volatility", "📡 Regime & Live"]
+            # --- Tabs ---
+            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+                ["📊 Rebalancing Plan",
+                 "✅ New Portfolio",
+                 "📈 Performance",
+                 "💸 Costs & Liquidity",
+                 "📉 Market Volatility",
+                 "📡 Regime & Live"]
             )
 
-            # --- Tab 1: Plan ---
+            # ----------------
+            # Tab 1: Plan
+            # ----------------
             with tab1:
                 st.subheader("Rebalancing Plan")
                 st.info(decision_note)
+
                 if new_portfolio_raw is not None and not new_portfolio_raw.empty:
                     signals = backend.diff_portfolios(
                         prev_portfolio if prev_portfolio is not None else st.session_state.get('latest_portfolio', backend.load_previous_portfolio()),
@@ -151,19 +150,19 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     if not any(signals.values()):
                         st.success("✅ No major rebalancing needed!")
                     else:
-                        cols = st.columns(3)
-                        with cols[0]:
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
                             if signals['sell']:
                                 st.error("🔴 Sell Completely")
                                 for t in signals['sell']:
                                     st.markdown(f"- **{t}**")
-                        with cols[1]:
+                        with c2:
                             if signals['buy']:
                                 st.success("🟢 New Buys")
                                 for t in signals['buy']:
                                     w = float(new_portfolio_raw.at[t, 'Weight'])
                                     st.markdown(f"- **{t}** (Target: {w:.2%})")
-                        with cols[2]:
+                        with c3:
                             if signals['rebalance']:
                                 st.info("🔄 Rebalance")
                                 for t, old_w, new_w in signals['rebalance']:
@@ -171,16 +170,16 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 else:
                     st.warning("No portfolio generated.")
 
-                # === Explain changes (new) ===
+                # Explainability
                 try:
                     with st.expander("🔎 What changed and why?", expanded=False):
                         uni = backend.get_nasdaq_100_plus_tickers()
                         if mode == "Classic 90/10 (sliders)":
                             params_for_explain = {
-                                'mom_lb': momentum_window,   # months
+                                'mom_lb': momentum_window,
                                 'mom_topn': top_n,
                                 'mom_cap': cap,
-                                'mr_lb': 21,                 # classic MR
+                                'mr_lb': 21,
                                 'mr_topn': 5,
                                 'mr_ma': 200,
                                 'mom_w': 0.90,
@@ -193,7 +192,6 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
 
                         end_explain = datetime.today().strftime('%Y-%m-%d')
                         px_explain = backend.fetch_market_data(uni, start_explain, end_explain)
-
                         if px_explain.empty:
                             st.info("Could not fetch prices to build signal snapshot.")
                         else:
@@ -216,7 +214,9 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 except Exception as e:
                     st.warning(f"Could not build explanation: {e}")
 
-            # --- Tab 2: Portfolio ---
+            # ----------------
+            # Tab 2: Portfolio
+            # ----------------
             with tab2:
                 st.subheader("New Target Portfolio")
                 if new_portfolio_display is not None and not new_portfolio_display.empty:
@@ -226,11 +226,12 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 else:
                     st.warning("No portfolio to display.")
 
-            # --- Tab 3: Performance ---
+            # ----------------
+            # Tab 3: Performance
+            # ----------------
             with tab3:
                 st.subheader("Backtest vs. QQQ (Since 2018)")
                 if strat_cum_gross is not None and qqq_cum is not None:
-                    # KPI table — show both gross and net if requested
                     if apply_costs and strat_cum_net is not None:
                         strat_g = strat_cum_gross.pct_change().dropna()
                         strat_n = strat_cum_net.pct_change().dropna()
@@ -253,7 +254,6 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     )
                     st.table(kpi_df)
 
-                    # Plot log equity
                     fig, ax = plt.subplots(figsize=(10,5))
                     ax.plot(strat_cum_gross.index, strat_cum_gross.values, label='Strategy (Gross)')
                     if apply_costs and strat_cum_net is not None:
@@ -265,15 +265,74 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     ax.grid(True, which="both", ls="--")
                     st.pyplot(fig)
 
-                    # Turnover trace
                     if hybrid_tno is not None:
                         st.caption("Estimated monthly turnover (fraction of portfolio traded):")
                         st.line_chart(hybrid_tno.rename("Turnover"))
                 else:
                     st.warning("Could not generate backtest.")
 
-            # --- Tab 4: Volatility ---
+            # ----------------
+            # Tab 4: Costs & Liquidity (new)
+            # ----------------
             with tab4:
+                st.subheader("Costs & Liquidity Reality Check")
+                st.caption("Estimates based on median $ volume and your round-trip cost setting. Not investment advice.")
+
+                # Notional for participation ratio calc
+                notional = st.number_input(
+                    "Assumed portfolio notional (USD)", min_value=10_000, value=100_000, step=10_000
+                )
+
+                # Liquidity pass count (using same universe filter)
+                try:
+                    uni = backend.get_nasdaq_100_plus_tickers()
+                    start = (datetime.today() - relativedelta(months=14)).strftime('%Y-%m-%d')
+                    end   = datetime.today().strftime('%Y-%m-%d')
+                    close, vol = backend.fetch_price_volume(uni, start, end)
+                    if not close.empty and not vol.empty:
+                        keep = backend.filter_by_liquidity(close, vol, min_dollar_volume) if min_dollar_volume > 0 else list(close.columns)
+                        st.write(f"**Liquidity filter:** {len(keep)}/{len(close.columns)} tickers pass (≥ ${min_dollar_volume:,.0f} median $ volume).")
+                    else:
+                        st.info("Couldn’t fetch price/volume to compute liquidity.")
+                except Exception as e:
+                    st.warning(f"Liquidity check failed: {e}")
+
+                # Turnover → cost drag estimate
+                if hybrid_tno is not None:
+                    avg_turnover = pd.Series(hybrid_tno).groupby(pd.to_datetime(hybrid_tno.index).year).sum().mean()
+                    est_cost_drag = avg_turnover * (roundtrip_bps / 10000.0)
+                    st.metric("Avg turnover / yr (backtest)", f"{avg_turnover:.2f}×")
+                    st.metric("Est. cost drag / yr", f"{est_cost_drag*100:.2f}%")
+                else:
+                    st.info("No turnover series available for cost estimate.")
+
+                # Per-ticker liquidity table (current portfolio)
+                if new_portfolio_raw is not None and not new_portfolio_raw.empty and not close.empty and not vol.empty:
+                    try:
+                        # Median $ volume
+                        med_dollar = backend.median_dollar_volume(
+                            close[new_portfolio_raw.index.intersection(close.columns)],
+                            vol[new_portfolio_raw.index.intersection(vol.columns)],
+                            window=60
+                        ).rename("Median_$Vol(60d)")
+                        df = pd.DataFrame(med_dollar)
+                        df["Weight"] = new_portfolio_raw['Weight'].reindex(df.index)
+                        # Approx $ position
+                        df["$Position"] = df["Weight"] * notional
+                        # Participation ratio
+                        df["Participation(%)"] = np.where(df["Median_$Vol(60d)"]>0,
+                                                          (df["$Position"] / df["Median_$Vol(60d)"])*100, np.nan)
+                        st.dataframe(df.sort_values("Weight", ascending=False), use_container_width=True)
+                        st.caption("Participation(%) = $Position / Median Dollar Volume. Lower is better for execution.")
+                    except Exception as e:
+                        st.warning(f"Couldn’t compute per-ticker liquidity table: {e}")
+                else:
+                    st.info("Generate a portfolio first to see per-ticker liquidity.")
+
+            # ----------------
+            # Tab 5: Volatility
+            # ----------------
+            with tab5:
                 st.subheader("QQQ 10-Day Rolling Volatility")
                 try:
                     qqq_vol_data = yf.download("QQQ", period="60d", auto_adjust=True, progress=False)
@@ -293,8 +352,10 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 except Exception as e:
                     st.error(f"Could not fetch volatility data: {e}")
 
-            # --- Tab 5: Regime & Live ---
-            with tab5:
+            # ----------------
+            # Tab 6: Regime & Live
+            # ----------------
+            with tab6:
                 st.subheader("Market Regime Snapshot")
                 try:
                     uni = backend.get_nasdaq_100_plus_tickers()
@@ -336,17 +397,14 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 else:
                     st.info("No live snapshots yet. Click the button above to start logging.")
 
-            # Keep raw for save button and for local persistence
-            if new_portfolio_raw is not None and not new_portfolio_raw.empty:
-                st.session_state.latest_portfolio = new_portfolio_raw
-
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}")
 
-# --- Save button ---
+# =========================
+# Save button
+# =========================
 if 'latest_portfolio' in st.session_state and not st.session_state.latest_portfolio.empty:
     st.sidebar.header("💾 Save Portfolio")
     if st.sidebar.button("Save this portfolio for next month"):
         backend.save_portfolio_to_gist(st.session_state.latest_portfolio)
-        # Also save locally to CSV for fallback diffs
         backend.save_current_portfolio(st.session_state.latest_portfolio)
