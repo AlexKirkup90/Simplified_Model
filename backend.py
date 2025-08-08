@@ -166,6 +166,135 @@ def kpi_row(name: str, rets: pd.Series, trade_log: pd.DataFrame | None = None, t
     ]
 
 # =========================
+# Regime & Live Tracking
+# =========================
+
+REGIME_MA = 200
+LIVE_PERF_FILE = "live_perf.csv"
+
+def _safe_series(obj):
+    return obj.squeeze() if isinstance(obj, (pd.DataFrame,)) else obj
+
+def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
+    px = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)['Close']
+    px = _safe_series(px)
+    return pd.Series(px).dropna()
+
+def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> dict:
+    """Simple, robust regime snapshot using daily data."""
+    if universe_prices_daily.empty:
+        return {}
+    # QQQ anchors
+    start = (universe_prices_daily.index.min() - pd.DateOffset(days=5)).strftime('%Y-%m-%d')
+    end   = (universe_prices_daily.index.max() + pd.DateOffset(days=5)).strftime('%Y-%m-%d')
+    qqq = get_benchmark_series("QQQ", start, end).reindex(universe_prices_daily.index).ffill().dropna()
+
+    pct_above_ma = (universe_prices_daily.iloc[-1] >
+                    universe_prices_daily.rolling(REGIME_MA).mean().iloc[-1]).mean()
+
+    qqq_ma = qqq.rolling(REGIME_MA).mean()
+    qqq_above_ma = float(qqq.iloc[-1] > qqq_ma.iloc[-1]) if len(qqq_ma.dropna()) else np.nan
+
+    qqq_vol_10d = qqq.pct_change().rolling(10).std().iloc[-1]
+    qqq_slope_50 = (qqq.rolling(50).mean().iloc[-1] / qqq.rolling(50).mean().iloc[-10] - 1) if len(qqq) > 60 else np.nan
+
+    # Universe breadth (positive 6-month momentum)
+    monthly = universe_prices_daily.resample('ME').last()
+    pos_6m = (monthly.pct_change(6).iloc[-1] > 0).mean()
+
+    return {
+        "universe_above_200dma": float(pct_above_ma),   # 0–1
+        "qqq_above_200dma": float(qqq_above_ma),       # 0/1
+        "qqq_vol_10d": float(qqq_vol_10d),             # daily stdev
+        "breadth_pos_6m": float(pos_6m),               # 0–1
+        "qqq_50dma_slope_10d": float(qqq_slope_50) if pd.notna(qqq_slope_50) else np.nan
+    }
+
+# -------- Live paper tracker (very light) --------
+
+def load_live_perf() -> pd.DataFrame:
+    """Load live performance log from Gist (if configured) or return empty."""
+    if not GIST_API_URL or not GITHUB_TOKEN:
+        return pd.DataFrame(columns=['date','strat_ret','qqq_ret','note'])
+    try:
+        resp = requests.get(GIST_API_URL, headers=HEADERS); resp.raise_for_status()
+        files = resp.json().get('files', {})
+        content = files.get(LIVE_PERF_FILE, {}).get('content', '')
+        if not content:
+            return pd.DataFrame(columns=['date','strat_ret','qqq_ret','note'])
+        df = pd.read_csv(pd.compat.StringIO(content))
+        df['date'] = pd.to_datetime(df['date'])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=['date','strat_ret','qqq_ret','note'])
+
+def save_live_perf(df: pd.DataFrame):
+    """Persist live performance log to Gist (no-op if not configured)."""
+    if not GIST_API_URL or not GITHUB_TOKEN:
+        return
+    try:
+        csv_str = df.to_csv(index=False)
+        payload = {'files': {LIVE_PERF_FILE: {'content': csv_str}}}
+        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp.raise_for_status()
+    except Exception as e:
+        st.sidebar.warning(f"Could not save live perf: {e}")
+
+def calc_one_day_live_return(weights: pd.Series, daily_prices: pd.DataFrame) -> float:
+    """
+    Approx live 1-day return of portfolio using today's and yesterday's closes.
+    weights: Series of target weights (sums to 1). daily_prices: Close df.
+    """
+    if weights is None or weights.empty or daily_prices.empty: return 0.0
+    aligned = daily_prices[weights.index].dropna().iloc[-2:]  # last 2 days
+    if len(aligned) < 2: return 0.0
+    rets = aligned.pct_change().iloc[-1]
+    return float((rets * weights).sum())
+
+def record_live_snapshot(weights_df: pd.DataFrame, note: str = "") -> dict:
+    """
+    App helper: compute 1-day strat & QQQ returns from last two closes and save to Gist CSV.
+    Returns a dict with the computed numbers for display.
+    """
+    try:
+        universe = get_nasdaq_100_plus_tickers()
+        end_date = datetime.today().strftime('%Y-%m-%d')
+        start_date = (datetime.today() - relativedelta(days=40)).strftime('%Y-%m-%d')
+        px = fetch_market_data(universe + ['QQQ'], start_date, end_date)
+        if px.empty or 'QQQ' not in px.columns:
+            return {"ok": False, "msg": "No price data for live snapshot."}
+
+        weights = weights_df['Weight'].astype(float)
+        weights = weights / weights.sum() if weights.sum() > 0 else weights
+        strat_1d = calc_one_day_live_return(weights, px[weights.index])
+        qqq_1d   = px['QQQ'].pct_change().iloc[-1]
+
+        log = load_live_perf()
+        new_row = pd.DataFrame([{
+            'date': pd.to_datetime(px.index[-1]).normalize(),
+            'strat_ret': strat_1d,
+            'qqq_ret': float(qqq_1d),
+            'note': note
+        }])
+        out = pd.concat([log, new_row], ignore_index=True).drop_duplicates(subset=['date'], keep='last')
+        save_live_perf(out)
+        return {"ok": True, "strat_ret": strat_1d, "qqq_ret": float(qqq_1d), "rows": len(out)}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+def get_live_equity() -> pd.DataFrame:
+    """
+    Return cumulative equity of logged live returns for strategy vs QQQ.
+    """
+    log = load_live_perf().sort_values('date')
+    if log.empty:
+        return pd.DataFrame(columns=['date','strat_eq','qqq_eq'])
+    df = log.copy()
+    df['strat_eq'] = (1 + df['strat_ret'].fillna(0)).cumprod()
+    df['qqq_eq']   = (1 + df['qqq_ret'].fillna(0)).cumprod()
+    return df[['date','strat_eq','qqq_eq']]
+
+# =========================
 # Classic strategy (as before)
 # =========================
 def run_backtest_gross(daily_prices: pd.DataFrame, momentum_window: int = 6, top_n: int = 15, cap: float = 0.25) -> pd.Series:
