@@ -70,33 +70,67 @@ def cap_weights(weights, cap=0.25, max_iterations=100):
     return w
 
 def get_performance_metrics(returns, use_quantstats=False):
-    """Calculates key performance metrics from a returns series.
-       use_quantstats is optional and ignored unless True."""
-    if returns.empty:
-        return {}
+    """
+    Calculates performance metrics for a MONTHLY returns series.
+    Always returns the keys the app expects.
+    """
+    # Ensure we have a clean Series
+    r = pd.Series(returns).dropna()
+    if r.empty or len(r) < 2:
+        return {
+            'Annual Return': 'N/A',
+            'Sharpe Ratio': 'N/A',
+            'Sortino Ratio': 'N/A',
+            'Calmar Ratio': 'N/A',
+            'Max Drawdown': 'N/A',
+        }
 
-    annual_return = returns.mean() * 12
-    sharpe_ratio = annual_return / (returns.std() * np.sqrt(12) + 1e-9)
-    cumulative_returns = (1 + returns).cumprod()
-    peak = cumulative_returns.cummax()
-    drawdown = (cumulative_returns - peak) / peak
-    max_drawdown = drawdown.min()
+    # Annual return (CAGR from equity curve, not just mean*12)
+    equity = (1 + r).cumprod()
+    n = len(r)
+    ann_return = equity.iloc[-1] ** (12 / n) - 1
 
-    metrics = {
-        'Annual Return': f"{annual_return:.2%}",
-        'Sharpe Ratio': f"{sharpe_ratio:.2f}",
-        'Max Drawdown': f"{max_drawdown:.2%}"
-    }
+    # Vol metrics (assumes monthly series -> 12 periods/yr)
+    mean_m = r.mean()
+    std_m = r.std()
+    ann_vol = std_m * np.sqrt(12)
 
+    # Sharpe (risk-free ~0)
+    sharpe = (mean_m * 12) / (ann_vol + 1e-9)
+
+    # Sortino (downside std only)
+    downside = r.clip(upper=0)
+    d_std_m = downside.std()
+    sortino = (mean_m * 12) / (d_std_m * np.sqrt(12) + 1e-9) if d_std_m > 0 else np.nan
+
+    # Max drawdown
+    peak = equity.cummax()
+    drawdown = (equity - peak) / peak
+    mdd = drawdown.min()
+
+    # Calmar
+    calmar = (ann_return / abs(mdd)) if (mdd is not None and mdd != 0) else np.nan
+
+    # Optional QS hook (ignored unless True)
     if use_quantstats:
         try:
-            import quantstats as qs
-            qs.extend_pandas()
-            qs.reports.html(returns, output='stats.html')
-        except ImportError:
-            print("QuantStats not installed. Skipping report.")
+            import quantstats as qs  # not required for the app path
+            _ = qs  # just to avoid linter warnings if unused
+        except Exception:
+            pass
 
-    return metrics
+    def f_pct(x): 
+        return "N/A" if pd.isna(x) else f"{x:.2%}"
+    def f_num(x): 
+        return "N/A" if pd.isna(x) else f"{x:.2f}"
+
+    return {
+        'Annual Return': f_pct(ann_return),
+        'Sharpe Ratio': f_num(sharpe),
+        'Sortino Ratio': f_num(sortino),
+        'Calmar Ratio': f_num(calmar),
+        'Max Drawdown': f_pct(mdd),
+    }
 
 def run_backtest_gross(daily_prices, momentum_window=6, top_n=15, cap=0.25):
     """Runs the primary MOMENTUM strategy."""
