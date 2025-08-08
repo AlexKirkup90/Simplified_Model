@@ -1,388 +1,371 @@
-# app.py — ISA Dynamic Portfolio (Monthly-Locked with Countdown)
-import streamlit as st
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
+# app.py
+import traceback
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-import backend
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import backend  # our backend module
+
+st.set_page_config(page_title="Hybrid Momentum Portfolio (ISA-ready)", layout="wide")
 
 # =========================
-# Page Config
+# Sidebar Controls
 # =========================
-st.set_page_config(layout="wide", page_title="ISA Dynamic Portfolio (Monthly)")
+st.sidebar.header("⚙️ Settings")
 
-# =========================
-# Date helpers (UI)
-# =========================
-def first_business_day(dt: datetime) -> pd.Timestamp:
-    start = pd.Timestamp(dt.date()).replace(day=1)
-    return pd.date_range(start=start, periods=1, freq="BMS")[0]
+mode = st.sidebar.selectbox(
+    "Strategy Mode",
+    ["ISA Dynamic (0.75) — Monthly Lock (Regime-Aware)", "Classic 90/10 (no lock)"],
+    index=0,
+)
 
-def next_rebalance_day(dt: datetime) -> pd.Timestamp:
-    # next month’s first business day
-    nxt = dt + relativedelta(months=1)
-    return first_business_day(nxt)
+# Common
+tol = st.sidebar.slider("Rebalance tolerance (abs Δ weight)", 0.005, 0.05, 0.01, 0.005, format="%.3f")
+min_dollar_volume = st.sidebar.number_input(
+    "Min median $ volume (60d)", min_value=0.0, value=0.0, step=1_000_000.0, help="Liquidity filter"
+)
+roundtrip_bps = st.sidebar.slider(
+    "Round-trip trading cost (bps)", 0, 100, 20, 1, help="Used in backtests only"
+)
+show_net = st.sidebar.checkbox("Show net of costs in backtest", value=True)
 
-def is_rebalance_day(dt: datetime) -> bool:
-    return pd.Timestamp(dt.date()) == first_business_day(dt)
+# Classic-only sliders
+if "Classic" in mode:
+    momentum_window = st.sidebar.slider("Momentum lookback (months)", 3, 12, 6, 1)
+    top_n = st.sidebar.slider("Number of momentum names", 5, 20, 15, 1)
+    cap = st.sidebar.slider("Max weight cap per stock", 0.10, 0.50, 0.25, 0.01, format="%.2f")
 
-def human_countdown(target_ts: pd.Timestamp) -> str:
-    now = pd.Timestamp(datetime.now())
-    delta = target_ts - now
-    if delta.total_seconds() <= 0:
-        return "Today"
-    days = delta.days
-    hours = int((delta.total_seconds() - days * 86400) // 3600)
-    mins = int((delta.total_seconds() - days * 86400 - hours * 3600) // 60)
-    parts = []
-    if days > 0: parts.append(f"{days}d")
-    if hours > 0: parts.append(f"{hours}h")
-    if mins > 0: parts.append(f"{mins}m")
-    return " ".join(parts) if parts else "Soon"
+# App title
+st.title("🚀 Hybrid Momentum Portfolio Manager (ISA-friendly)")
 
-# =========================
-# Sidebar controls
-# =========================
-st.sidebar.header("⚙️ ISA Dynamic Settings")
-preset = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"].copy()
-
-# (Keep these in sync with backend preset defaults)
-trigger = st.sidebar.slider("Rebalance Trigger (Health)", 0.50, 1.00, float(preset["trigger"]), 0.05)
-mom_w   = st.sidebar.slider("Momentum Weight", 0.0, 1.0, float(preset["mom_w"]), 0.05)
-mr_w    = round(1.0 - mom_w, 2)
-st.sidebar.caption(f"MR Weight auto: **{mr_w:.2f}**")
-
-min_dollar_volume = st.sidebar.number_input("Min Median $ Volume (60d)", min_value=0.0, value=0.0, step=1e6, format="%.0f")
-show_net = st.sidebar.checkbox("Show Net of Costs in Backtest", value=False)
-roundtrip_bps = st.sidebar.slider("Roundtrip Cost (bps)", 0, 100, 10, 1)
-
-st.title("📈 ISA Dynamic Portfolio — Monthly Execution")
+if "Classic" in mode:
+    st.caption("**Mode:** Classic 90/10 hybrid (no lock, no regime scaling). For research & exploration.")
+else:
+    st.caption("**Mode:** ISA Dynamic (0.75) — Monthly lock + stability + regime-aware exposure/trigger.")
 
 # =========================
-# Monthly lock status + countdown
+# Buttons
 # =========================
-today = datetime.today()
-rebalance_today = backend.is_rebalance_today(today.date(), None)  # backend uses price index if available internally
-nxt_reb = next_rebalance_day(today)
-colA, colB = st.columns(2)
-with colA:
-    if rebalance_today:
-        st.success(f"Rebalance Day — {today.strftime('%Y-%m-%d')}")
-    else:
-        st.info(f"Holding portfolio — next rebalance: **{nxt_reb.date()}**")
-with colB:
-    st.metric("⏳ Time until next rebalance", human_countdown(nxt_reb))
+go = st.button("🔁 Generate / Refresh", type="primary", use_container_width=True)
 
 # =========================
-# Generate/Load portfolio (monthly-locked inside backend)
+# Main execution
 # =========================
-prev_port = backend.load_previous_portfolio()
-try:
-    # The function may return either (display_df, raw_df, decision)
-    # or ((display_df, raw_df), decision). Handle both defensively.
-    result = backend.generate_live_portfolio_isa_monthly(
-        preset={
-            "mom_lb": preset["mom_lb"], "mom_topn": preset["mom_topn"], "mom_cap": preset["mom_cap"],
-            "mr_lb": preset["mr_lb"], "mr_topn": preset["mr_topn"], "mr_ma": preset["mr_ma"],
-            "mom_w": mom_w, "mr_w": mr_w,
-            "trigger": trigger,
-            "stability_days": preset.get("stability_days", 5),
-        },
-        prev_portfolio=prev_port,
-        min_dollar_volume=min_dollar_volume
-    )
-    # Unpack robustly
-    if isinstance(result, tuple) and len(result) == 3:
-        live_disp, live_raw, decision = result
-    elif isinstance(result, tuple) and len(result) == 2:
-        pair, decision = result
-        live_disp, live_raw = pair
-    else:
-        live_disp, live_raw, decision = None, None, "Unexpected return shape from backend."
-except Exception as e:
-    live_disp, live_raw, decision = None, None, f"Error building portfolio: {e}"
+live_disp = live_raw = None
+decision = "Click **Generate / Refresh** to build the latest portfolio."
 
-# Save if we actually rebalanced (backend decides via monthly lock + trigger)
-if live_raw is not None and not live_raw.empty:
-    backend.save_current_portfolio(live_raw)
+strategy_cum_gross = strategy_cum_net = qqq_cum = hybrid_tno = None
+
+if go:
+    with st.spinner("Building portfolio and running diagnostics..."):
+        try:
+            prev_port = backend.load_previous_portfolio()
+
+            if "Classic" in mode:
+                # Build live classic portfolio
+                live_disp, live_raw = backend.generate_live_portfolio_classic(
+                    momentum_window, top_n, cap, min_dollar_volume=min_dollar_volume
+                )
+                decision = "Classic mode has no monthly lock or regime overlay."
+
+                # Backtest (since 2018)
+                strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_for_app(
+                    momentum_window, top_n, cap,
+                    roundtrip_bps=roundtrip_bps, min_dollar_volume=min_dollar_volume, show_net=show_net
+                )
+
+            else:
+                # ISA Dynamic (monthly lock + regime-aware)
+                preset = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+                live_disp, live_raw, decision = backend.generate_live_portfolio_isa_monthly(
+                    preset, prev_port, min_dollar_volume=min_dollar_volume
+                )
+
+                # Backtest (since 2018)
+                strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
+                    roundtrip_bps=roundtrip_bps, min_dollar_volume=min_dollar_volume, show_net=show_net
+                )
+
+            st.session_state.latest_portfolio = live_raw if live_raw is not None else pd.DataFrame(columns=["Weight"])
+            st.session_state.latest_decision = decision
+
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {e}")
+            st.code(traceback.format_exc())
 
 # =========================
 # Tabs
 # =========================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Performance", "💼 Current Portfolio", "💰 Cost / Liquidity", "🧭 Regime", "🔄 Changes"
-])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📊 Plan", "✅ Current Portfolio", "📈 Performance", "🧭 Regime", "🔍 Changes", "💸 Costs/Liquidity"]
+)
 
-# ---- Tab 1: Performance ----
+# ---- Tab 1: Plan (diffs vs last saved) ----
 with tab1:
-    st.subheader("Backtest vs QQQ (Since 2018)")
-    strat_cum_gross, strat_cum_net, qqq_cum, tno = backend.run_backtest_isa_dynamic(
-        roundtrip_bps=roundtrip_bps,
-        min_dollar_volume=min_dollar_volume,
-        show_net=show_net
-    )
-    if strat_cum_gross is None:
-        st.warning("Could not run backtest (missing data).")
+    st.subheader("📊 Rebalancing Plan")
+
+    prev_port = backend.load_previous_portfolio()
+    if "latest_portfolio" in st.session_state:
+        candidate = st.session_state.latest_portfolio
     else:
-        # Returns series from cum curves
-        strat_rets = strat_cum_gross.pct_change().fillna(0.0) if not show_net else strat_cum_net.pct_change().fillna(0.0)
-        bench_rets = qqq_cum.pct_change().fillna(0.0)
+        candidate = None
 
-        # KPIs
-        cols = st.columns(2)
-        with cols[0]:
-            k = backend.kpi_row("ISA Dynamic", strat_rets, trade_log=None, turnover_series=tno)
-            st.markdown("**ISA Dynamic (selected)**")
-            st.write(dict(zip(
-                ["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity×"],
-                k
-            )))
-        with cols[1]:
-            k = backend.kpi_row("QQQ", bench_rets)
-            st.markdown("**QQQ Benchmark**")
-            st.write(dict(zip(
-                ["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity×"],
-                k
-            )))
+    if candidate is None or candidate.empty:
+        st.info("Generate a portfolio to see the rebalancing plan.")
+    else:
+        diffs = backend.diff_portfolios(prev_port, candidate, tol=tol)
+        if not any([diffs["sell"], diffs["buy"], diffs["rebalance"]]):
+            st.success("✅ No rebalancing needed.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown("### 🔴 Sells")
+                if diffs["sell"]:
+                    for t in diffs["sell"]:
+                        st.write(f"- **{t}**")
+                else:
+                    st.write("None")
+            with c2:
+                st.markdown("### 🟢 Buys")
+                if diffs["buy"]:
+                    for t in diffs["buy"]:
+                        tgt = float(candidate.loc[t, "Weight"]) if t in candidate.index else 0.0
+                        st.write(f"- **{t}** — target {tgt:.2%}")
+                else:
+                    st.write("None")
+            with c3:
+                st.markdown("### 🔄 Rebalances")
+                if diffs["rebalance"]:
+                    for t, old_w, new_w in diffs["rebalance"]:
+                        st.write(f"- **{t}**: {old_w:.2%} → **{new_w:.2%}**")
+                else:
+                    st.write("None")
 
-        # Chart
-        fig, ax = plt.subplots(figsize=(10, 5))
-        label = "ISA Dynamic (Net)" if show_net else "ISA Dynamic (Gross)"
-        ax.plot(strat_cum_net.index if show_net else strat_cum_gross.index,
-                strat_cum_net.values if show_net else strat_cum_gross.values, label=label)
-        ax.plot(qqq_cum.index, qqq_cum.values, label="QQQ", linestyle="--")
-        ax.set_yscale("log")
-        ax.set_ylabel("Cumulative Growth (log)")
-        ax.grid(True, which="both", ls="--")
-        ax.legend()
-        st.pyplot(fig)
+    st.divider()
+    # Save actions
+    if "latest_portfolio" in st.session_state and not st.session_state.latest_portfolio.empty:
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Save to Gist"):
+                backend.save_portfolio_to_gist(st.session_state.latest_portfolio)
+                backend.save_current_portfolio(st.session_state.latest_portfolio)
+                st.success("Saved.")
+        with c2:
+            if st.button("📝 Log today’s 1-day live vs QQQ"):
+                try:
+                    res = backend.record_live_snapshot(st.session_state.latest_portfolio, note=mode)
+                    if res.get("ok", False):
+                        st.success(
+                            f"Logged. 1d strat: {res['strat_ret']:.2%} vs QQQ: {res['qqq_ret']:.2%}  — {res['rows']} rows total."
+                        )
+                    else:
+                        st.error(res.get("msg", "Failed to log."))
+                except Exception as e:
+                    st.error(f"Log failed: {e}")
 
 # ---- Tab 2: Current Portfolio ----
 with tab2:
-    st.subheader("Current Portfolio (Monthly-Locked)")
+    st.subheader("✅ Current Portfolio")
+    decision_text = st.session_state.get("latest_decision", decision)
+    st.caption(decision_text)
+
     if live_disp is None or live_disp.empty:
-        st.warning(decision)
+        st.warning("No portfolio to show yet.")
     else:
-        st.caption(decision)
+        # Regime/exposure tag
+        try:
+            regime_label, _rm = backend.get_market_regime()
+            eff_expo = float(live_raw["Weight"].sum()) if (live_raw is not None and not live_raw.empty) else 0.0
+            st.caption(f"Regime: **{regime_label}**  •  Effective equity exposure: **{eff_expo*100:.1f}%**")
+        except Exception:
+            pass
+
         st.dataframe(live_disp, use_container_width=True)
 
+        # Quick bar chart
+        try:
+            fig, ax = plt.subplots(figsize=(10, 4))
+            sr = live_raw.sort_values("Weight", ascending=False)["Weight"]
+            ax.bar(sr.index, sr.values)
+            ax.set_ylabel("Weight")
+            ax.set_xticklabels(sr.index, rotation=45, ha="right")
+            st.pyplot(fig)
+        except Exception:
+            pass
+
+        # --- Preview next rebalance (regime-aware) ---
         with st.expander("🔎 Preview next rebalance (does NOT trade or save)"):
             try:
-                # 1) Pull universe prices (last ~max lookback + buffer)
                 univ = backend.get_nasdaq_100_plus_tickers()
                 end = datetime.today().strftime("%Y-%m-%d")
-                lookback_months = max(backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_lb"], 12) + 8
+                lookback_months = 24
                 start = (datetime.today() - relativedelta(months=lookback_months)).strftime("%Y-%m-%d")
-
                 close, vol = backend.fetch_price_volume(univ, start, end)
                 if close.empty:
                     st.warning("Could not fetch price/volume for preview.")
                 else:
-                    # 2) Optional liquidity filter
-                    try:
-                        _min_dollar = float(min_dollar_volume)  # from sidebar
-                    except Exception:
-                        _min_dollar = 0.0
-
+                    # Liquidity filter
                     available = [t for t in univ if t in close.columns]
-                    if _min_dollar > 0 and available:
-                        keep = backend.filter_by_liquidity(close[available], vol[available], _min_dollar)
+                    if min_dollar_volume > 0 and available:
+                        keep = backend.filter_by_liquidity(close[available], vol[available], min_dollar_volume)
                         if keep:
                             close = close[keep]
                         else:
                             close = close[[]]
 
-                    if close.empty:
-                        st.info("No tickers remain after liquidity filtering.")
+                    # Build regime-aware preview
+                    preset = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+                    preview_w, preview_trigger, preview_regime, _ = backend.build_isa_dynamic_with_regime(close, preset)
+
+                    if preview_w is None or preview_w.empty:
+                        st.info("No preview weights available (signals too weak or filters too strict).")
                     else:
-                        # 3) Build proposed ISA weights
-                        preview_params = {
-                            "mom_lb":   backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_lb"],
-                            "mom_topn": backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_topn"],
-                            "mom_cap":  backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_cap"],
-                            "mr_lb":    backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mr_lb"],
-                            "mr_topn":  backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mr_topn"],
-                            "mr_ma":    backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mr_ma"],
-                            "mom_w":    float(mom_w) if "mom_w" in locals() else backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_w"],
-                            "mr_w":     float(mr_w)  if "mr_w"  in locals() else (1.0 - backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_w"]),
-                            "trigger":  float(trigger) if "trigger" in locals() else backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["trigger"],
-                            "stability_days": backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"].get("stability_days", 5),
-                        }
+                        preview_df = pd.DataFrame({"Weight": preview_w}).sort_values("Weight", ascending=False)
+                        preview_fmt = preview_df.copy()
+                        preview_fmt["Weight"] = preview_fmt["Weight"].map("{:.2%}".format)
 
-                        preview_w = backend._build_isa_weights(close, preview_params)
-                        if preview_w is None or preview_w.empty:
-                            st.info("No preview weights available.")
-                        else:
-                            preview_df = pd.DataFrame({"Weight": preview_w}).sort_values("Weight", ascending=False)
-                            preview_fmt = preview_df.copy()
-                            preview_fmt["Weight"] = preview_fmt["Weight"].map("{:.2%}".format)
+                        st.caption(f"Preview regime: **{preview_regime}**  •  Trigger used: **{preview_trigger:.2f}**")
+                        st.dataframe(preview_fmt, use_container_width=True)
 
-                            st.markdown("**Proposed target weights if you rebalanced today (preview only):**")
-                            st.dataframe(preview_fmt, use_container_width=True)
-
-                            # 4) Changes vs CURRENT portfolio
-                            base_df = None
-                            if 'live_raw' in locals() and live_raw is not None and not live_raw.empty:
-                                base_df = live_raw
-                                st.caption("Diff vs current on-screen portfolio.")
-                            else:
-                                base_df = backend.load_previous_portfolio()
-                                st.caption("Diff vs last saved portfolio.")
-
-                            if base_df is not None and not base_df.empty:
-                                changes = backend.diff_portfolios(base_df, preview_df, tol=0.01)
-                                st.markdown("**Changes (preview):**")
-                                c1, c2, c3 = st.columns(3)
-                                with c1:
-                                    st.markdown("🟥 **Sells**")
-                                    if changes["sell"]:
-                                        for t in changes["sell"]:
-                                            st.write(f"- **{t}**")
-                                    else:
-                                        st.write("None")
-                                with c2:
-                                    st.markdown("🟩 **Buys**")
-                                    if changes["buy"]:
-                                        for t in changes["buy"]:
-                                            tgt = float(preview_df.loc[t, "Weight"]) if t in preview_df.index else 0.0
-                                            st.write(f"- **{t}** — target {tgt:.2%}")
-                                    else:
-                                        st.write("None")
-                                with c3:
-                                    st.markdown("🔄 **Rebalances (±≥1%)**")
-                                    if changes["rebalance"]:
-                                        for t, old_w, new_w in changes["rebalance"]:
-                                            st.write(f"- **{t}**: {old_w:.2%} → **{new_w:.2%}**")
-                                    else:
-                                        st.write("None")
+                        # Diff vs current
+                        base_df = live_raw if (live_raw is not None and not live_raw.empty) else backend.load_previous_portfolio()
+                        if base_df is not None and not base_df.empty:
+                            changes = backend.diff_portfolios(base_df, preview_df, tol=0.01)
+                            st.markdown("**Preview changes vs current:**")
+                            c1, c2, c3 = st.columns(3)
+                            with c1:
+                                st.markdown("🟥 **Sells**")
+                                st.write("None" if not changes["sell"] else "\n".join([f"- **{t}**" for t in changes["sell"]]))
+                            with c2:
+                                st.markdown("🟩 **Buys**")
+                                if changes["buy"]:
+                                    for t in changes["buy"]:
+                                        tgt = float(preview_df.loc[t, "Weight"]) if t in preview_df.index else 0.0
+                                        st.write(f"- **{t}** — target {tgt:.2%}")
+                                else:
+                                    st.write("None")
+                            with c3:
+                                st.markdown("🔄 **Rebalances (±≥1%)**")
+                                if changes["rebalance"]:
+                                    for t, ow, nw in changes["rebalance"]:
+                                        st.write(f"- **{t}**: {ow:.2%} → **{nw:.2%}**")
+                                else:
+                                    st.write("None")
             except Exception as e:
                 st.error(f"Preview failed: {e}")
 
-# ---- Tab 3: Cost / Liquidity ----
+# ---- Tab 3: Performance ----
 with tab3:
-    st.subheader("Estimated Liquidity (Median $ Volume, 60d)")
-    try:
-        if live_raw is None or live_raw.empty:
-            st.info("No live portfolio to analyze.")
-        else:
-            # fetch recent month for constituents only (faster)
-            end = datetime.today().strftime("%Y-%m-%d")
-            start = (datetime.today() - relativedelta(months=3)).strftime("%Y-%m-%d")
-            tickers = list(live_raw.index)
-            close, vol = backend.fetch_price_volume(tickers, start, end)
-            if close.empty:
-                st.warning("Could not fetch recent price/volume for constituents.")
-            else:
-                med = backend.median_dollar_volume(close, vol, window=60)
-                liq_df = pd.DataFrame({"Median_$Vol_60d": med}).sort_values("Median_$Vol_60d", ascending=False)
-                st.dataframe(liq_df.style.format({"Median_$Vol_60d": "£{:,.0f}"}), use_container_width=True)
-    except Exception as e:
-        st.error(f"Liquidity calc failed: {e}")
+    st.subheader("📈 Backtest (since 2018)")
+    if strategy_cum_gross is None or qqq_cum is None:
+        st.info("Generate to see backtest results.")
+    else:
+        # KPIs (gross & net)
+        st.markdown("#### Key Performance (monthly series inferred)")
+        krows = []
+        krows.append(backend.kpi_row("Strategy (Gross)", strategy_cum_gross.pct_change()))
+        if strategy_cum_net is not None and show_net:
+            krows.append(backend.kpi_row("Strategy (Net of costs)", strategy_cum_net.pct_change()))
+        krows.append(backend.kpi_row("QQQ Benchmark", qqq_cum.pct_change()))
+        kdf = pd.DataFrame(krows, columns=["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity x"])
+        st.dataframe(kdf, use_container_width=True)
+
+        # Equity curves
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(strategy_cum_gross.index, strategy_cum_gross.values, label="Strategy (Gross)")
+        if strategy_cum_net is not None and show_net:
+            ax.plot(strategy_cum_net.index, strategy_cum_net.values, label="Strategy (Net)", linestyle=":")
+        ax.plot(qqq_cum.index, qqq_cum.values, label="QQQ", linestyle="--")
+        ax.set_yscale("log")
+        ax.set_ylabel("Cumulative Growth (log)")
+        ax.grid(True, ls="--", alpha=0.6)
+        ax.legend()
+        st.pyplot(fig)
 
 # ---- Tab 4: Regime ----
 with tab4:
-    st.subheader("Market Regime (Breadth, Vol, Trend)")
-
+    st.subheader("🧭 Market Regime")
     try:
-        # Pull a 12-month slice for speed
-        universe = backend.get_nasdaq_100_plus_tickers()
+        # Build regime block using backend metrics
+        univ = backend.get_nasdaq_100_plus_tickers()
         end = datetime.today().strftime("%Y-%m-%d")
         start = (datetime.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
-        prices = backend.fetch_market_data(universe, start, end)
+        px = backend.fetch_market_data(univ, start, end)
 
-        if prices is None or prices.empty:
-            st.warning("Could not fetch market data for regime metrics.")
-        else:
-            # Use your existing backend metric builder
-            regime_data = backend.compute_regime_metrics(prices)
+        label, metrics = backend.get_market_regime()
 
-            # Extract values safely
-            breadth = float(regime_data.get("universe_above_200dma", 0.0))
-            qqq_above = float(regime_data.get("qqq_above_200dma", 0.0))
-            vol_10d = float(regime_data.get("qqq_vol_10d", 0.0))
-            slope_50dma = float(regime_data.get("qqq_50dma_slope_10d", 0.0))
-            breadth_pos_6m = float(regime_data.get("breadth_pos_6m", 0.0))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Regime", label)
+        c2.metric("% Universe >200DMA", f"{metrics.get('universe_above_200dma', np.nan)*100:.1f}%")
+        c3.metric("QQQ above 200DMA", "Yes" if metrics.get("qqq_above_200dma", 0.0) >= 1.0 else "No")
 
-            # Simple classification (tweak thresholds to taste)
-            if breadth > 0.60 and slope_50dma > 0 and vol_10d < 0.02:
-                regime = "Bull"
-                colour = "🟢"
-                summary = ("Broad participation, positive trend, and low volatility. "
-                           "Environment supportive for taking risk.")
-            elif breadth >= 0.40 and slope_50dma >= 0:
-                regime = "Caution"
-                colour = "🟡"
-                summary = ("Mixed signals — trend ok but breadth/volatility not ideal. "
-                           "Maintain positions; avoid aggressive new risk.")
-            else:
-                regime = "Bear"
-                colour = "🔴"
-                summary = ("Weak breadth or negative trend with elevated volatility. "
-                           "Be defensive; reduce risk where appropriate.")
+        c4, c5 = st.columns(2)
+        c4.metric("QQQ 10D Vol", f"{metrics.get('qqq_vol_10d', np.nan)*100:.2f}%")
+        c5.metric("QQQ 50DMA slope (10D)", f"{metrics.get('qqq_50dma_slope_10d', np.nan)*100:.2f}%")
 
-            # Header + summary
-            st.markdown(f"### {colour} {regime} Regime")
-            st.write(summary)
-
-            # Quick gauges
-            st.progress(min(max(breadth, 0.0), 1.0))
-            st.caption(f"Breadth now: **{breadth:.1%}** of universe above 200DMA "
-                       f"(6-month breadth: {breadth_pos_6m:.1%}).")
-            cols = st.columns(3)
-            cols[0].metric("QQQ above 200DMA", "Yes" if qqq_above >= 1 else "No")
-            cols[1].metric("QQQ 10-day vol", f"{vol_10d:.2%}")
-            cols[2].metric("QQQ 50DMA slope (10d)", f"{slope_50dma:.2%}")
-
-            with st.expander("Raw regime metrics"):
-                st.json(regime_data)
-
+        st.markdown("**Breadth (share of tickers with positive 6-month return):** "
+                    f"{metrics.get('breadth_pos_6m', np.nan)*100:.1f}%")
     except Exception as e:
         st.error(f"Failed to load regime data: {e}")
 
-# ---- Tab 5: Changes ----
+# ---- Tab 5: Changes (Explainability) ----
 with tab5:
-    st.subheader("Changes vs Last Saved Portfolio")
-    prev_port = backend.load_previous_portfolio()
-    if (prev_port is None or prev_port.empty) or (live_raw is None or live_raw.empty):
-        st.info("Need both a previous and current portfolio to compute changes.")
-    else:
-        changes = backend.diff_portfolios(prev_port, live_raw, tol=0.01)
-        # Render changes
-        cols = st.columns(3)
-        with cols[0]:
-            st.markdown("### 🟥 Sells")
-            if changes["sell"]:
-                for t in changes["sell"]:
-                    st.write(f"- **{t}**")
-            else:
-                st.write("None")
-        with cols[1]:
-            st.markdown("### 🟩 Buys")
-            if changes["buy"]:
-                for t in changes["buy"]:
-                    tgt = float(live_raw.loc[t, "Weight"]) if t in live_raw.index else 0.0
-                    st.write(f"- **{t}** — target {tgt:.2%}")
-            else:
-                st.write("None")
-        with cols[2]:
-            st.markdown("### 🔄 Rebalances (±≥1%)")
-            if changes["rebalance"]:
-                for t, old_w, new_w in changes["rebalance"]:
-                    st.write(f"- **{t}**: {old_w:.2%} → **{new_w:.2%}**")
-            else:
-                st.write("None")
+    st.subheader("🔍 What changed and why?")
+    try:
+        prev_df = backend.load_previous_portfolio()
+        curr_df = st.session_state.get("latest_portfolio", None)
 
-# =========================
-# Live snapshot logging (optional button)
-# =========================
-st.divider()
-if live_raw is not None and not live_raw.empty:
-    note = st.text_input("Add a note to live snapshot (optional)", "")
-    if st.button("📝 Record Live Snapshot"):
-        res = backend.record_live_snapshot(live_raw, note=note)
-        if res.get("ok", False):
-            st.success(f"Recorded snapshot for {res.get('rows', '?')} day(s).")
+        if curr_df is None or curr_df.empty:
+            st.info("Generate the portfolio to view changes.")
         else:
-            st.error(res.get("msg", "Failed to log snapshot."))
+            # Fetch prices for just the relevant tickers (fast)
+            tickers = sorted(set(curr_df.index) | (set(prev_df.index) if prev_df is not None else set()))
+            if tickers:
+                end = datetime.today().strftime("%Y-%m-%d")
+                start = (datetime.today() - relativedelta(months=18)).strftime("%Y-%m-%d")
+                px = backend.fetch_market_data(tickers, start, end)
+                params = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+
+                expl = backend.explain_portfolio_changes(prev_df, curr_df, px, params)
+                if expl is None or expl.empty:
+                    st.info("No material changes to explain.")
+                else:
+                    st.dataframe(expl, use_container_width=True)
+            else:
+                st.info("No tickers found to explain.")
+    except Exception as e:
+        st.error(f"Explainability failed: {e}")
+
+# ---- Tab 6: Costs & Liquidity ----
+with tab6:
+    st.subheader("💸 Costs & Liquidity (Backtest diagnostics)")
+    if hybrid_tno is None or strategy_cum_gross is None:
+        st.info("Generate to see cost/liquidity diagnostics.")
+    else:
+        # Turnover summary by year
+        tno = pd.Series(hybrid_tno).copy()
+        tno.index = pd.to_datetime(tno.index)
+        yearly_turnover = tno.groupby(tno.index.year).sum()
+        st.markdown("**Turnover (Σ |Δw| / 2) per year:**")
+        st.bar_chart(yearly_turnover)
+
+        # Live portfolio liquidity snapshot
+        if live_raw is not None and not live_raw.empty:
+            try:
+                univ = list(live_raw.index)
+                end = datetime.today().strftime("%Y-%m-%d")
+                start = (datetime.today() - relativedelta(days=120)).strftime("%Y-%m-%d")
+                close, vol = backend.fetch_price_volume(univ, start, end)
+                med_dollar = backend.median_dollar_volume(close, vol, window=60).reindex(live_raw.index)
+                snap = pd.DataFrame({
+                    "Weight": live_raw["Weight"],
+                    "Median $Vol (60d)": med_dollar
+                }).sort_values("Weight", ascending=False)
+                st.markdown("**Live holdings — median dollar volume (60d):**")
+                st.dataframe(snap, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Liquidity snapshot failed: {e}")
