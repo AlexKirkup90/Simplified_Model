@@ -2,7 +2,8 @@
 import streamlit as st
 import matplotlib.pyplot as plt
 import yfinance as yf
-from prettytable import PrettyTable
+import pandas as pd
+import numpy as np
 
 import backend
 
@@ -70,9 +71,10 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 st.subheader("Rebalancing Plan")
                 st.info(decision_note)
                 if new_portfolio_raw is not None and not new_portfolio_raw.empty:
-                    signals = backend.diff_portfolios(prev_portfolio if prev_portfolio is not None else
-                                                      st.session_state.get('latest_portfolio', backend.load_previous_portfolio()),
-                                                      new_portfolio_raw, tol)
+                    signals = backend.diff_portfolios(
+                        prev_portfolio if prev_portfolio is not None else st.session_state.get('latest_portfolio', backend.load_previous_portfolio()),
+                        new_portfolio_raw, tol
+                    )
                     if not any(signals.values()):
                         st.success("✅ No major rebalancing needed!")
                     else:
@@ -111,15 +113,15 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 st.subheader("Backtest vs. QQQ (Since 2018)")
                 if strat_cum is not None and qqq_cum is not None:
                     # KPI table (frequency-aware)
-                    import numpy as np
-                    tbl = PrettyTable()
-                    tbl.field_names = ["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity Multiple"]
-                    # Use pct-change of cumulative to get periodic returns
                     strat_rets = strat_cum.pct_change().dropna()
                     qqq_rets   = qqq_cum.pct_change().dropna()
-                    tbl.add_row(backend.kpi_row("Strategy", strat_rets))
-                    tbl.add_row(backend.kpi_row("QQQ Benchmark", qqq_rets))
-                    st.text(tbl)
+
+                    rows = [
+                        backend.kpi_row("Strategy", strat_rets),
+                        backend.kpi_row("QQQ Benchmark", qqq_rets),
+                    ]
+                    kpi_df = pd.DataFrame(rows, columns=["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity Multiple"])
+                    st.table(kpi_df)
 
                     # Plot log equity
                     fig, ax = plt.subplots(figsize=(10,5))
