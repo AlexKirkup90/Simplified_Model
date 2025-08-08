@@ -21,7 +21,7 @@ st.sidebar.header("⚙️ App Controls")
 auto_log = st.sidebar.checkbox(
     "Auto-log 1-day performance on load",
     value=True,
-    help="Logs 1-day return vs QQQ using last saved portfolio (from Gist)."
+    help="Logs 1-day return vs QQQ using last saved portfolio (from Gist or local CSV)."
 )
 
 auto_log_msg = ""
@@ -58,7 +58,11 @@ mode = st.sidebar.selectbox(
 st.sidebar.header("💸 Costs & Liquidity")
 apply_costs = st.sidebar.checkbox("Show net of costs", value=True)
 roundtrip_bps = st.sidebar.number_input("Round-trip trading cost (bps)", min_value=0, max_value=100, value=10, step=1)
-min_dollar_volume = st.sidebar.number_input("Min median $ volume (60d)", min_value=0, value=10000000, step=1000000, help="Filters illiquid names using median (Close×Volume) over 60 trading days.")
+min_dollar_volume = st.sidebar.number_input(
+    "Min median £ volume (60d)",
+    min_value=0, value=10_000_000, step=1_000_000,
+    help="Filters illiquid names using median (Close×Volume) over 60 trading days."
+)
 
 # Classic controls
 if mode == "Classic 90/10 (sliders)":
@@ -112,7 +116,7 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 # Live portfolio (ISA Dynamic with trigger vs previous)
                 display_df, raw_df, decision_note = backend.generate_live_portfolio_isa(
                     backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"],
-                    prev_portfolio if prev_portfolio is not None and not prev_portfolio.empty else None,
+                    prev_portfolio if (prev_portfolio is not None and not prev_portfolio.empty) else None,
                     min_dollar_volume=min_dollar_volume
                 )
                 new_portfolio_display, new_portfolio_raw = display_df, raw_df
@@ -123,6 +127,10 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     min_dollar_volume=min_dollar_volume,
                     show_net=apply_costs
                 )
+
+            # Persist the latest portfolio locally for next-run diff (Gist save still via button)
+            if new_portfolio_raw is not None and not new_portfolio_raw.empty:
+                backend.save_current_portfolio(new_portfolio_raw)
 
             # -------------------------
             # Tabs
@@ -222,7 +230,7 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
             with tab3:
                 st.subheader("Backtest vs. QQQ (Since 2018)")
                 if strat_cum_gross is not None and qqq_cum is not None:
-                    # KPI table (frequency-aware) — show both gross and net if requested
+                    # KPI table — show both gross and net if requested
                     if apply_costs and strat_cum_net is not None:
                         strat_g = strat_cum_gross.pct_change().dropna()
                         strat_n = strat_cum_net.pct_change().dropna()
@@ -328,7 +336,7 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                 else:
                     st.info("No live snapshots yet. Click the button above to start logging.")
 
-            # Keep raw for save button
+            # Keep raw for save button and for local persistence
             if new_portfolio_raw is not None and not new_portfolio_raw.empty:
                 st.session_state.latest_portfolio = new_portfolio_raw
 
@@ -340,3 +348,5 @@ if 'latest_portfolio' in st.session_state and not st.session_state.latest_portfo
     st.sidebar.header("💾 Save Portfolio")
     if st.sidebar.button("Save this portfolio for next month"):
         backend.save_portfolio_to_gist(st.session_state.latest_portfolio)
+        # Also save locally to CSV for fallback diffs
+        backend.save_current_portfolio(st.session_state.latest_portfolio)
