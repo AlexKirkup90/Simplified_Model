@@ -168,21 +168,97 @@ with tab2:
         st.caption(decision)
         st.dataframe(live_disp, use_container_width=True)
 
-        # Bar chart of weights (raw)
-        try:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            live_raw_sorted = live_raw.sort_values("Weight", ascending=False)
-            ax.bar(live_raw_sorted.index, live_raw_sorted["Weight"].values)
-            ax.set_ylabel("Weight")
-            ax.set_xticklabels(live_raw_sorted.index, rotation=45, ha="right")
-            st.pyplot(fig)
-        except Exception:
-            pass
+        with st.expander("🔎 Preview next rebalance (does NOT trade or save)"):
+            try:
+                # 1) Pull universe prices (last ~max lookback + buffer)
+                univ = backend.get_nasdaq_100_plus_tickers()
+                end = datetime.today().strftime("%Y-%m-%d")
+                lookback_months = max(backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_lb"], 12) + 8
+                start = (datetime.today() - relativedelta(months=lookback_months)).strftime("%Y-%m-%d")
 
-        # Save to Gist
-        if st.button("💾 Save this portfolio to Gist"):
-            backend.save_portfolio_to_gist(live_raw)
-            st.success("Saved to Gist.")
+                close, vol = backend.fetch_price_volume(univ, start, end)
+                if close.empty:
+                    st.warning("Could not fetch price/volume for preview.")
+                else:
+                    # 2) Optional liquidity filter
+                    try:
+                        _min_dollar = float(min_dollar_volume)  # from sidebar
+                    except Exception:
+                        _min_dollar = 0.0
+
+                    available = [t for t in univ if t in close.columns]
+                    if _min_dollar > 0 and available:
+                        keep = backend.filter_by_liquidity(close[available], vol[available], _min_dollar)
+                        if keep:
+                            close = close[keep]
+                        else:
+                            close = close[[]]
+
+                    if close.empty:
+                        st.info("No tickers remain after liquidity filtering.")
+                    else:
+                        # 3) Build proposed ISA weights
+                        preview_params = {
+                            "mom_lb":   backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_lb"],
+                            "mom_topn": backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_topn"],
+                            "mom_cap":  backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_cap"],
+                            "mr_lb":    backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mr_lb"],
+                            "mr_topn":  backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mr_topn"],
+                            "mr_ma":    backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mr_ma"],
+                            "mom_w":    float(mom_w) if "mom_w" in locals() else backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_w"],
+                            "mr_w":     float(mr_w)  if "mr_w"  in locals() else (1.0 - backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["mom_w"]),
+                            "trigger":  float(trigger) if "trigger" in locals() else backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]["trigger"],
+                            "stability_days": backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"].get("stability_days", 5),
+                        }
+
+                        preview_w = backend._build_isa_weights(close, preview_params)
+                        if preview_w is None or preview_w.empty:
+                            st.info("No preview weights available.")
+                        else:
+                            preview_df = pd.DataFrame({"Weight": preview_w}).sort_values("Weight", ascending=False)
+                            preview_fmt = preview_df.copy()
+                            preview_fmt["Weight"] = preview_fmt["Weight"].map("{:.2%}".format)
+
+                            st.markdown("**Proposed target weights if you rebalanced today (preview only):**")
+                            st.dataframe(preview_fmt, use_container_width=True)
+
+                            # 4) Changes vs CURRENT portfolio
+                            base_df = None
+                            if 'live_raw' in locals() and live_raw is not None and not live_raw.empty:
+                                base_df = live_raw
+                                st.caption("Diff vs current on-screen portfolio.")
+                            else:
+                                base_df = backend.load_previous_portfolio()
+                                st.caption("Diff vs last saved portfolio.")
+
+                            if base_df is not None and not base_df.empty:
+                                changes = backend.diff_portfolios(base_df, preview_df, tol=0.01)
+                                st.markdown("**Changes (preview):**")
+                                c1, c2, c3 = st.columns(3)
+                                with c1:
+                                    st.markdown("🟥 **Sells**")
+                                    if changes["sell"]:
+                                        for t in changes["sell"]:
+                                            st.write(f"- **{t}**")
+                                    else:
+                                        st.write("None")
+                                with c2:
+                                    st.markdown("🟩 **Buys**")
+                                    if changes["buy"]:
+                                        for t in changes["buy"]:
+                                            tgt = float(preview_df.loc[t, "Weight"]) if t in preview_df.index else 0.0
+                                            st.write(f"- **{t}** — target {tgt:.2%}")
+                                    else:
+                                        st.write("None")
+                                with c3:
+                                    st.markdown("🔄 **Rebalances (±≥1%)**")
+                                    if changes["rebalance"]:
+                                        for t, old_w, new_w in changes["rebalance"]:
+                                            st.write(f"- **{t}**: {old_w:.2%} → **{new_w:.2%}**")
+                                    else:
+                                        st.write("None")
+            except Exception as e:
+                st.error(f"Preview failed: {e}")
 
 # ---- Tab 3: Cost / Liquidity ----
 with tab3:
