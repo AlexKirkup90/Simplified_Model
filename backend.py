@@ -69,21 +69,34 @@ def cap_weights(weights, cap=0.25, max_iterations=100):
             w += excess_weight / len(w)
     return w
 
-def get_performance_metrics(returns):
-    """Calculates key performance metrics from a returns series."""
+def get_performance_metrics(returns, use_quantstats=False):
+    """Calculates key performance metrics from a returns series.
+       use_quantstats is optional and ignored unless True."""
     if returns.empty:
         return {}
+
     annual_return = returns.mean() * 12
     sharpe_ratio = annual_return / (returns.std() * np.sqrt(12) + 1e-9)
     cumulative_returns = (1 + returns).cumprod()
     peak = cumulative_returns.cummax()
     drawdown = (cumulative_returns - peak) / peak
     max_drawdown = drawdown.min()
-    return {
+
+    metrics = {
         'Annual Return': f"{annual_return:.2%}",
         'Sharpe Ratio': f"{sharpe_ratio:.2f}",
         'Max Drawdown': f"{max_drawdown:.2%}"
     }
+
+    if use_quantstats:
+        try:
+            import quantstats as qs
+            qs.extend_pandas()
+            qs.reports.html(returns, output='stats.html')
+        except ImportError:
+            print("QuantStats not installed. Skipping report.")
+
+    return metrics
 
 def run_backtest_gross(daily_prices, momentum_window=6, top_n=15, cap=0.25):
     """Runs the primary MOMENTUM strategy."""
