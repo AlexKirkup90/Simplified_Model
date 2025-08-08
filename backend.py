@@ -239,13 +239,16 @@ def drawdown(curve: pd.Series) -> pd.Series:
 
 def kpi_row(name: str, rets: pd.Series,
             trade_log: Optional[pd.DataFrame] = None,
-            turnover_series: Optional[pd.Series] = None) -> List[str]:
+            turnover_series: Optional[pd.Series] = None,
+            avg_trade_size: Optional[float] = None) -> List[str]:
     r = pd.Series(rets).dropna().astype(float)
     if r.empty:
         return [name, "-", "-", "-", "-", "-", "-", "-", "-", "-"]
+
     py = _infer_periods_per_year(r.index)
     eq = (1 + r).cumprod()
     n  = max(len(r), 1)
+
     ann_ret = eq.iloc[-1] ** (py / n) - 1
     mean_p, std_p = r.mean(), r.std()
     sharpe  = (mean_p * py) / (std_p * np.sqrt(py) + 1e-9)
@@ -255,6 +258,7 @@ def kpi_row(name: str, rets: pd.Series,
     calmar  = ann_ret / abs(dd) if dd != 0 else np.nan
     eq_mult = float(eq.iloc[-1])
 
+    # trades per year (exact if trade_log provided)
     tpy = 0.0
     if trade_log is not None and len(trade_log) > 0 and "date" in trade_log.columns:
         tl = trade_log.copy()
@@ -262,7 +266,15 @@ def kpi_row(name: str, rets: pd.Series,
         grp = tl.groupby("year").size()
         if len(grp) > 0:
             tpy = float(grp.mean())
+    # or estimate from turnover if avg_trade_size given
+    elif turnover_series is not None and avg_trade_size:
+        ts = pd.Series(turnover_series)
+        ts.index = pd.to_datetime(ts.index)
+        yearly_turn = ts.groupby(ts.index.year).sum()  # sum of (Σ|Δw|/2) per year
+        if len(yearly_turn) > 0:
+            tpy = float((yearly_turn / float(avg_trade_size)).mean())
 
+    # turnover per year
     topy = 0.0
     if turnover_series is not None and len(turnover_series) > 0:
         s = pd.Series(turnover_series)
