@@ -284,19 +284,62 @@ with tab3:
 # ---- Tab 4: Regime ----
 with tab4:
     st.subheader("Market Regime (Breadth, Vol, Trend)")
+
     try:
-        # small universe fetch for speed: use your NASDAQ+ list
-        univ = backend.get_nasdaq_100_plus_tickers()
-        end = datetime.today().strftime("%Y-%m-%d")
-        start = (datetime.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
-        prices = backend.fetch_market_data(univ, start, end)
-        if prices.empty:
-            st.warning("Could not fetch market data for regime metrics.")
+        # Fetch regime metrics from backend
+        regime_data = backend.get_market_regime()
+        if not regime_data:
+            st.warning("No regime data available.")
         else:
-            metrics = backend.compute_regime_metrics(prices)
-            st.json(metrics)
+            # Extract values
+            breadth = regime_data.get("universe_above_200dma", 0)
+            qqq_above = regime_data.get("qqq_above_200dma", 0)
+            vol_10d = regime_data.get("qqq_vol_10d", 0)
+            breadth_pos_6m = regime_data.get("breadth_pos_6m", 0)
+            slope_50dma = regime_data.get("qqq_50dma_slope_10d", 0)
+
+            # Classification logic
+            if breadth > 0.6 and slope_50dma > 0 and vol_10d < 0.02:
+                regime = "Bull"
+                colour = "🟢"
+                summary = (
+                    "Conditions are bullish — broad participation, positive trend, "
+                    "and low volatility. Environment supportive for taking risk."
+                )
+            elif breadth > 0.4 and slope_50dma >= 0:
+                regime = "Caution"
+                colour = "🟡"
+                summary = (
+                    "Mixed signals — trend remains positive but breadth or volatility "
+                    "is not ideal. Maintain positions but avoid aggressive buying."
+                )
+            else:
+                regime = "Bear"
+                colour = "🔴"
+                summary = (
+                    "Defensive conditions — weak breadth or negative trend with higher volatility. "
+                    "Reduce risk and protect capital."
+                )
+
+            # Display
+            st.markdown(f"### {colour} {regime} Regime")
+            st.write(summary)
+
+            with st.expander("View raw regime metrics"):
+                st.json(regime_data)
+
+            # Optional: breadth gauge
+            st.progress(min(max(breadth, 0), 1))
+            st.caption(f"Breadth: {breadth:.1%} of universe above 200DMA")
+
+            # Snapshot
+            note = st.text_input("Add a note to live snapshot (optional)")
+            if st.button("Record Live Snapshot"):
+                backend.save_regime_snapshot(regime_data, note)
+                st.success("Snapshot saved.")
+
     except Exception as e:
-        st.error(f"Regime metrics failed: {e}")
+        st.error(f"Failed to load regime data: {e}")
 
 # ---- Tab 5: Changes ----
 with tab5:
