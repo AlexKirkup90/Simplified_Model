@@ -785,43 +785,57 @@ def diff_portfolios(prev_df: Optional[pd.DataFrame],
 # Explainability (“what changed & why”)
 # =========================
 def _signal_snapshot_for_explain(daily_prices: pd.DataFrame, params: Dict) -> pd.DataFrame:
-    if daily_prices.empty:
+    """
+    Build a one-row snapshot of signals used in the explanation table.
+    Assumes daily_prices already restricted to available tickers.
+    """
+    if daily_prices is None or daily_prices.empty:
         return pd.DataFrame()
+
     monthly = daily_prices.resample("ME").last()
     if monthly.shape[0] < 13:
         return pd.DataFrame()
+
+    # Keep a stable list of columns we actually have data for
+    cols = monthly.columns.tolist()
 
     r3  = monthly.pct_change(3).iloc[-1]
     r6  = monthly.pct_change(6).iloc[-1]
     r12 = monthly.pct_change(12).iloc[-1]
 
-    def z(s: pd.Series, cols) -> pd.Series:
+    def z(s: pd.Series, cols_) -> pd.Series:
         s = s.replace([np.inf, -np.inf], np.nan).dropna()
-        if s.std(ddof=0) == 0 or s.empty:
-            return pd.Series(0.0, index=cols)
+        if s.empty or s.std(ddof=0) == 0:
+            return pd.Series(0.0, index=cols_)
         zs = (s - s.mean()) / (s.std(ddof=0) + 1e-9)
-        return zs.reindex(cols).fillna(0.0)
+        return zs.reindex(cols_).fillna(0.0)
 
-    cols = monthly.columns
     mom_score = 0.2 * z(r3, cols) + 0.4 * z(r6, cols) + 0.4 * z(r12, cols)
     mom_rank  = mom_score.rank(ascending=False, method="min")
 
-    st_ret = daily_prices.pct_change(params["mr_lb"]).iloc[-1]
-    long_ma = daily_prices.rolling(params["mr_ma"]).mean().iloc[-1]
-    above_ma = (daily_prices.iloc[-1] > long_ma).astype(int)
+    st_ret   = daily_prices.pct_change(params["mr_lb"]).iloc[-1].reindex(cols)
+    long_ma  = daily_prices.rolling(params["mr_ma"]).mean().iloc[-1].reindex(cols)
+    last_px  = daily_prices.iloc[-1].reindex(cols)
+    above_ma = (last_px > long_ma).astype(float)
 
     snap = pd.DataFrame({
-        "mom_score": mom_score,
-        "mom_rank": mom_rank,
+        "mom_score": mom_score.reindex(cols),
+        "mom_rank":  mom_rank.reindex(cols),
         f"st_ret_{params['mr_lb']}d": st_ret,
         f"above_{params['mr_ma']}dma": above_ma
     })
     return snap.sort_index()
 
+
 def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
                               curr_df: Optional[pd.DataFrame],
                               daily_prices: pd.DataFrame,
                               params: Dict) -> pd.DataFrame:
+    """
+    Return a table describing buys/sells/rebalances with momentum & MR context.
+    Safely ignores tickers missing from daily_prices.
+    """
+    # Normalize inputs
     prev_df = prev_df if prev_df is not None else pd.DataFrame(columns=["Weight"])
     curr_df = curr_df if curr_df is not None else pd.DataFrame(columns=["Weight"])
     prev_w = prev_df["Weight"].astype(float) if "Weight" in prev_df.columns else pd.Series(dtype=float)
@@ -834,10 +848,32 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
             "Mom Rank","Mom Score",f"ST Return ({params['mr_lb']}d)",f"Above {params['mr_ma']}DMA"
         ])
 
-    prices = daily_prices[all_tickers].dropna(axis=1, how="all")
-    if prices.empty:
-        return pd.DataFrame()
+    if daily_prices is None or daily_prices.empty:
+        # No price context available; still return the structural changes
+        rows = []
+        for t in all_tickers:
+            old_w = float(prev_w.get(t, 0.0))
+            new_w = float(curr_w.get(t, 0.0))
+            if abs(new_w - old_w) < 1e-9:
+                continue
+            action = "Buy" if old_w == 0 and new_w > 0 else ("Sell" if new_w == 0 and old_w > 0 else "Rebalance")
+            rows.append({
+                "Ticker": t, "Action": action,
+                "Old Wt": f"{old_w:.2%}", "New Wt": f"{new_w:.2%}",
+                "Δ Wt (bps)": int(round((new_w - old_w) * 10000)),
+                "Mom Rank": np.nan, "Mom Score": np.nan,
+                f"ST Return ({params['mr_lb']}d)": np.nan,
+                f"Above {params['mr_ma']}DMA": None
+            })
+        return pd.DataFrame(rows).sort_values("Δ Wt (bps)", ascending=False).reset_index(drop=True)
 
+    # Only use tickers that actually exist in the price panel
+    available = [t for t in all_tickers if t in daily_prices.columns]
+    if len(available) == 0:
+        # Nothing available; same fallback as above
+        return explain_portfolio_changes(prev_df, curr_df, pd.DataFrame(), params)
+
+    prices = daily_prices[available].copy()
     snap = _signal_snapshot_for_explain(prices, params)
 
     rows = []
@@ -854,23 +890,27 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
         else:
             action = "Rebalance"
 
-        mom_rank = snap.at[t, "mom_rank"] if t in snap.index else np.nan
-        mom_score = snap.at[t, "mom_score"] if t in snap.index else np.nan
-        st_key = f"st_ret_{params['mr_lb']}d"
-        stv = snap.at[t, st_key] if t in snap.index else np.nan
-        above_key = f"above_{params['mr_ma']}dma"
-        ab = snap.at[t, above_key] if t in snap.index else np.nan
+        # Fill signal columns only if ticker had price data
+        if t in snap.index:
+            mom_rank = snap.at[t, "mom_rank"]
+            mom_score = snap.at[t, "mom_score"]
+            st_key = f"st_ret_{params['mr_lb']}d"
+            stv = snap.at[t, st_key]
+            above_key = f"above_{params['mr_ma']}dma"
+            ab = bool(snap.at[t, above_key]) if pd.notna(snap.at[t, above_key]) else None
+        else:
+            mom_rank = np.nan; mom_score = np.nan; stv = np.nan; ab = None
 
         rows.append({
             "Ticker": t,
             "Action": action,
-            "Old Wt": old_w,
-            "New Wt": new_w,
+            "Old Wt": f"{old_w:.2%}",
+            "New Wt": f"{new_w:.2%}",
             "Δ Wt (bps)": int(round((new_w - old_w) * 10000)),
             "Mom Rank": int(mom_rank) if pd.notna(mom_rank) else np.nan,
             "Mom Score": mom_score,
             f"ST Return ({params['mr_lb']}d)": stv,
-            f"Above {params['mr_ma']}DMA": bool(ab) if pd.notna(ab) else None
+            f"Above {params['mr_ma']}DMA": ab
         })
 
     out = pd.DataFrame(rows)
@@ -878,11 +918,11 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
         return out
 
     action_order = pd.Categorical(out["Action"], categories=["Buy","Rebalance","Sell"], ordered=True)
-    out = out.assign(ActionOrder=action_order).sort_values(["ActionOrder","Δ Wt (bps)"], ascending=[True, False]).drop(columns=["ActionOrder"])
-    out["Old Wt"] = out["Old Wt"].map(lambda x: f"{x:.2%}")
-    out["New Wt"] = out["New Wt"].map(lambda x: f"{x:.2%}")
-    return out.reset_index(drop=True)
-
+    out = out.assign(ActionOrder=action_order) \
+             .sort_values(["ActionOrder","Δ Wt (bps)"], ascending=[True, False]) \
+             .drop(columns=["ActionOrder"]) \
+             .reset_index(drop=True)
+    return out
 # =========================
 # Regime & Live paper tracking
 # =========================
