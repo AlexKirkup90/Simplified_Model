@@ -70,8 +70,8 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                     st.subheader(f"Backtest: Hybrid Strategy vs. QQQ (Since 2018)")
                     if strategy_returns_cum is not None and qqq_returns_cum is not None:
                         # KPIs (monthly pct_change)
-                        strat_metrics = backend.get_performance_metrics(strategy_returns_cum.pct_change())
-                        qqq_metrics = backend.get_performance_metrics(qqq_returns_cum.pct_change())
+                        strat_metrics = backend.get_performance_metrics(strategy_returns_cum.pct_change(), use_quantstats=False)
+                        qqq_metrics   = backend.get_performance_metrics(qqq_returns_cum.pct_change(), use_quantstats=False)
 
                         st.markdown("##### Key Performance Indicators")
 
