@@ -139,7 +139,53 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
                                     st.markdown(f"- **{t}**: {old_w:.2%} → **{new_w:.2%}**")
                 else:
                     st.warning("No portfolio generated.")
+                    
+# === Explain changes (new) ===
+with st.expander("🔎 What changed and why?", expanded=False):
+    try:
+        # Fetch a short window for the signal snapshot
+        uni = backend.get_nasdaq_100_plus_tickers()
+        if mode == "Classic 90/10 (sliders)":
+            params_for_explain = {
+                'mom_lb': momentum_window,   # months
+                'mom_topn': top_n,
+                'mom_cap': cap,
+                'mr_lb': 21,                 # classic MR
+                'mr_topn': 5,
+                'mr_ma': 200,
+                'mom_w': 0.90,
+                'mr_w': 0.10
+            }
+            start_explain = (datetime.today() - relativedelta(months=momentum_window + 8)).strftime('%Y-%m-%d')
+        else:
+            params_for_explain = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+            start_explain = (datetime.today() - relativedelta(months=params_for_explain['mom_lb'] + 8)).strftime('%Y-%m-%d')
 
+        end_explain = datetime.today().strftime('%Y-%m-%d')
+        px_explain = backend.fetch_market_data(uni, start_explain, end_explain)
+
+        if px_explain.empty:
+            st.info("Could not fetch prices to build signal snapshot.")
+        else:
+            expl = backend.explain_portfolio_changes(
+                prev_portfolio if prev_portfolio is not None else st.session_state.get('latest_portfolio', backend.load_previous_portfolio()),
+                new_portfolio_raw,
+                px_explain,
+                params_for_explain
+            )
+            if expl.empty:
+                st.write("No material changes to explain.")
+            else:
+                st.dataframe(expl, use_container_width=True)
+                st.caption(
+                    "Notes: Momentum rank is within the current universe (1 = best). "
+                    "Short-term return is the last {} trading days (more negative = larger 'dip'). "
+                    "Above 200DMA indicates long-term uptrend filter for MR sleeve."
+                    .format(params_for_explain['mr_lb'])
+                )
+    except Exception as e:
+        st.warning(f"Could not build explanation: {e}")
+        
             # --- Tab 2: Portfolio ---
             with tab2:
                 st.subheader("New Target Portfolio")
