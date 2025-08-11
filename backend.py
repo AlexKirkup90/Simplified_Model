@@ -49,78 +49,59 @@ def to_yahoo_symbol(sym: str) -> str:
     return str(sym).strip().upper().replace(".", "-")
 
 # =========================
-# Universes + Sectors
+# Universe builders & sectors
 # =========================
-@st.cache_data(ttl=43200)
-def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
-    """Daily Close (auto-adjusted), tz-naive index."""
+@st.cache_data(ttl=86400)
+def fetch_sp500_constituents() -> List[str]:
+    """Get current S&P 500 tickers from Wikipedia."""
     try:
-        fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
-        data = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)["Close"]
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-        data = data.dropna(axis=1, how="all")
-        # --- tz normalize ---
-        idx = pd.to_datetime(data.index)
-        if getattr(idx, "tz", None) is not None:
-            idx = idx.tz_localize(None)
-        data.index = idx
-        return data
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        df = tables[0]
+        tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
+        # Remove weird cases (e.g., BRK.B => BRK-B already handled via replace)
+        return sorted(list(set(tickers)))
     except Exception as e:
-        st.error(f"Failed to download market data: {e}")
-        return pd.DataFrame()
+        st.warning(f"Failed to fetch S&P 500 list: {e}")
+        return []
 
+@st.cache_data(ttl=86400)
+def get_sector_map(tickers: List[str]) -> Dict[str, str]:
+    """
+    Best-effort sector map via yfinance. Returns 'Unknown' when missing.
+    Cached to avoid repeated API calls.
+    """
+    out = {}
+    for t in tickers:
+        try:
+            info = yf.Ticker(t).info or {}
+            sector = info.get("sector") or "Unknown"
+        except Exception:
+            sector = "Unknown"
+        out[t] = sector
+    return out
 
-@st.cache_data(ttl=43200)
-def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Daily Close & Volume as aligned DataFrames with tz-naive indexes."""
-    try:
-        fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
-        df = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[["Close", "Volume"]]
+def get_universe(choice: str) -> Tuple[List[str], Dict[str, str], str]:
+    """
+    Returns (tickers, sectors_map, label) for:
+      - 'NASDAQ100+'
+      - 'S&P500 (All)'
+      - 'Hybrid Top150'  (start from S&P500; later reduced to top 150 by liquidity)
+    """
+    choice = (choice or "").strip()
+    if choice.lower().startswith("nasdaq"):
+        tickers = get_nasdaq_100_plus_tickers()
+        sectors = get_sector_map(tickers)
+        return tickers, sectors, "NASDAQ100+"
 
-        if isinstance(df, pd.Series):
-            df = df.to_frame()
+    if choice.lower().startswith("s&p500"):
+        tickers = fetch_sp500_constituents()
+        sectors = get_sector_map(tickers)
+        return tickers, sectors, "S&P500 (All)"
 
-        if isinstance(df.columns, pd.MultiIndex):
-            close = df["Close"]
-            vol = df["Volume"]
-        else:
-            if "Close" in df.columns and "Volume" in df.columns:
-                close = df[["Close"]].copy()
-                vol = df[["Volume"]].copy()
-                if len(tickers) == 1:
-                    close.columns = [tickers[0]]
-                    vol.columns = [tickers[0]]
-            else:
-                return pd.DataFrame(), pd.DataFrame()
-
-        close = close.dropna(axis=1, how="all")
-        vol = vol.reindex_like(close).fillna(0)
-
-        # --- tz normalize both ---
-        for _df in (close, vol):
-            idx = pd.to_datetime(_df.index)
-            if getattr(idx, "tz", None) is not None:
-                idx = idx.tz_localize(None)
-            _df.index = idx
-
-        return close, vol
-    except Exception as e:
-        st.error(f"Failed to download price/volume: {e}")
-        return pd.DataFrame(), pd.DataFrame()
-
-
-def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
-    """Close series with tz-naive index."""
-    px = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)["Close"]
-    if isinstance(px, pd.DataFrame):
-        px = px.squeeze()
-    s = pd.Series(px).dropna()
-    idx = pd.to_datetime(s.index)
-    if getattr(idx, "tz", None) is not None:
-        idx = idx.tz_localize(None)
-    s.index = idx
-    return s
+    # Default to Hybrid Top150
+    tickers = fetch_sp500_constituents()
+    sectors = get_sector_map(tickers)
+    return tickers, sectors, "Hybrid Top150"
 
 # =========================
 # Data fetching (cache)
