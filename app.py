@@ -142,7 +142,7 @@ if go:
                 start_date="2017-07-01",
                 universe_choice=universe_choice,
                 top_n=preset["mom_topn"],
-                name_cap=preset["mom_cap"],
+                name_cap=float(name_cap),
                 sector_cap=sector_cap,
                 stickiness_days=stickiness_days,
                 mr_topn=preset["mr_topn"],
