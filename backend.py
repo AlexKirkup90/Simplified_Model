@@ -321,52 +321,81 @@ def equity_curve(returns: pd.Series) -> pd.Series:
 def drawdown(curve: pd.Series) -> pd.Series:
     return curve / curve.cummax() - 1
 
-def kpi_row(name: str, rets: pd.Series,
+def kpi_row(name: str,
+            rets: pd.Series,
             trade_log: Optional[pd.DataFrame] = None,
             turnover_series: Optional[pd.Series] = None,
             avg_trade_size: float = 0.02) -> List[str]:
+    """
+    KPI row with robust turnover:
+      - Turnover/yr = mean of calendar-year sums of monthly turnover
+      - Trades/yr   ≈ Turnover/yr ÷ avg_trade_size (default 2% per single-leg trade)
+    """
     r = pd.Series(rets).dropna().astype(float)
     if r.empty:
         return [name, "-", "-", "-", "-", "-", "-", "-", "-", "-"]
-    py = _infer_periods_per_year(r.index)
+
+    # infer periodicity
+    idx = pd.to_datetime(r.index)
+    # very light inference: monthly-ish unless clearly daily/weekly
+    def _infer_py(ix):
+        if len(ix) < 3: return 12.0
+        try: f = pd.infer_freq(ix)
+        except Exception: f = None
+        if f:
+            F = f.upper()
+            if F.startswith(("B","D")): return 252.0
+            if F.startswith("W"):       return 52.0
+            if F.startswith("M"):       return 12.0
+            if F.startswith("Q"):       return 4.0
+            if F.startswith(("A","Y")): return 1.0
+        # fallback by median spacing
+        d = np.median(np.diff(ix.view("i8")))/1e9/86400.0
+        return 252.0 if d<=2.5 else 52.0 if d<=9 else 12.0 if d<=45 else 4.0 if d<=150 else 1.0
+
+    py = _infer_py(idx)
+    freq_label = (
+        "Daily (252py)" if abs(py-252)<1 else
+        "Weekly (52py)" if abs(py-52)<1 else
+        "Monthly (12py)" if abs(py-12)<0.5 else
+        "Quarterly (4py)" if abs(py-4)<0.5 else
+        "Yearly (1py)" if abs(py-1)<0.2 else
+        f"{py:.1f}py"
+    )
+
+    # core KPIs
     eq = (1 + r).cumprod()
     n  = max(len(r), 1)
-    ann_ret = eq.iloc[-1] ** (py / n) - 1
-    mean_p, std_p = r.mean(), r.std()
-    sharpe  = (mean_p * py) / (std_p * np.sqrt(py) + 1e-9)
-    down_p  = r.clip(upper=0).std()
-    sortino = (mean_p * py) / (down_p * np.sqrt(py) + 1e-9) if down_p > 0 else np.nan
+    ann_return = eq.iloc[-1] ** (py / n) - 1
+    mu, sd = r.mean(), r.std()
+    sharpe  = (mu * py) / (sd * np.sqrt(py) + 1e-9)
+    down_sd = r.clip(upper=0).std()
+    sortino = (mu * py) / (down_sd * np.sqrt(py) + 1e-9) if down_sd > 0 else np.nan
     dd      = (eq/eq.cummax() - 1).min()
-    calmar  = ann_ret / abs(dd) if dd != 0 else np.nan
+    calmar  = ann_return / abs(dd) if dd != 0 else np.nan
     eq_mult = float(eq.iloc[-1])
 
+    # robust turnover calc (group-by-year mean)
     tpy = 0.0
-    if trade_log is not None and len(trade_log) > 0 and "date" in trade_log.columns:
-        tl = trade_log.copy()
-        tl["year"] = pd.to_datetime(tl["date"]).dt.year
-        grp = tl.groupby("year").size()
-        if len(grp) > 0:
-            tpy = float(grp.mean())
-
-    topy = 0.0
     if turnover_series is not None and len(turnover_series) > 0:
-        s = pd.Series(turnover_series)
-        s.index = pd.to_datetime(s.index)
-        grp = s.groupby(s.index.year).sum()
-        if len(grp) > 0:
-            topy = float(grp.mean())
+        ts = pd.Series(turnover_series).copy()
+        ts.index = pd.to_datetime(ts.index)
+        yearly_sum = ts.groupby(ts.index.year).sum()
+        if len(yearly_sum) > 0:
+            tpy = float(yearly_sum.mean())
 
-    trades_est = topy / max(avg_trade_size, 1e-6) if topy > 0 else 0.0
+    # trades per year (single-leg) from average trade size assumption
+    trades_per_year = (tpy / avg_trade_size) if tpy > 0 and avg_trade_size > 0 else 0.0
 
     return [
-        name, _freq_label(py),
-        f"{ann_ret*100:.2f}%",
+        name, freq_label,
+        f"{ann_return*100:.2f}%",
         f"{sharpe:.2f}",
         f"{sortino:.2f}" if not np.isnan(sortino) else "N/A",
         f"{calmar:.2f}"  if not np.isnan(calmar)  else "N/A",
         f"{dd*100:.2f}%",
-        f"{trades_est:.1f}",
-        f"{topy:.2f}",
+        f"{trades_per_year:.1f}",
+        f"{tpy:.2f}",
         f"{eq_mult:.2f}x"
     ]
 
