@@ -243,7 +243,7 @@ with tab3:
                 "Strategy (Gross)",
                 strategy_cum_gross.pct_change(),
                 turnover_series=hybrid_tno,
-                avg_trade_size=0.02  # estimate trades/yr from turnover
+                avg_trade_size=0.02
             )
         )
         if strategy_cum_net is not None and show_net:
@@ -281,6 +281,14 @@ with tab3:
         st.pyplot(fig)
 
         st.caption("Trades/yr estimated from turnover assuming ~2% avg single-leg trade (configurable in code).")
+
+        # Show Monthly Net Returns table
+        if strategy_cum_net is not None and show_net:
+            st.subheader("📅 Monthly Net Returns (%)")
+            monthly_net = strategy_cum_net.pct_change() * 100
+            monthly_net = monthly_net.dropna()  # remove first NaN
+            monthly_net_df = pd.DataFrame(monthly_net, columns=["Net Return (%)"])
+            st.dataframe(monthly_net_df.round(2))
 
 # ---------------------------
 # Tab 4: Regime
