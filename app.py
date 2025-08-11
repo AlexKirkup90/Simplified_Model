@@ -12,52 +12,51 @@ import backend  # our production module
 
 st.set_page_config(layout="wide", page_title="Hybrid Momentum Portfolio")
 
-# ======================
-# Sidebar Controls
-# ======================
+# === Sidebar Controls ===
+if "universe" not in st.session_state:
+    st.session_state.universe = "Hybrid Top150"   # default based on your latest results
+if "roundtrip_bps" not in st.session_state:
+    st.session_state.roundtrip_bps = 20           # validated default in sanity checks
+if "stickiness_days" not in st.session_state:
+    st.session_state.stickiness_days = 7          # good balance from checks
+
 st.sidebar.header("⚙️ Strategy Settings")
 
-universe_name = st.sidebar.selectbox(
+# Universe toggle (persisted)
+universe_choice = st.sidebar.selectbox(
     "Universe",
-    ["NASDAQ100+", "Hybrid Top150", "S&P500"],
-    index=1,
-    help="Choose where the model can pick stocks from."
+    ["Hybrid Top150", "NASDAQ100+", "S&P500 (All)"],
+    index=["Hybrid Top150", "NASDAQ100+", "S&P500 (All)"].index(st.session_state.universe)
 )
+st.session_state.universe = universe_choice
 
-min_dollar_volume = st.sidebar.number_input(
-    "Liquidity floor (median $ volume, last 60d)",
-    min_value=0.0, value=0.0, step=1_000_000.0,
-    help="Optional: drop illiquid names (0 = off). Ignored for Hybrid Top150 which uses top-N by liquidity."
+# Costs (persisted)
+roundtrip_bps = st.sidebar.slider(
+    "Assumed round-trip cost (bps)",
+    min_value=0, max_value=100, value=st.session_state.roundtrip_bps, step=1,
+    help="Used for Net-of-cost backtest and trade planning. 1 bp = 0.01%."
 )
+st.session_state.roundtrip_bps = roundtrip_bps
 
-roundtrip_bps = st.sidebar.number_input(
-    "Rebalance cost (round-trip, bps)",
-    min_value=0, max_value=200, value=0, step=5,
-    help="Applied to turnover in backtests when 'Show net' is on."
+# (Optional) stickiness in UI if you want it visible now; harmless if your backend ignores it for the moment
+stickiness_days = st.sidebar.slider(
+    "Momentum stickiness (days in top cohort)",
+    min_value=3, max_value=15, value=st.session_state.stickiness_days, step=1,
+    help="Require a name to stay in the momentum top cohort this many consecutive days before entering."
 )
+st.session_state.stickiness_days = stickiness_days
 
-show_net = st.sidebar.checkbox("Show net of costs", value=False)
+# Existing sliders for the classic momentum sleeve (keep as-is if you have them)
+momentum_window = st.sidebar.slider("Momentum Lookback (Months)", 3, 12, 6, 1)
+top_n          = st.sidebar.slider("Number of Stocks in Portfolio", 5, 20, 15, 1)
+cap            = st.sidebar.slider("Max Weight Cap per Stock", 0.1, 0.5, 0.25, 0.01, format="%.2f")
+tol            = st.sidebar.slider("Rebalancing Tolerance", 0.005, 0.05, 0.01, 0.005, format="%.3f")
 
-st.sidebar.header("Momentum Sleeve")
-momentum_window = st.sidebar.slider("Momentum Lookback (Months)", 3, 18, 15, 1)
-top_n = st.sidebar.slider("Number of Stocks (Momentum)", 5, 20, 8, 1)
-cap = st.sidebar.slider("Max Weight Cap per Stock", 0.10, 0.50, 0.25, 0.01, format="%.2f")
-
-st.sidebar.header("ISA Dynamic Weights")
-mom_w = st.sidebar.slider("Weight: Momentum", 0.50, 0.95, 0.85, 0.05)
-mr_w = 1.0 - mom_w
-st.sidebar.caption(f"Mean-Reversion weight auto-set to **{mr_w:.0%}**.")
-
-st.sidebar.header("Rebalancing")
-tol = st.sidebar.slider("Rebalancing Tolerance (Δ weight)", 0.005, 0.05, 0.01, 0.005, format="%.3f")
-
-st.title("🚀 Hybrid Momentum Portfolio Manager")
-
-st.markdown(
-    f"**Universe:** `{universe_name}` &nbsp;|&nbsp; **Liquidity floor:** "
-    f"{'off' if min_dollar_volume==0 else f'${min_dollar_volume:,.0f}'} &nbsp;|&nbsp; "
-    f"**Costs:** {roundtrip_bps} bps (round-trip) {'(shown)' if show_net else '(hidden)'}"
-)
+# (Optional) show current defaults
+with st.sidebar.expander("Defaults in use"):
+    st.write(f"Universe: **{st.session_state.universe}**")
+    st.write(f"Costs: **{st.session_state.roundtrip_bps} bps**")
+    st.write(f"Stickiness: **{st.session_state.stickiness_days} days**")
 
 # ======================
 # Action button
