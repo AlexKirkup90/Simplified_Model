@@ -44,21 +44,27 @@ stickiness_days = st.sidebar.slider(
     1
 )
 
-sector_cap = st.sidebar.slider(
+# --- Caps (UI in %; backend uses fractions) ---
+name_cap_pct = st.sidebar.slider(
+    "Single-name cap (%)",
+    min_value=20, max_value=50, value=int(preset.get("mom_cap", 0.25) * 100),
+    step=5
+)
+sector_cap_pct = st.sidebar.slider(
     "Sector Cap (max % per sector)",
-    0.10, 0.50, 
-    float(preset.get("sector_cap", 0.30)), 
-    0.05, 
-    format="%.2f"   # Show raw decimal, no rounding to 0%/100%
+    min_value=10, max_value=50, value=int(preset.get("sector_cap", 0.30) * 100),
+    step=5
 )
-# Single-name cap (max % per stock)
-name_cap = st.sidebar.slider(
-    "Single-name cap (max % per stock)",
-    0.10, 0.50,     # <— was 0.35; raise to 0.50
-    0.35,           # default
-    0.05,
-    format="%.0f%%"
-)
+
+# Convert to fractions for backend and stash in session
+name_cap = name_cap_pct / 100.0
+sector_cap = sector_cap_pct / 100.0
+st.session_state["name_cap"] = name_cap
+st.session_state["sector_cap"] = sector_cap
+
+# Optional helper labels
+st.caption(f"Single-name cap: **{name_cap_pct}%**")
+st.caption(f"Sector cap: **{sector_cap_pct}%**")
 
 # make available to backend
 st.session_state["name_cap"] = float(name_cap)
