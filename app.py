@@ -219,82 +219,64 @@ if st.button("Generate Portfolio & Rebalancing Plan", type="primary", use_contai
             # ---- Tab 3: Performance ----
 with tab3:
     st.subheader("📈 Backtest (since 2018)")
-    if strategy_cum_gross is None or qqq_cum is None:
-        st.info("Generate to see backtest results.")
-    else:
-        # KPIs (monthly series inferred)
-        st.markdown("#### Key Performance (monthly series inferred)")
+    try:
+        if strategy_cum_gross is None or qqq_cum is None:
+            st.info("Generate to see backtest results.")
+        else:
+            # KPIs (monthly series inferred)
+            st.markdown("#### Key Performance (monthly series inferred)")
 
-        krows = []
-        # Gross
-        krows.append(
-            backend.kpi_row(
-                "Strategy (Gross)",
-                strategy_cum_gross.pct_change(),
-                turnover_series=hybrid_tno,          # ensure this is coming back from your backtest call
-                avg_trade_size=0.02
-            )
-        )
-        # Net (if shown)
-        if strategy_cum_net is not None and show_net:
+            krows = []
+            # Strategy (Gross)
             krows.append(
                 backend.kpi_row(
-                    "Strategy (Net of costs)",
-                    strategy_cum_net.pct_change(),
-                    turnover_series=hybrid_tno,
-                    avg_trade_size=0.02
+                    "Strategy (Gross)",
+                    strategy_cum_gross.pct_change(),
+                    turnover_series=hybrid_tno,   # from your backtest call
+                    avg_trade_size=0.02           # estimate trades/yr from turnover (~2%/trade)
                 )
             )
-        # Benchmark
-        krows.append(
-            backend.kpi_row(
-                "QQQ Benchmark",
-                qqq_cum.pct_change(),
-                turnover_series=None
+
+            # Strategy (Net), if shown
+            if show_net and strategy_cum_net is not None:
+                krows.append(
+                    backend.kpi_row(
+                        "Strategy (Net of costs)",
+                        strategy_cum_net.pct_change(),
+                        turnover_series=hybrid_tno,
+                        avg_trade_size=0.02
+                    )
+                )
+
+            # Benchmark
+            krows.append(
+                backend.kpi_row(
+                    "QQQ Benchmark",
+                    qqq_cum.pct_change()
+                )
             )
-        )
 
-        kdf = pd.DataFrame(
-            krows,
-            columns=["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity x"]
-        )
-        st.dataframe(kdf, use_container_width=True)
-        st.caption("Trades/yr is estimated from turnover assuming ~2% average single-leg trade size.")
+            kdf = pd.DataFrame(
+                krows,
+                columns=["Model","Freq","CAGR","Sharpe","Sortino","Calmar","MaxDD","Trades/yr","Turnover/yr","Equity x"]
+            )
+            st.dataframe(kdf, use_container_width=True)
+            st.caption("Trades/yr is estimated from turnover assuming ~2% average per single-leg trade. Adjust in code (avg_trade_size).")
 
-        # Equity curves (log)
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(strategy_cum_gross.index, strategy_cum_gross.values, label="Strategy (Gross)")
-        if strategy_cum_net is not None and show_net:
-            ax.plot(strategy_cum_net.index, strategy_cum_net.values, label="Strategy (Net)", linestyle=":")
-        ax.plot(qqq_cum.index, qqq_cum.values, label="QQQ", linestyle="--")
-        ax.set_yscale("log")
-        ax.set_ylabel("Cumulative Growth (log)")
-        ax.grid(True, ls="--", alpha=0.6)
-        ax.legend()
-        st.pyplot(fig)
+            # Equity curves
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(strategy_cum_gross.index, strategy_cum_gross.values, label="Strategy (Gross)")
+            if show_net and strategy_cum_net is not None:
+                ax.plot(strategy_cum_net.index, strategy_cum_net.values, label="Strategy (Net)", linestyle=":")
+            ax.plot(qqq_cum.index, qqq_cum.values, label="QQQ", linestyle="--")
+            ax.set_yscale("log")
+            ax.set_ylabel("Cumulative Growth (log)")
+            ax.grid(True, ls="--", alpha=0.6)
+            ax.legend()
+            st.pyplot(fig)
 
-        # Turnover sanity (optional)
-        with st.expander("🔎 Turnover sanity check", expanded=False):
-            try:
-                tno_s = pd.Series(hybrid_tno).dropna()
-                months = len(tno_s)
-                total_turnover = float(tno_s.sum())
-                avg_turnover_pm = total_turnover / months if months else np.nan
-                turnover_per_year_direct = avg_turnover_pm * 12 if months else np.nan
-
-                # group-by-year mean (robust)
-                ts = tno_s.copy()
-                ts.index = pd.to_datetime(ts.index)
-                yearly = ts.groupby(ts.index.year).sum()
-                turnover_per_year_by_year = float(yearly.mean()) if len(yearly) > 0 else np.nan
-
-                st.write(f"- Months observed: **{months}**")
-                st.write(f"- Avg turnover per month: **{avg_turnover_pm:.4f}**")
-                st.write(f"- Turnover/yr (direct ×12): **{turnover_per_year_direct:.4f}**")
-                st.write(f"- Turnover/yr (group-by-year mean): **{turnover_per_year_by_year:.4f}**")
-                st.caption("The app reports Turnover/yr using the group-by-year mean (more robust).")
-            except Exception as e:
-                st.warning(f"Turnover debug failed: {e}")
+    except Exception as e:
+        st.error(f"Error loading performance tab: {e}")
 
             # =======================
             # Tab 4: Regime
