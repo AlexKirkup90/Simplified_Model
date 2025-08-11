@@ -340,22 +340,32 @@ with tab5:
         st.info("Generate first to see changes.")
     else:
         try:
-            # Pull a small recent window for signals
-            uni_tickers, _, _ = backend.get_universe(universe_choice)
-            end = datetime.today().strftime("%Y-%m-%d")
-            start = (datetime.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
-            px = backend.fetch_market_data(uni_tickers, start, end)
-
-            # Explain vs last saved (fallback to live if no saved)
+            # --- figure out the two portfolios we're comparing ---
             base_df = backend.load_previous_portfolio()
             if base_df is None or base_df.empty:
-                base_df = live_raw
+                base_df = live_raw  # fallback: compare to itself (no-op)
 
-            expl = backend.explain_portfolio_changes(base_df, live_raw, px, backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"])
+            # --- build a price frame that DEFINITELY includes all tickers we need ---
+            union_tickers = sorted(set(base_df.index) | set(live_raw.index))
+            if union_tickers:
+                end   = datetime.today().strftime("%Y-%m-%d")
+                start = (datetime.today() - relativedelta(months=14)).strftime("%Y-%m-%d")
+                px_union = backend.fetch_market_data(union_tickers, start, end)
+            else:
+                px_union = pd.DataFrame()
+
+            # --- explain changes using the union price frame (robust to missing cols) ---
+            expl = backend.explain_portfolio_changes(
+                base_df,
+                live_raw,
+                px_union,  # <- robust frame built for the exact tickers
+                backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+            )
+
             if expl is None or expl.empty:
                 st.info("No changes to explain.")
             else:
-                # Tidy display
+                # tidy formatting for display
                 show = expl.copy()
                 for col in show.columns:
                     if "Score" in col:
@@ -363,6 +373,7 @@ with tab5:
                     if "Return" in col:
                         show[col] = show[col].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
                 st.dataframe(show, use_container_width=True)
+
         except Exception as e:
             st.error(f"Explainability failed: {e}")
             st.code(traceback.format_exc())
