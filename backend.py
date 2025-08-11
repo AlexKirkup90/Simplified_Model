@@ -51,68 +51,76 @@ def to_yahoo_symbol(sym: str) -> str:
 # =========================
 # Universes + Sectors
 # =========================
-@st.cache_data(ttl=86400)
-def get_sp500_with_sectors() -> Tuple[List[str], Dict[str, str]]:
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    sp = None
-    for t in tables:
-        cols = [c.lower() for c in t.columns.astype(str)]
-        if "symbol" in cols and any(c.startswith("gics sector") for c in cols):
-            sp = t.rename(columns=dict(zip(t.columns, cols)))
-            break
-    if sp is None:
-        return [], {}
-    sec_col = [c for c in sp.columns if c.startswith("gics sector")][0]
-    sp["symbol"] = sp["symbol"].astype(str).str.upper().str.strip().map(to_yahoo_symbol)
-    sectors = dict(zip(sp["symbol"], sp[sec_col]))
-    tickers = sorted(sp["symbol"].unique().tolist())
-    return tickers, sectors
+@st.cache_data(ttl=43200)
+def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """Daily Close (auto-adjusted), tz-naive index."""
+    try:
+        fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+        data = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)["Close"]
+        if isinstance(data, pd.Series):
+            data = data.to_frame()
+        data = data.dropna(axis=1, how="all")
+        # --- tz normalize ---
+        idx = pd.to_datetime(data.index)
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_localize(None)
+        data.index = idx
+        return data
+    except Exception as e:
+        st.error(f"Failed to download market data: {e}")
+        return pd.DataFrame()
 
-@st.cache_data(ttl=86400)
-def get_nasdaq100_with_sectors() -> Tuple[List[str], Dict[str, str]]:
-    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-    tables = pd.read_html(url)
-    ndx = None
-    for t in tables:
-        cols = [c.lower() for c in t.columns.astype(str)]
-        if "ticker" in cols:
-            ndx = t.rename(columns=dict(zip(t.columns, cols)))
-            break
-    if ndx is None:
-        return [], {}
-    ndx["ticker"] = ndx["ticker"].astype(str).str.upper().str.strip().map(to_yahoo_symbol)
-    # sector may be missing; default to Unknown
-    sectors = dict(zip(ndx["ticker"], ndx["sector"])) if "sector" in ndx.columns else {t: "Unknown" for t in ndx["ticker"]}
-    tickers = sorted(ndx["ticker"].unique().tolist())
-    # extras
-    extras = [to_yahoo_symbol(t) for t in ['TSLA','SHOP','SNOW','PLTR','ETSY','RIVN','COIN']]
-    for t in extras:
-        if t not in tickers:
-            tickers.append(t)
-        sectors.setdefault(t, "Unknown")
-    return tickers, sectors
 
-@st.cache_data(ttl=86400)
-def get_nasdaq_100_plus_tickers() -> List[str]:
-    t, _ = get_nasdaq100_with_sectors()
-    return t
+@st.cache_data(ttl=43200)
+def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Daily Close & Volume as aligned DataFrames with tz-naive indexes."""
+    try:
+        fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+        df = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[["Close", "Volume"]]
 
-def get_universe(universe_choice: str) -> Tuple[List[str], Dict[str, str], str]:
-    """
-    Returns (tickers, sector_map, label). For Hybrid Top150 we build from S&P500 by liquidity later.
-    """
-    uc = (universe_choice or "").strip()
-    if uc == "S&P500 (All)":
-        sp, sp_sec = get_sp500_with_sectors()
-        return sp, sp_sec, "S&P500 (All)"
-    if uc == "Hybrid Top150":
-        # start from S&P500 universe; we will reduce to top150 by liquidity after downloading prices
-        sp, sp_sec = get_sp500_with_sectors()
-        return sp, sp_sec, "Hybrid Top150"
-    # default NASDAQ100+
-    ndx, ndx_sec = get_nasdaq100_with_sectors()
-    return ndx, ndx_sec, "NASDAQ100+"
+        if isinstance(df, pd.Series):
+            df = df.to_frame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            close = df["Close"]
+            vol = df["Volume"]
+        else:
+            if "Close" in df.columns and "Volume" in df.columns:
+                close = df[["Close"]].copy()
+                vol = df[["Volume"]].copy()
+                if len(tickers) == 1:
+                    close.columns = [tickers[0]]
+                    vol.columns = [tickers[0]]
+            else:
+                return pd.DataFrame(), pd.DataFrame()
+
+        close = close.dropna(axis=1, how="all")
+        vol = vol.reindex_like(close).fillna(0)
+
+        # --- tz normalize both ---
+        for _df in (close, vol):
+            idx = pd.to_datetime(_df.index)
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_localize(None)
+            _df.index = idx
+
+        return close, vol
+    except Exception as e:
+        st.error(f"Failed to download price/volume: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
+    """Close series with tz-naive index."""
+    px = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    if isinstance(px, pd.DataFrame):
+        px = px.squeeze()
+    s = pd.Series(px).dropna()
+    idx = pd.to_datetime(s.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    s.index = idx
+    return s
 
 # =========================
 # Data fetching (cache)
@@ -477,37 +485,55 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
 # =========================
 # Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps)
 # =========================
-def _build_isa_weights(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str,str]) -> pd.Series:
+def _build_isa_weights(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
     monthly = daily_close.resample("ME").last()
 
-    # Composite momentum sleeve with stability gating
-    comp = composite_score(daily_close)
-    momz = blended_momentum_z(monthly)
-    sel  = comp[momz.index]
-    sel  = sel[momz > 0].dropna()
-    top_m = sel.nlargest(preset["mom_topn"]) if not sel.empty else pd.Series(dtype=float)
+    # --- Composite momentum (ticker vector at latest date) ---
+    comp_all = composite_score(daily_close)
+    if isinstance(comp_all, pd.DataFrame):
+        comp_vec = comp_all.iloc[-1].dropna()
+    else:
+        comp_vec = pd.Series(comp_all).dropna()
 
-    # Stability (stickiness)
-    stable = momentum_stable_names(daily_close, top_n=preset["mom_topn"], days=preset.get("stability_days",7))
-    if len(stable)>0 and not top_m.empty:
-        top_m = top_m.reindex([t for t in top_m.index if t in stable]).dropna() or top_m
+    # --- Long-term blended momentum z-score (month-end) ---
+    momz = blended_momentum_z(monthly)  # Series indexed by ticker
+    pos_idx = momz[momz > 0].index
 
-    mom_raw = (top_m / top_m.sum()) if not top_m.empty and top_m.sum() > 0 else pd.Series(dtype=float)
-    mom_w   = cap_weights(mom_raw, cap=preset["mom_cap"]) * preset["mom_w"] if not mom_raw.empty else pd.Series(dtype=float)
-    if not mom_w.empty:
-        mom_w = apply_sector_caps(mom_w, sectors_map, cap=preset.get("sector_cap",0.30))
+    # Filter composite by positive momentum universe
+    comp_vec = comp_vec.reindex(pos_idx).dropna()
+    top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
 
-    # MR sleeve
+    # --- Stability (stickiness) filter on entries ---
+    stable_names = set(momentum_stable_names(
+        daily_close, top_n=preset["mom_topn"], days=preset.get("stability_days", 7)
+    ))
+    if stable_names and not top_m.empty:
+        filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
+        if not filtered.empty:
+            top_m = filtered  # only replace if something remains
+
+    # Weights for momentum sleeve (with name cap + sector caps)
+    if not top_m.empty and top_m.sum() > 0:
+        mom_raw = top_m / top_m.sum()
+        mom_w = cap_weights(mom_raw, cap=preset["mom_cap"]) * preset["mom_w"]
+        if not mom_w.empty:
+            mom_w = apply_sector_caps(mom_w, sectors_map, cap=preset.get("sector_cap", 0.30))
+    else:
+        mom_w = pd.Series(dtype=float)
+
+    # --- Mean-Reversion sleeve (quality + worst ST) ---
     st_ret = daily_close.pct_change(preset["mr_lb"]).iloc[-1]
     long_ma = daily_close.rolling(preset["mr_ma"]).mean().iloc[-1]
     quality = (daily_close.iloc[-1] > long_ma)
     pool = [t for t, ok in quality.items() if ok]
-    mr_scores = st_ret[pool].dropna()
+    mr_scores = st_ret.reindex(pool).dropna()
     dips = mr_scores.nsmallest(preset["mr_topn"])
-    mr_w = (pd.Series(1/len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
+    mr_w = (pd.Series(1 / len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
 
+    # --- Combine sleeves & normalize ---
     new_w = mom_w.add(mr_w, fill_value=0.0)
     return new_w / new_w.sum() if new_w.sum() > 0 else new_w
+
 
 def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
     display_df = pd.DataFrame({"Weight": weights}).sort_values("Weight", ascending=False)
@@ -515,16 +541,19 @@ def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
     display_fmt["Weight"] = display_fmt["Weight"].map("{:.2%}".format)
     return display_fmt, display_df
 
-def generate_live_portfolio_isa_monthly(preset: Dict,
-                                        prev_portfolio: Optional[pd.DataFrame],
-                                        min_dollar_volume: float = 0.0) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
+
+def generate_live_portfolio_isa_monthly(
+    preset: Dict,
+    prev_portfolio: Optional[pd.DataFrame],
+    min_dollar_volume: float = 0.0
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
     Universe is taken from st.session_state.universe if present (default Hybrid Top150).
     """
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
-    stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days",7))
-    sector_cap      = st.session_state.get("sector_cap", preset.get("sector_cap",0.30))
+    stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
+    sector_cap      = st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
 
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
@@ -538,14 +567,14 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
     if close.empty:
         return None, None, "No price data."
 
-    # Special: Hybrid Top150 → reduce S&P500 by 60d median dollar volume
+    # Special: Hybrid Top150 → reduce by 60d median dollar volume
     sectors_map = base_sectors.copy()
     if label == "Hybrid Top150":
         med = median_dollar_volume(close, vol, window=60).sort_values(ascending=False)
         top_list = med.head(150).index.tolist()
         close = close[top_list]
         vol   = vol[top_list]
-        sectors_map = {t: base_sectors.get(t,"Unknown") for t in close.columns}
+        sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns}
 
     # Liquidity floor (optional)
     if min_dollar_volume > 0:
@@ -553,7 +582,7 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
         if not keep:
             return None, None, "No tickers pass liquidity filter."
         close = close[keep]
-        sectors_map = {t: sectors_map.get(t,"Unknown") for t in close.columns}
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
     # Monthly lock check — hold previous if not first trading day
     today = datetime.today().date()
@@ -578,7 +607,6 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
         monthly = close.resample("ME").last()
         mom_scores = blended_momentum_z(monthly)
         if not mom_scores.empty and len(new_w) > 0:
-            # health = weighted score of held names vs best score
             top_m = mom_scores.nlargest(params["mom_topn"])
             top_score = float(top_m.iloc[0]) if len(top_m) > 0 else 1e-9
             prev_w = prev_portfolio["Weight"].astype(float)
@@ -586,42 +614,44 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
                 decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
-                return _format_display(prev_w)
+                disp, raw = _format_display(prev_w)
+                return disp, raw, decision
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
-    return *_format_display(new_w), decision
+    disp, raw = _format_display(new_w)
+    return disp, raw, decision
 
-def run_backtest_for_app(
-    momentum_window: int = 6,              # kept for compatibility (unused in composite)
-    top_n: int = 8,                        # lock to best: top 8
-    cap: float = 0.25,                     # name cap 25%
-    roundtrip_bps: float = 20.0,
+
+def run_backtest_isa_dynamic(
+    roundtrip_bps: float = 0.0,
     min_dollar_volume: float = 0.0,
     show_net: bool = True,
-    universe_choice: Optional[str] = "Hybrid Top150",
-    stickiness_days: Optional[int] = 7,    # momentum persistence
-    sector_cap: Optional[float] = 0.30,    # sector cap 30%
-    mr_topn: int = 3,                      # MR sleeve: worst 3 among quality
-    start_date: str = "2017-07-01",        # match notebook window
+    start_date: str = "2017-07-01",
     end_date: Optional[str] = None,
-    mom_weight: float = 0.85,              # 85/15 hybrid weights
+    universe_choice: Optional[str] = "Hybrid Top150",
+    top_n: int = 8,
+    name_cap: float = 0.25,
+    sector_cap: float = 0.30,
+    stickiness_days: int = 7,
+    mr_topn: int = 3,
+    mom_weight: float = 0.85,
     mr_weight: float = 0.15,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
-    Universe-aware hybrid backtest (composite momentum + mean reversion),
-    with costs, liquidity filter, stickiness, sector caps, and 2017-07 start.
-    Returns (strategy_cum_gross, strategy_cum_net, qqq_cum, turnover_series).
+    ISA-Dynamic hybrid backtest (composite momentum + mean reversion) with
+    costs, liquidity, stickiness, sector caps, and QQQ benchmark.
+    Returns: (strategy_cum_gross, strategy_cum_net_or_None, qqq_cum, turnover_series)
     """
     if end_date is None:
         end_date = datetime.today().strftime("%Y-%m-%d")
 
-    # --- Universe & data ---
+    # Universe & data (helper)
     close, vol, sectors_map, label = _prepare_universe_for_backtest(universe_choice, start_date, end_date)
     if close.empty or "QQQ" not in close.columns:
         return None, None, None, None
 
-    # Optional liquidity floor
+    # Liquidity floor (optional)
     if min_dollar_volume > 0:
         keep = filter_by_liquidity(
             close.drop(columns=["QQQ"], errors="ignore"),
@@ -637,17 +667,15 @@ def run_backtest_for_app(
     daily = close.drop(columns=["QQQ"])
     qqq  = close["QQQ"]
 
-    # --- Sleeves ---
-    # Composite momentum with stickiness + caps
+    # Sleeves
     mom_rets, mom_tno = run_momentum_composite_param(
         daily,
         sectors_map,
         top_n=top_n,
-        name_cap=cap,
+        name_cap=name_cap,
         sector_cap=sector_cap,
         stickiness_days=stickiness_days
     )
-    # Mean reversion sleeve
     mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200)
 
     # Combine + costs
@@ -660,7 +688,7 @@ def run_backtest_for_app(
     qqq_cum = (1 + qqq.resample("ME").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
 
     return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
-
+    
 # =========================
 # Diff engine (for Plan tab)
 # =========================
