@@ -236,7 +236,7 @@ with tab3:
     else:
         st.markdown("#### Key Performance (monthly series inferred)")
 
-        AVG_TRADE_SIZE = 0.02  # used to estimate trades/yr from turnover
+        AVG_TRADE_SIZE = 0.02  # estimate trades/yr from turnover
 
         # --- KPI table ---
         rows = []
@@ -290,13 +290,11 @@ with tab3:
         # Choose net if available (and user ticked 'show net'); else use gross
         base_cum = strategy_cum_net if (strategy_cum_net is not None and show_net) else strategy_cum_gross
 
-        monthly_net = base_cum.pct_change().dropna() * 100  # in %
-        # Trim to backtest window for this app
+        monthly_net = base_cum.pct_change().dropna() * 100  # %
         monthly_net = monthly_net[monthly_net.index >= pd.Timestamp("2017-07-01")]
 
         monthly_net_df = pd.DataFrame(monthly_net, columns=["Net Return (%)"])
         monthly_net_df.index = monthly_net_df.index.strftime("%Y-%m")
-
         st.dataframe(monthly_net_df.round(2), use_container_width=True)
 
         csv_bytes = monthly_net_df.round(4).to_csv().encode("utf-8")
@@ -309,7 +307,7 @@ with tab3:
         )
 
         # Quick stats
-        m = (monthly_net / 100.0).astype(float)  # back to decimal
+        m = (monthly_net / 100.0).astype(float)  # decimal
         if len(m) > 0:
             ann_cagr = (1 + m).prod() ** (12 / len(m)) - 1
             ann_vol  = m.std() * (12 ** 0.5)
@@ -341,7 +339,6 @@ with tab3:
             def sample_12m_block_bootstrap(rng, m_arr, block):
                 """Draw a 12-month path via (possibly) block bootstrap."""
                 if block <= 1:
-                    # IID bootstrap
                     picks = rng.integers(0, len(m_arr), size=12)
                     path = m_arr[picks]
                 else:
@@ -371,6 +368,39 @@ with tab3:
             ax2.set_ylabel("Frequency")
             ax2.grid(True, ls="--", alpha=0.5)
             st.pyplot(fig2)
+
+            # === TL;DR summary of Monte Carlo ===
+            st.markdown("##### TL;DR for the next 12 months")
+
+            med = float(np.median(sims))
+            p10_val = float(np.percentile(sims, 10))
+            p90_val = float(np.percentile(sims, 90))
+            p05_val = float(np.percentile(sims, 5))
+            prob_neg = float((sims < 0).mean())
+
+            start_amount = st.number_input(
+                "Show results for a starting amount (£)",
+                min_value=100, max_value=1_000_000, step=100, value=1000
+            )
+
+            def money(x):
+                return f"£{x:,.0f}"
+
+            st.markdown(
+                f"""
+- **Median outcome:** **{med*100:.1f}%** → **{money(start_amount*(1+med))}**  
+- **Typical range (10th–90th pct):** **{p10_val*100:.1f}%** to **{p90_val*100:.1f}%**  
+  → **{money(start_amount*(1+p10_val))}** to **{money(start_amount*(1+p90_val))}**  
+- **Downside tail (5th pct):** **{p05_val*100:.1f}%** → **{money(start_amount*(1+p05_val))}**  
+- **Chance of a negative year:** **{prob_neg*100:.1f}%**  
+"""
+            )
+
+            st.info(
+                f"In plain English: the distribution is skewed positive. "
+                f"Most paths are up (median ≈ {med*100:.1f}%), but there’s still real downside risk "
+                f"(~{prob_neg*100:.1f}% chance of a down year). Size positions accordingly."
+            )
 # ---------------------------
 # Tab 4: Regime
 # ---------------------------
