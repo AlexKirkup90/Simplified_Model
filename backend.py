@@ -471,15 +471,35 @@ def run_backtest_mean_reversion(daily_prices: pd.DataFrame,
         prev_w = w
     return rets.fillna(0.0), tno.fillna(0.0)
 
-def combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mw=0.85, rw=0.15):
-    idx = mom_rets.index.union(mr_rets.index)
-    mom_r = mom_rets.reindex(idx, fill_value=0.0)
-    mr_r  = mr_rets.reindex(idx,  fill_value=0.0)
-    mom_n = mom_tno.reindex(idx, fill_value=0.0)
-    mr_n  = mr_tno.reindex(idx,  fill_value=0.0)
-    gross = mom_r*mw + mr_r*rw
-    tno   = mom_n*mw + mr_n*rw
-    return gross, tno
+def combine_hybrid(mom_rets: pd.Series, mr_rets: pd.Series,
+                   mom_tno: Optional[pd.Series] = None,
+                   mr_tno: Optional[pd.Series] = None,
+                   mw: float = 0.9, rw: float = 0.1,
+                   mom_w: Optional[float] = None,
+                   mr_w: Optional[float] = None) -> Tuple[pd.Series, Optional[pd.Series]]:
+    """
+    Combine momentum & mean-reversion sleeves. Supports both (mw, rw) and (mom_w, mr_w).
+    Returns (combined_returns, combined_turnover or None).
+    """
+    # Backward/forward compatibility for arg names
+    if mom_w is not None:
+        mw = mom_w
+    if mr_w is not None:
+        rw = mr_w
+
+    mom = pd.Series(mom_rets).copy()
+    mr  = pd.Series(mr_rets).reindex(mom.index, fill_value=0.0)
+    mom = mom.reindex(mr.index, fill_value=0.0)
+
+    combo = (mom * mw) + (mr * rw)
+
+    if mom_tno is None and mr_tno is None:
+        return combo, None
+
+    mtn = pd.Series(mom_tno).reindex(combo.index, fill_value=0.0) if mom_tno is not None else pd.Series(0.0, index=combo.index)
+    rtn = pd.Series(mr_tno ).reindex(combo.index, fill_value=0.0) if mr_tno  is not None else pd.Series(0.0, index=combo.index)
+    tno = (mtn * mw) + (rtn * rw)
+    return combo, tno
 
 def apply_costs(gross, turnover, roundtrip_bps):
     return gross - turnover*(roundtrip_bps/10000.0)
