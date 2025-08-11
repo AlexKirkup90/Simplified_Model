@@ -592,78 +592,74 @@ def generate_live_portfolio_isa_monthly(preset: Dict,
 
     return *_format_display(new_w), decision
 
-# =========================
-# Backtests for app (with costs & liquidity & universes)
-# =========================
-def _prepare_universe_for_backtest(universe_choice: str, start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,str], str]:
-    base_tickers, base_sectors, label = get_universe(universe_choice)
-    close, vol = fetch_price_volume(base_tickers + ["QQQ"], start_date, end_date)
-    if close.empty or "QQQ" not in close.columns:
-        return pd.DataFrame(), pd.DataFrame(), {}, label
-    sectors_map = {t: base_sectors.get(t,"Unknown") for t in close.columns if t != "QQQ"}
-
-    # Hybrid Top150 reduction
-    if label == "Hybrid Top150":
-        med = median_dollar_volume(close.drop(columns=["QQQ"], errors="ignore"),
-                                   vol.drop(columns=["QQQ"], errors="ignore"), window=60).sort_values(ascending=False)
-        top_list = med.head(150).index.tolist()
-        cols = [c for c in top_list if c in close.columns]
-        close = close[cols + (["QQQ"] if "QQQ" in close.columns else [])]
-        vol   = vol[cols + (["QQQ"] if "QQQ" in vol.columns else [])]
-        sectors_map = {t: sectors_map.get(t,"Unknown") for t in cols}
-    return close, vol, sectors_map, label
-
-def run_backtest_for_app(momentum_window: int, top_n: int, cap: float,
-                         roundtrip_bps: float = 0.0,
-                         min_dollar_volume: float = 0.0,
-                         show_net: bool = False,
-                         universe_choice: Optional[str] = None,
-                         stickiness_days: Optional[int] = None,
-                         sector_cap: Optional[float] = None) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+def run_backtest_for_app(
+    momentum_window: int = 6,              # kept for compatibility (unused in composite)
+    top_n: int = 8,                        # lock to best: top 8
+    cap: float = 0.25,                     # name cap 25%
+    roundtrip_bps: float = 20.0,
+    min_dollar_volume: float = 0.0,
+    show_net: bool = True,
+    universe_choice: Optional[str] = "Hybrid Top150",
+    stickiness_days: Optional[int] = 7,    # momentum persistence
+    sector_cap: Optional[float] = 0.30,    # sector cap 30%
+    mr_topn: int = 3,                      # MR sleeve: worst 3 among quality
+    start_date: str = "2017-07-01",        # match notebook window
+    end_date: Optional[str] = None,
+    mom_weight: float = 0.85,              # 85/15 hybrid weights
+    mr_weight: float = 0.15,
+) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
-    Classic path kept for compatibility (uses composite for momentum if universe_choice set).
+    Universe-aware hybrid backtest (composite momentum + mean reversion),
+    with costs, liquidity filter, stickiness, sector caps, and 2017-07 start.
+    Returns (strategy_cum_gross, strategy_cum_net, qqq_cum, turnover_series).
     """
-    start_date = "2018-01-01"
-    end_date = datetime.today().strftime("%Y-%m-%d")
+    if end_date is None:
+        end_date = datetime.today().strftime("%Y-%m-%d")
 
-    # Pull UI choices if not provided
-    if universe_choice is None:
-        universe_choice = st.session_state.get("universe", "Hybrid Top150")
-    if stickiness_days is None:
-        stickiness_days = st.session_state.get("stickiness_days", 7)
-    if sector_cap is None:
-        sector_cap = st.session_state.get("sector_cap", 0.30)
-
+    # --- Universe & data ---
     close, vol, sectors_map, label = _prepare_universe_for_backtest(universe_choice, start_date, end_date)
     if close.empty or "QQQ" not in close.columns:
         return None, None, None, None
 
-    # Liquidity filter floor (optional)
+    # Optional liquidity floor
     if min_dollar_volume > 0:
-        keep = filter_by_liquidity(close.drop(columns=["QQQ"], errors="ignore"),
-                                   vol.drop(columns=["QQQ"], errors="ignore"), min_dollar_volume)
+        keep = filter_by_liquidity(
+            close.drop(columns=["QQQ"], errors="ignore"),
+            vol.drop(columns=["QQQ"], errors="ignore"),
+            min_dollar_volume
+        )
         keep_cols = [c for c in keep if c in close.columns]
         if not keep_cols:
             return None, None, None, None
         close = close[keep_cols + ["QQQ"]]
-        sectors_map = {t: sectors_map.get(t,"Unknown") for t in keep_cols}
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep_cols}
 
     daily = close.drop(columns=["QQQ"])
     qqq  = close["QQQ"]
 
-    # Momentum sleeve: use composite if we have universes wired; otherwise fallback to single-window
+    # --- Sleeves ---
+    # Composite momentum with stickiness + caps
     mom_rets, mom_tno = run_momentum_composite_param(
-        daily, sectors_map, top_n=top_n, name_cap=cap, sector_cap=sector_cap, stickiness_days=stickiness_days
+        daily,
+        sectors_map,
+        top_n=top_n,
+        name_cap=cap,
+        sector_cap=sector_cap,
+        stickiness_days=stickiness_days
     )
-    mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, 21, 3, 200)
+    # Mean reversion sleeve
+    mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200)
 
-    hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mw=0.90, rw=0.10)
+    # Combine + costs
+    hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight)
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
+    # Cum curves
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
-    strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod()
-    qqq_cum = (1 + qqq.resample("ME").last().pct_change()).cumprod()
-    return strat_cum_gross, strat_cum_net, qqq_cum.reindex(strat_cum_gross.index, method="ffill"), hybrid_tno
+    strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
+    qqq_cum = (1 + qqq.resample("ME").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
+
+    return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
 
 # =========================
 # Diff engine (for Plan tab)
