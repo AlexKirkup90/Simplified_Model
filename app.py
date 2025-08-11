@@ -236,14 +236,16 @@ with tab3:
     else:
         st.markdown("#### Key Performance (monthly series inferred)")
 
-        # Build KPI rows (use backend.kpi_row)
+        AVG_TRADE_SIZE = 0.02  # used to estimate trades/yr from turnover
+
+        # --- KPI table ---
         rows = []
         rows.append(
             backend.kpi_row(
                 "Strategy (Gross)",
                 strategy_cum_gross.pct_change(),
                 turnover_series=hybrid_tno,
-                avg_trade_size=0.02
+                avg_trade_size=AVG_TRADE_SIZE
             )
         )
         if strategy_cum_net is not None and show_net:
@@ -252,7 +254,7 @@ with tab3:
                     "Strategy (Net of costs)",
                     strategy_cum_net.pct_change(),
                     turnover_series=hybrid_tno,
-                    avg_trade_size=0.02
+                    avg_trade_size=AVG_TRADE_SIZE
                 )
             )
         rows.append(
@@ -268,7 +270,7 @@ with tab3:
         )
         st.dataframe(kdf, use_container_width=True)
 
-        # Equity curves
+        # --- Equity curves ---
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(strategy_cum_gross.index, strategy_cum_gross.values, label="Strategy (Gross)")
         if strategy_cum_net is not None and show_net:
@@ -280,16 +282,95 @@ with tab3:
         ax.legend()
         st.pyplot(fig)
 
-        st.caption("Trades/yr estimated from turnover assuming ~2% avg single-leg trade (configurable in code).")
+        st.caption("Trades/yr estimated from turnover assuming ~2% average single-leg trade (adjust in code with AVG_TRADE_SIZE).")
 
-        # Show Monthly Net Returns table
-        if strategy_cum_net is not None and show_net:
-            st.subheader("📅 Monthly Net Returns (%)")
-            monthly_net = strategy_cum_net.pct_change() * 100
-            monthly_net = monthly_net.dropna()  # remove first NaN
-            monthly_net_df = pd.DataFrame(monthly_net, columns=["Net Return (%)"])
-            st.dataframe(monthly_net_df.round(2))
+        # ========= Monthly Net Returns =========
+        st.subheader("📅 Monthly Net Returns (%)")
 
+        # Choose net if available (and user ticked 'show net'); else use gross
+        base_cum = strategy_cum_net if (strategy_cum_net is not None and show_net) else strategy_cum_gross
+
+        monthly_net = base_cum.pct_change().dropna() * 100  # in %
+        # Trim to backtest window for this app
+        monthly_net = monthly_net[monthly_net.index >= pd.Timestamp("2017-07-01")]
+
+        monthly_net_df = pd.DataFrame(monthly_net, columns=["Net Return (%)"])
+        monthly_net_df.index = monthly_net_df.index.strftime("%Y-%m")
+
+        st.dataframe(monthly_net_df.round(2), use_container_width=True)
+
+        csv_bytes = monthly_net_df.round(4).to_csv().encode("utf-8")
+        st.download_button(
+            "⬇️ Download monthly net returns (CSV)",
+            data=csv_bytes,
+            file_name="monthly_net_returns.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+        # Quick stats
+        m = (monthly_net / 100.0).astype(float)  # back to decimal
+        if len(m) > 0:
+            ann_cagr = (1 + m).prod() ** (12 / len(m)) - 1
+            ann_vol  = m.std() * (12 ** 0.5)
+            sharpe   = (m.mean() * 12) / (m.std() * (12 ** 0.5) + 1e-9)
+            hit_rate = (m > 0).mean()
+
+            st.markdown(
+                f"**Since 2017-07:** "
+                f"CAGR: **{ann_cagr:.2%}** • Vol: **{ann_vol:.2%}** • Sharpe: **{sharpe:.2f}** • Hit-rate: **{hit_rate:.1%}**"
+            )
+
+        # ========= 12-Month Monte Carlo (bootstrap) =========
+        st.subheader("🔮 12-Month Monte Carlo (net returns)")
+        if len(m) < 6:
+            st.info("Not enough monthly history to run the simulation.")
+        else:
+            col_a, col_b, col_c = st.columns([1,1,1])
+            with col_a:
+                n_trials = st.slider("Simulations", 1000, 10000, 5000, 500)
+            with col_b:
+                block = st.slider("Block size (months)", 1, 6, 3, 1,
+                                  help="Use 1 for IID bootstrap; >1 keeps short-term clustering.")
+            with col_c:
+                seed = st.number_input("Random seed", value=42, step=1)
+
+            rng = np.random.default_rng(int(seed))
+            m_arr = m.values  # 1D numpy array of monthly decimal returns
+
+            def sample_12m_block_bootstrap(rng, m_arr, block):
+                """Draw a 12-month path via (possibly) block bootstrap."""
+                if block <= 1:
+                    # IID bootstrap
+                    picks = rng.integers(0, len(m_arr), size=12)
+                    path = m_arr[picks]
+                else:
+                    need = 12
+                    parts = []
+                    while need > 0:
+                        start = rng.integers(0, max(1, len(m_arr) - block + 1))
+                        seg = m_arr[start:start+block]
+                        parts.append(seg)
+                        need -= len(seg)
+                    path = np.concatenate(parts)[:12]
+                return (1.0 + path).prod() - 1.0  # 12-month compounded return
+
+            sims = np.array([sample_12m_block_bootstrap(rng, m_arr, block) for _ in range(n_trials)])
+
+            p10, p50, p90 = np.percentile(sims, [10, 50, 90])
+            st.markdown(
+                f"**12-month projected (net):** Median **{p50:.1%}**, "
+                f"10th pct **{p10:.1%}**, 90th pct **{p90:.1%}**"
+            )
+
+            # Histogram of simulated 12-month returns
+            fig2, ax2 = plt.subplots(figsize=(8, 4))
+            ax2.hist(sims * 100.0, bins=40, alpha=0.9)
+            ax2.axvline(p50*100, linestyle="--", linewidth=1)
+            ax2.set_xlabel("12-month return (%)")
+            ax2.set_ylabel("Frequency")
+            ax2.grid(True, ls="--", alpha=0.5)
+            st.pyplot(fig2)
 # ---------------------------
 # Tab 4: Regime
 # ---------------------------
