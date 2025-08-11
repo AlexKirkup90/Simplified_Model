@@ -46,11 +46,16 @@ stickiness_days = st.sidebar.slider(
 
 sector_cap = st.sidebar.slider(
     "Sector Cap (max % per sector)",
-    0.10, 0.50,                      # 10% → 50%
-    preset.get("sector_cap", 0.30),  # default 30%
-    0.05,                            # 5% steps
-    format="%.0f%%"                  # display as 10%, 15%, … 50%
+    0.10, 0.50, 
+    float(preset.get("sector_cap", 0.30)), 
+    0.05, 
+    format="%.2f"   # Show raw decimal, no rounding to 0%/100%
 )
+
+# Optional: convert to percent string for display
+st.sidebar.caption(f"Sector Cap in %: {sector_cap * 100:.0f}%")
+
+st.session_state["sector_cap"] = float(sector_cap)
 
 # Persist to session so backend reads the same values
 st.session_state["stickiness_days"] = int(stickiness_days)
