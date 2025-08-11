@@ -38,7 +38,13 @@ preset = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
 
 # Stickiness & sector cap (overrides)
 stickiness_days = st.sidebar.slider("Stickiness (days in top cohort)", 3, 15, preset.get("stability_days", 7), 1)
-sector_cap = st.sidebar.slider("Sector Cap (max % per sector)", 0.10, 0.50, preset.get("sector_cap", 0.30), 0.05, format="%.0f%%") / 1.0
+sector_cap = st.sidebar.slider(
+    "Sector Cap (max % per sector)",
+    0.10, 0.50, 
+    preset.get("sector_cap", 0.30), 
+    0.05, 
+    format="%.0f%%"
+)
 
 st.session_state["stickiness_days"] = stickiness_days
 st.session_state["sector_cap"] = sector_cap
