@@ -578,7 +578,6 @@ def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
     display_fmt["Weight"] = display_fmt["Weight"].map("{:.2%}".format)
     return display_fmt, display_df
 
-
 def generate_live_portfolio_isa_monthly(
     preset: Dict,
     prev_portfolio: Optional[pd.DataFrame],
@@ -592,6 +591,12 @@ def generate_live_portfolio_isa_monthly(
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
     sector_cap      = st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
 
+    # build params from preset, then override with UI/session values
+    params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
+    params["stability_days"] = int(stickiness_days)
+    params["sector_cap"]     = float(sector_cap)
+    params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
+    
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
     if not base_tickers:
