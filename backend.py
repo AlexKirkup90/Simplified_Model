@@ -58,7 +58,6 @@ def fetch_sp500_constituents() -> List[str]:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         df = tables[0]
         tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
-        # Remove weird cases (e.g., BRK.B => BRK-B already handled via replace)
         return sorted(list(set(tickers)))
     except Exception as e:
         st.warning(f"Failed to fetch S&P 500 list: {e}")
@@ -66,10 +65,7 @@ def fetch_sp500_constituents() -> List[str]:
 
 @st.cache_data(ttl=86400)
 def get_sector_map(tickers: List[str]) -> Dict[str, str]:
-    """
-    Best-effort sector map via yfinance. Returns 'Unknown' when missing.
-    Cached to avoid repeated API calls.
-    """
+    """Best-effort sector map via yfinance. Returns 'Unknown' when missing."""
     out = {}
     for t in tickers:
         try:
@@ -85,7 +81,7 @@ def get_universe(choice: str) -> Tuple[List[str], Dict[str, str], str]:
     Returns (tickers, sectors_map, label) for:
       - 'NASDAQ100+'
       - 'S&P500 (All)'
-      - 'Hybrid Top150'  (start from S&P500; later reduced to top 150 by liquidity)
+      - 'Hybrid Top150'
     """
     choice = (choice or "").strip()
     if choice.lower().startswith("nasdaq"):
@@ -102,6 +98,45 @@ def get_universe(choice: str) -> Tuple[List[str], Dict[str, str], str]:
     tickers = fetch_sp500_constituents()
     sectors = get_sector_map(tickers)
     return tickers, sectors, "Hybrid Top150"
+
+# =========================
+# Universe prep for backtests
+# =========================
+def _prepare_universe_for_backtest(
+    universe_choice: str,
+    start_date: str,
+    end_date: str
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str], str]:
+    """Fetches prices/volumes, applies Hybrid150 filter if needed."""
+    base_tickers, base_sectors, label = get_universe(universe_choice)
+    if not base_tickers:
+        return pd.DataFrame(), pd.DataFrame(), {}, label
+
+    close, vol = fetch_price_volume(base_tickers + ["QQQ"], start_date, end_date)
+    if close.empty or "QQQ" not in close.columns:
+        return pd.DataFrame(), pd.DataFrame(), {}, label
+
+    sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns if t != "QQQ"}
+
+    if label == "Hybrid Top150":
+        med = median_dollar_volume(
+            close.drop(columns=["QQQ"], errors="ignore"),
+            vol.drop(columns=["QQQ"], errors="ignore"),
+            window=60
+        ).sort_values(ascending=False)
+        top_list = med.head(150).index.tolist()
+        keep_cols = [c for c in top_list if c in close.columns]
+        if keep_cols:
+            close = close[keep_cols + ["QQQ"]]
+            vol   = vol[keep_cols + ["QQQ"]]
+            sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep_cols}
+
+    for _df in (close, vol):
+        idx = pd.to_datetime(_df.index)
+        if getattr(idx, "tz", None) is not None:
+            _df.index = idx.tz_localize(None)
+
+    return close, vol, sectors_map, label
 
 # =========================
 # Data fetching (cache)
@@ -123,7 +158,8 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         df = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[["Close","Volume"]]
-        if isinstance(df, pd.Series): df = df.to_frame()
+        if isinstance(df, pd.Series):
+            df = df.to_frame()
         if isinstance(df.columns, pd.MultiIndex):
             close = df["Close"]
             vol   = df["Volume"]
@@ -142,7 +178,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()
-
+        
 # =========================
 # Persistence (Gist + Local)
 # =========================
