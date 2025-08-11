@@ -111,23 +111,23 @@ if go:
                 min_dollar_volume=min_dollar_volume
             )
         except Exception as e:
-            st.error(f"Portfolio generation failed: {e}")
-            st.code(traceback.format_exc())
+    st.error(f"Portfolio generation failed: {e}")
+    st.code(traceback.format_exc())
 
-     # AFTER — lock to ISA Dynamic backtest (hybrid rules), 2017-07-01
-strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
-    roundtrip_bps=roundtrip_bps,
-    min_dollar_volume=min_dollar_volume,
-    show_net=show_net,
-    start_date="2017-07-01"
-)
-        except Exception as e:
-            st.warning(f"Backtest failed: {e}")
+# AFTER — lock to ISA Dynamic backtest (hybrid rules), 2017-07-01
+try:
+    strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
+        roundtrip_bps=roundtrip_bps,
+        min_dollar_volume=min_dollar_volume,
+        show_net=show_net,
+        start_date="2017-07-01"
+    )
+except Exception as e:
+    st.warning(f"Backtest failed: {e}")
 
-        # save to session for save/diff buttons
-        if live_raw is not None and not live_raw.empty:
-            st.session_state.latest_portfolio = live_raw.copy()
-
+# save to session for save/diff buttons
+if live_raw is not None and not live_raw.empty:
+    st.session_state.latest_portfolio = live_raw.copy()
 # ===========================
 # Tab 1 — Rebalancing Plan
 # ===========================
