@@ -51,13 +51,17 @@ sector_cap = st.sidebar.slider(
     0.05, 
     format="%.2f"   # Show raw decimal, no rounding to 0%/100%
 )
-# NEW — single-name cap (fraction, e.g., 0.25 = 25%)
+# Single-name cap (max % per stock)
 name_cap = st.sidebar.slider(
     "Single-name cap (max % per stock)",
-    0.15, 0.35,
-    preset.get("mom_cap", 0.25),
-    0.01
+    0.10, 0.50,     # <— was 0.35; raise to 0.50
+    0.35,           # default
+    0.05,
+    format="%.0f%%"
 )
+
+# make available to backend
+st.session_state["name_cap"] = float(name_cap)
 st.caption(f"Single-name cap: {name_cap:.0%}")
 
 # store for other parts of the app if needed
