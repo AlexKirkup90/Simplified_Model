@@ -114,14 +114,13 @@ if go:
             st.error(f"Portfolio generation failed: {e}")
             st.code(traceback.format_exc())
 
-        # ---- Backtest (classic 90/10) with costs/liquidity (until ISA-dynamic BT is promoted)
-        try:
-            strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_for_app(
-                momentum_window=6, top_n=15, cap=0.25,
-                roundtrip_bps=roundtrip_bps,
-                min_dollar_volume=min_dollar_volume,
-                show_net=show_net
-            )
+     # AFTER — lock to ISA Dynamic backtest (hybrid rules), 2017-07-01
+strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
+    roundtrip_bps=roundtrip_bps,
+    min_dollar_volume=min_dollar_volume,
+    show_net=show_net,
+    start_date="2017-07-01"
+)
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
 
