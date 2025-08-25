@@ -68,7 +68,80 @@ def validate_market_data(prices_df: pd.DataFrame) -> List[str]:
         alerts.append(f"Warning: {missing_pct:.1f}% missing data points")
     
     return alerts
+    
+def clean_price_data(
+    prices_df: pd.DataFrame,
+    hard_cap_abs_ret: float = 0.60,    # only “repair” >60% daily jumps
+    use_robust_filter: bool = True,    # optional robust MAD filter
+    max_flagged_pct: float = 2.0       # drop ticker if >2% days flagged
+) -> pd.DataFrame:
+    """
+    Repair obvious data glitches while preserving legit large moves.
+    Strategy-safe: caps/repairs only extreme daily returns.
+    """
+    if prices_df.empty or prices_df.shape[0] < 30:
+        return prices_df
 
+    px = prices_df.sort_index().copy()
+    r  = px.pct_change()
+
+    # 1) Hard cap flag: absurd jumps likely from bad adjustments
+    hard_flag = r.abs() > hard_cap_abs_ret
+
+    # 2) Optional robust outlier flag using rolling median/MAD
+    if use_robust_filter:
+        med = r.rolling(21, min_periods=10).median()
+        mad = (r.sub(med)).abs().rolling(21, min_periods=10).median() + 1e-12
+        robust_z = (r.sub(med)).abs() / (1.4826 * mad)  # ~z-score from MAD
+        robust_flag = robust_z > 8.0                     # very conservative
+        flag = hard_flag | robust_flag
+    else:
+        flag = hard_flag
+
+    # Drop tickers that are “beyond repair”
+    bad_cols = []
+    for c in r.columns:
+        valid_days = r[c].notna().sum()
+        if valid_days == 0:
+            continue
+        pct_flagged = 100.0 * flag[c].sum() / valid_days
+        if pct_flagged > max_flagged_pct:
+            bad_cols.append(c)
+
+    if bad_cols:
+        px = px.drop(columns=bad_cols, errors="ignore")
+        r  = r.drop(columns=bad_cols, errors="ignore")
+        flag = flag.drop(columns=bad_cols, errors="ignore")
+        st.info(f"Data cleaner: dropped {len(bad_cols)} tickers with excessive glitches: {', '.join(bad_cols[:10])}{'…' if len(bad_cols)>10 else ''}")
+
+    # Repair flagged returns
+    if flag.any().any():
+        r_repaired = r.copy()
+
+        # Option A (simple): cap extreme returns to ±hard_cap_abs_ret
+        capped = r.clip(lower=-hard_cap_abs_ret, upper=hard_cap_abs_ret)
+
+        # Option B (robust): where robust flag, use rolling median instead of cap
+        if use_robust_filter:
+            med = r.rolling(21, min_periods=10).median()
+            r_repaired[flag] = med[flag].fillna(capped[flag])
+        else:
+            r_repaired[flag] = capped[flag]
+
+        # Rebuild price path from repaired returns (per column, preserving first valid price)
+        px_clean = px.copy()
+        for c in px_clean.columns:
+            s = px_clean[c].dropna()
+            if s.empty:
+                continue
+            r_c = r_repaired[c].reindex(s.index)
+            # Make a new series that composes from the first price
+            cum = (1.0 + r_c.fillna(0.0)).cumprod()
+            px_clean.loc[s.index, c] = float(s.iloc[0]) * cum
+
+        return px_clean
+    else:
+        return px
 # =========================
 # NEW: Volatility-Adjusted Position Sizing
 # =========================
@@ -365,14 +438,16 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         data = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)["Close"]
         if isinstance(data, pd.Series):
             data = data.to_frame()
-        
         result = data.dropna(axis=1, how="all")
-        
+
+        # ✅ Clean obvious glitches before validation
+        result = clean_price_data(result)
+
         # Validate the fetched data
         alerts = validate_market_data(result)
         if alerts:
-            st.info(f"Data quality check: {alerts[0]}")  # Show first alert only
-        
+            st.info(f"Data quality check: {alerts[0]}")
+
         return result
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
@@ -397,14 +472,18 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     vol.columns   = [tickers[0]]
             else:
                 return pd.DataFrame(), pd.DataFrame()
+
         close = close.dropna(axis=1, how="all")
         vol   = vol.reindex_like(close).fillna(0)
-        
+
+        # ✅ Clean prices before anything else
+        close = clean_price_data(close)
+
         # Validate data
         alerts = validate_market_data(close)
         if alerts and len(alerts) > 0:
             st.info(f"Price data validation: {alerts[0]}")
-        
+
         return close, vol
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
