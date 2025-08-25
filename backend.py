@@ -931,12 +931,13 @@ def generate_live_portfolio_isa_monthly(
             disp, raw = _format_display(prev_portfolio["Weight"].astype(float))
             return disp, raw, decision
         else:
+            # No saved portfolio yet — build one now but note the lock
             decision = "No saved portfolio; proposing initial allocation (monthly lock applies from next month)."
 
     # Build candidate weights (use params with overrides!)
     new_w = _build_isa_weights(close, params, sectors_map)
 
-        # Trigger vs previous portfolio
+    # Trigger vs previous portfolio (health check)
     if prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("ME").last()
         mom_scores = blended_momentum_z(monthly)
@@ -956,10 +957,6 @@ def generate_live_portfolio_isa_monthly(
 
     disp, raw = _format_display(new_w)
     return disp, raw, decision
-else:
-    decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
-
-    return *_format_display(new_w), decision
 
 def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
                                    max_dd_threshold: float = 0.15) -> pd.Series:
@@ -1032,14 +1029,14 @@ def run_backtest_isa_dynamic(
     )
     mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200)
 
-    # Combine + costs
+        # Combine + costs
     hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight)
     
     # Apply drawdown-based exposure adjustment
-if use_enhanced_features:
-    hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
+    if use_enhanced_features:
+        hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
 
-hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
+    hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     # Cum curves
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
