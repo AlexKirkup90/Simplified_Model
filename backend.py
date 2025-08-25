@@ -68,80 +68,7 @@ def validate_market_data(prices_df: pd.DataFrame) -> List[str]:
         alerts.append(f"Warning: {missing_pct:.1f}% missing data points")
     
     return alerts
-    
-def clean_price_data(
-    prices_df: pd.DataFrame,
-    hard_cap_abs_ret: float = 0.60,    # only “repair” >60% daily jumps
-    use_robust_filter: bool = True,    # optional robust MAD filter
-    max_flagged_pct: float = 2.0       # drop ticker if >2% days flagged
-) -> pd.DataFrame:
-    """
-    Repair obvious data glitches while preserving legit large moves.
-    Strategy-safe: caps/repairs only extreme daily returns.
-    """
-    if prices_df.empty or prices_df.shape[0] < 30:
-        return prices_df
 
-    px = prices_df.sort_index().copy()
-    r  = px.pct_change()
-
-    # 1) Hard cap flag: absurd jumps likely from bad adjustments
-    hard_flag = r.abs() > hard_cap_abs_ret
-
-    # 2) Optional robust outlier flag using rolling median/MAD
-    if use_robust_filter:
-        med = r.rolling(21, min_periods=10).median()
-        mad = (r.sub(med)).abs().rolling(21, min_periods=10).median() + 1e-12
-        robust_z = (r.sub(med)).abs() / (1.4826 * mad)  # ~z-score from MAD
-        robust_flag = robust_z > 8.0                     # very conservative
-        flag = hard_flag | robust_flag
-    else:
-        flag = hard_flag
-
-    # Drop tickers that are “beyond repair”
-    bad_cols = []
-    for c in r.columns:
-        valid_days = r[c].notna().sum()
-        if valid_days == 0:
-            continue
-        pct_flagged = 100.0 * flag[c].sum() / valid_days
-        if pct_flagged > max_flagged_pct:
-            bad_cols.append(c)
-
-    if bad_cols:
-        px = px.drop(columns=bad_cols, errors="ignore")
-        r  = r.drop(columns=bad_cols, errors="ignore")
-        flag = flag.drop(columns=bad_cols, errors="ignore")
-        st.info(f"Data cleaner: dropped {len(bad_cols)} tickers with excessive glitches: {', '.join(bad_cols[:10])}{'…' if len(bad_cols)>10 else ''}")
-
-    # Repair flagged returns
-    if flag.any().any():
-        r_repaired = r.copy()
-
-        # Option A (simple): cap extreme returns to ±hard_cap_abs_ret
-        capped = r.clip(lower=-hard_cap_abs_ret, upper=hard_cap_abs_ret)
-
-        # Option B (robust): where robust flag, use rolling median instead of cap
-        if use_robust_filter:
-            med = r.rolling(21, min_periods=10).median()
-            r_repaired[flag] = med[flag].fillna(capped[flag])
-        else:
-            r_repaired[flag] = capped[flag]
-
-        # Rebuild price path from repaired returns (per column, preserving first valid price)
-        px_clean = px.copy()
-        for c in px_clean.columns:
-            s = px_clean[c].dropna()
-            if s.empty:
-                continue
-            r_c = r_repaired[c].reindex(s.index)
-            # Make a new series that composes from the first price
-            cum = (1.0 + r_c.fillna(0.0)).cumprod()
-            px_clean.loc[s.index, c] = float(s.iloc[0]) * cum
-
-        return px_clean
-    else:
-        return px
 # =========================
 # NEW: Volatility-Adjusted Position Sizing
 # =========================
@@ -438,16 +365,14 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         data = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)["Close"]
         if isinstance(data, pd.Series):
             data = data.to_frame()
+        
         result = data.dropna(axis=1, how="all")
-
-        # ✅ Clean obvious glitches before validation
-        result = clean_price_data(result)
-
+        
         # Validate the fetched data
         alerts = validate_market_data(result)
         if alerts:
-            st.info(f"Data quality check: {alerts[0]}")
-
+            st.info(f"Data quality check: {alerts[0]}")  # Show first alert only
+        
         return result
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
@@ -472,18 +397,14 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     vol.columns   = [tickers[0]]
             else:
                 return pd.DataFrame(), pd.DataFrame()
-
         close = close.dropna(axis=1, how="all")
         vol   = vol.reindex_like(close).fillna(0)
-
-        # ✅ Clean prices before anything else
-        close = clean_price_data(close)
-
+        
         # Validate data
         alerts = validate_market_data(close)
         if alerts and len(alerts) > 0:
             st.info(f"Price data validation: {alerts[0]}")
-
+        
         return close, vol
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
@@ -964,27 +885,26 @@ def generate_live_portfolio_isa_monthly(
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
     sector_cap      = st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
-    name_cap_ui     = st.session_state.get("name_cap", preset.get("mom_cap", 0.25))
 
-    # Build params ONCE, keep UI overrides
+    # build params from preset, then override with UI/session values
     params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
     params["stability_days"] = int(stickiness_days)
     params["sector_cap"]     = float(sector_cap)
-    params["mom_cap"]        = float(name_cap_ui)
-
+    params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
+    
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
     if not base_tickers:
         return None, None, "No universe available."
 
     # Fetch prices
-    start = (datetime.today() - relativedelta(months=max(params["mom_lb"], 12) + 8)).strftime("%Y-%m-%d")
+    start = (datetime.today() - relativedelta(months=max(preset["mom_lb"], 12) + 8)).strftime("%Y-%m-%d")
     end   = datetime.today().strftime("%Y-%m-%d")
     close, vol = fetch_price_volume(base_tickers, start, end)
     if close.empty:
         return None, None, "No price data."
 
-    # Hybrid Top150 reduction
+    # Special: Hybrid Top150 → reduce by 60d median dollar volume
     sectors_map = base_sectors.copy()
     if label == "Hybrid Top150":
         med = median_dollar_volume(close, vol, window=60).sort_values(ascending=False)
@@ -1001,7 +921,7 @@ def generate_live_portfolio_isa_monthly(
         close = close[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
-    # Monthly lock
+    # Monthly lock check — hold previous if not first trading day
     today = datetime.today().date()
     is_monthly = is_rebalance_today(today, close.index)
     decision = "Not the monthly rebalance day — holding previous portfolio."
@@ -1010,13 +930,16 @@ def generate_live_portfolio_isa_monthly(
             disp, raw = _format_display(prev_portfolio["Weight"].astype(float))
             return disp, raw, decision
         else:
-            # No saved portfolio yet — build one now but note the lock
             decision = "No saved portfolio; proposing initial allocation (monthly lock applies from next month)."
 
-    # Build candidate weights (use params with overrides!)
+    # Build candidate weights (enhanced)
+    params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
+    params["stability_days"] = stickiness_days
+    params["sector_cap"]     = sector_cap
+
     new_w = _build_isa_weights(close, params, sectors_map)
 
-    # Trigger vs previous portfolio (health check)
+    # Trigger vs previous portfolio (health of current)
     if prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("ME").last()
         mom_scores = blended_momentum_z(monthly)
@@ -1026,7 +949,6 @@ def generate_live_portfolio_isa_monthly(
             prev_w = prev_portfolio["Weight"].astype(float)
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
-
             if health >= params["trigger"]:
                 decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
                 disp, raw = _format_display(prev_w)
@@ -1037,21 +959,6 @@ def generate_live_portfolio_isa_monthly(
     disp, raw = _format_display(new_w)
     return disp, raw, decision
 
-def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
-                                   max_dd_threshold: float = 0.15) -> pd.Series:
-    """
-    Walk forward: at each month, compute drawdown of returns so far,
-    get an exposure from get_drawdown_adjusted_exposure(), and scale that month's return.
-    """
-    r = pd.Series(monthly_returns).copy().fillna(0.0)
-    out = []
-    hist = pd.Series(dtype=float)
-    for dt, val in r.items():
-        # exposure based on history up to previous month
-        exp = get_drawdown_adjusted_exposure(hist, max_dd_threshold=max_dd_threshold) if len(hist) else 1.0
-        out.append((dt, val * exp))
-        hist = pd.concat([hist, pd.Series([val], index=[dt])])
-    return pd.Series(dict(out)).reindex(r.index)
 
 def run_backtest_isa_dynamic(
     roundtrip_bps: float = 0.0,
@@ -1108,13 +1015,14 @@ def run_backtest_isa_dynamic(
     )
     mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200)
 
-        # Combine + costs
+    # Combine + costs
     hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight)
     
     # Apply drawdown-based exposure adjustment
     if use_enhanced_features:
-        hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
-
+        dd_exposure = get_drawdown_adjusted_exposure(hybrid_gross)
+        hybrid_gross = hybrid_gross * dd_exposure
+    
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     # Cum curves
@@ -1205,7 +1113,7 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
             "Mom Rank","Mom Score",f"ST Return ({params['mr_lb']}d)",f"Above {params['mr_ma']}DMA"
         ])
 
-    prices = daily_prices.reindex(columns=all_tickers).dropna(axis=1, how="all")
+    prices = daily_prices[all_tickers].dropna(axis=1, how="all")
     if prices.empty:
         return pd.DataFrame()
 
