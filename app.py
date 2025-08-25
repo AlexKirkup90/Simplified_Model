@@ -237,19 +237,18 @@ with tab2:
             pass
 
         # Enhanced save with snapshot recording
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("💾 Save this portfolio for next month"):
-        backend.save_portfolio_to_gist(live_raw)
-        st.success("Saved to Gist.")
-        
-with col2:
-    if st.button("📸 Record live snapshot"):
-        result = backend.record_live_snapshot(live_raw, note="Manual snapshot")
-        if result.get("ok"):
-            st.success(f"✅ Snapshot recorded! Strategy: {result['strat_ret']:.2%}, QQQ: {result['qqq_ret']:.2%}")
-        else:
-            st.error(f"❌ Snapshot failed: {result.get('msg', 'Unknown error')}")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save this portfolio for next month"):
+                backend.save_portfolio_to_gist(live_raw)
+                st.success("Saved to Gist.")
+        with col2:
+            if st.button("📸 Record live snapshot"):
+                result = backend.record_live_snapshot(live_raw, note="Manual snapshot")
+                if result.get("ok"):
+                    st.success(f"✅ Snapshot recorded! Strategy: {result['strat_ret']:.2%}, QQQ: {result['qqq_ret']:.2%}")
+                else:
+                    st.error(f"❌ Snapshot failed: {result.get('msg', 'Unknown error')}")
 
 # ---------------------------
 # Tab 3: Enhanced Performance
@@ -443,26 +442,27 @@ with tab3:
                 ax2.grid(True, ls="--", alpha=0.5)
                 st.pyplot(fig2)
 
-       # === Enhanced TL;DR summary ===
-st.markdown("##### TL;DR for the next 12 months")
+                      # === Enhanced TL;DR summary ===
+                st.markdown("##### TL;DR for the next 12 months")
 
-start_amount = st.number_input(
-    "Show results for a starting amount (£)",
-    min_value=100, max_value=1_000_000, step=100, value=1000
-)
+                start_amount = st.number_input(
+                    "Show results for a starting amount (£)",
+                    min_value=100, max_value=1_000_000, step=100, value=1000
+                )
 
-def money(x: float) -> str:
-    return f"£{x:,.0f}"
+                def money(x: float) -> str:
+                    return f"£{x:,.0f}"
 
-# Safe pulls with sensible fallbacks
-median_ret = float(percentiles.get('p50', mc_results.get('mean_return', 0.0)))
-p10_ret    = float(percentiles.get('p10', np.percentile(mc_results['scenarios'], 10)))
-p90_ret    = float(percentiles.get('p90', np.percentile(mc_results['scenarios'], 90)))
-p05_ret    = float(percentiles.get('p5',  np.percentile(mc_results['scenarios'], 5)))
-downside   = float(mc_results.get('downside_risk', 0.0))
-prob_pos   = float(mc_results.get('prob_positive', 0.0))
+                # Safe pulls with sensible fallbacks
+                scenarios = mc_results.get('scenarios', np.array([]))
+                median_ret = float(percentiles.get('p50', mc_results.get('mean_return', 0.0)))
+                p10_ret    = float(percentiles.get('p10', np.percentile(scenarios, 10))) if scenarios.size else 0.0
+                p90_ret    = float(percentiles.get('p90', np.percentile(scenarios, 90))) if scenarios.size else 0.0
+                p05_ret    = float(percentiles.get('p5',  np.percentile(scenarios, 5)))  if scenarios.size else 0.0
+                downside   = float(mc_results.get('downside_risk', 0.0))
+                prob_pos   = float(mc_results.get('prob_positive', 0.0))
 
-st.markdown(f"""
+                st.markdown(f"""
 **Expected Outcomes for £{start_amount:,}:**
 - **Median outcome:** **{median_ret*100:.1f}%** → **{money(start_amount*(1+median_ret))}**  
 - **Typical range (10th–90th pct):** **{p10_ret*100:.1f}%** to **{p90_ret*100:.1f}%**  
@@ -472,13 +472,12 @@ st.markdown(f"""
 - **Average loss in bad scenarios:** **{downside*100:.1f}%**  
 """)
 
-# One-liner interpretation
-st.info(
-    f"In plain English: the distribution is skewed positive. "
-    f"Most paths are up (median ≈ {median_ret*100:.1f}%), "
-    f"but there’s still real downside risk (~{prob_pos*100:.1f}% chance of a positive year). "
-    f"Size positions accordingly."
-)
+                st.info(
+                    f"In plain English: the distribution is skewed positive. "
+                    f"Most paths are up (median ≈ {median_ret*100:.1f}%), "
+                    f"but there’s still real downside risk (~{prob_pos*100:.1f}% chance of a positive year). "
+                    f"Size positions accordingly."
+                )
 
 # ---------------------------
 # Tab 4: Enhanced Regime
