@@ -237,20 +237,19 @@ with tab2:
             pass
 
         # Enhanced save with snapshot recording
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Save this portfolio for next month"):
-    backend.save_portfolio_to_gist(live_raw)
-    backend.save_current_portfolio(live_raw)
-    st.success("Saved (Gist + local).")
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("💾 Save this portfolio for next month"):
+        backend.save_portfolio_to_gist(live_raw)
+        st.success("Saved to Gist.")
         
-        with col2:
-            if st.button("📸 Record live snapshot"):
-                result = backend.record_live_snapshot(live_raw, note="Manual snapshot")
-                if result.get("ok"):
-                    st.success(f"✅ Snapshot recorded! Strategy: {result['strat_ret']:.2%}, QQQ: {result['qqq_ret']:.2%}")
-                else:
-                    st.error(f"❌ Snapshot failed: {result.get('msg', 'Unknown error')}")
+with col2:
+    if st.button("📸 Record live snapshot"):
+        result = backend.record_live_snapshot(live_raw, note="Manual snapshot")
+        if result.get("ok"):
+            st.success(f"✅ Snapshot recorded! Strategy: {result['strat_ret']:.2%}, QQQ: {result['qqq_ret']:.2%}")
+        else:
+            st.error(f"❌ Snapshot failed: {result.get('msg', 'Unknown error')}")
 
 # ---------------------------
 # Tab 3: Enhanced Performance
