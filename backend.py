@@ -885,26 +885,27 @@ def generate_live_portfolio_isa_monthly(
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
     sector_cap      = st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
+    name_cap_ui     = st.session_state.get("name_cap", preset.get("mom_cap", 0.25))
 
-    # build params from preset, then override with UI/session values
+    # Build params ONCE, keep UI overrides
     params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
     params["stability_days"] = int(stickiness_days)
     params["sector_cap"]     = float(sector_cap)
-    params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
-    
+    params["mom_cap"]        = float(name_cap_ui)
+
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
     if not base_tickers:
         return None, None, "No universe available."
 
     # Fetch prices
-    start = (datetime.today() - relativedelta(months=max(preset["mom_lb"], 12) + 8)).strftime("%Y-%m-%d")
+    start = (datetime.today() - relativedelta(months=max(params["mom_lb"], 12) + 8)).strftime("%Y-%m-%d")
     end   = datetime.today().strftime("%Y-%m-%d")
     close, vol = fetch_price_volume(base_tickers, start, end)
     if close.empty:
         return None, None, "No price data."
 
-    # Special: Hybrid Top150 → reduce by 60d median dollar volume
+    # Hybrid Top150 reduction
     sectors_map = base_sectors.copy()
     if label == "Hybrid Top150":
         med = median_dollar_volume(close, vol, window=60).sort_values(ascending=False)
@@ -921,7 +922,7 @@ def generate_live_portfolio_isa_monthly(
         close = close[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
-    # Monthly lock check — hold previous if not first trading day
+    # Monthly lock
     today = datetime.today().date()
     is_monthly = is_rebalance_today(today, close.index)
     decision = "Not the monthly rebalance day — holding previous portfolio."
@@ -932,14 +933,10 @@ def generate_live_portfolio_isa_monthly(
         else:
             decision = "No saved portfolio; proposing initial allocation (monthly lock applies from next month)."
 
-    # Build candidate weights (enhanced)
-    params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
-    params["stability_days"] = stickiness_days
-    params["sector_cap"]     = sector_cap
-
+    # Build candidate weights (use params with overrides!)
     new_w = _build_isa_weights(close, params, sectors_map)
 
-    # Trigger vs previous portfolio (health of current)
+    # Trigger vs previous portfolio
     if prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("ME").last()
         mom_scores = blended_momentum_z(monthly)
@@ -951,14 +948,27 @@ def generate_live_portfolio_isa_monthly(
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
                 decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
-                disp, raw = _format_display(prev_w)
-                return disp, raw, decision
+                return _format_display(prev_w)
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
-    disp, raw = _format_display(new_w)
-    return disp, raw, decision
+    return *_format_display(new_w), decision
 
+def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
+                                   max_dd_threshold: float = 0.15) -> pd.Series:
+    """
+    Walk forward: at each month, compute drawdown of returns so far,
+    get an exposure from get_drawdown_adjusted_exposure(), and scale that month's return.
+    """
+    r = pd.Series(monthly_returns).copy().fillna(0.0)
+    out = []
+    hist = pd.Series(dtype=float)
+    for dt, val in r.items():
+        # exposure based on history up to previous month
+        exp = get_drawdown_adjusted_exposure(hist, max_dd_threshold=max_dd_threshold) if len(hist) else 1.0
+        out.append((dt, val * exp))
+        hist = pd.concat([hist, pd.Series([val], index=[dt])])
+    return pd.Series(dict(out)).reindex(r.index)
 
 def run_backtest_isa_dynamic(
     roundtrip_bps: float = 0.0,
@@ -1020,9 +1030,7 @@ def run_backtest_isa_dynamic(
     
     # Apply drawdown-based exposure adjustment
     if use_enhanced_features:
-        dd_exposure = get_drawdown_adjusted_exposure(hybrid_gross)
-        hybrid_gross = hybrid_gross * dd_exposure
-    
+    hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     # Cum curves
@@ -1113,7 +1121,7 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
             "Mom Rank","Mom Score",f"ST Return ({params['mr_lb']}d)",f"Above {params['mr_ma']}DMA"
         ])
 
-    prices = daily_prices[all_tickers].dropna(axis=1, how="all")
+    prices = daily_prices.reindex(columns=all_tickers).dropna(axis=1, how="all")
     if prices.empty:
         return pd.DataFrame()
 
