@@ -936,7 +936,7 @@ def generate_live_portfolio_isa_monthly(
     # Build candidate weights (use params with overrides!)
     new_w = _build_isa_weights(close, params, sectors_map)
 
-    # Trigger vs previous portfolio
+        # Trigger vs previous portfolio
     if prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("ME").last()
         mom_scores = blended_momentum_z(monthly)
@@ -946,10 +946,16 @@ def generate_live_portfolio_isa_monthly(
             prev_w = prev_portfolio["Weight"].astype(float)
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
+
             if health >= params["trigger"]:
-    decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
+                decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
+                disp, raw = _format_display(prev_w)
+                return disp, raw, decision
+            else:
+                decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
+
     disp, raw = _format_display(new_w)
-return disp, raw, decision
+    return disp, raw, decision
 else:
     decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
