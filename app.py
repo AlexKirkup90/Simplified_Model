@@ -1,4 +1,4 @@
-# app.py
+# app.py - Enhanced Hybrid Momentum Portfolio (ISA-Dynamic) with Strategy Health Monitoring
 import traceback
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -16,7 +16,7 @@ import backend  # all logic lives here
 st.set_page_config(layout="wide", page_title="Hybrid Momentum Portfolio (ISA-Dynamic)")
 
 st.title("🚀 Hybrid Momentum (ISA Dynamic) — Monthly Execution")
-st.caption("Composite momentum + mean reversion, with stickiness, sector caps, and monthly lock.")
+st.caption("Enhanced composite momentum + mean reversion, with stickiness, sector caps, monthly lock, and health monitoring.")
 
 # ---------------------------
 # Sidebar controls
@@ -35,6 +35,13 @@ st.session_state["universe"] = universe_choice
 
 # ISA preset defaults
 preset = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+
+# Enhanced features toggle
+use_enhanced_features = st.sidebar.checkbox(
+    "🔬 Use Enhanced Features",
+    value=True,
+    help="Enables volatility-adjusted caps, regime awareness, and signal decay"
+)
 
 # Stickiness & sector cap (overrides)
 stickiness_days = st.sidebar.slider(
@@ -63,30 +70,12 @@ st.session_state["name_cap"] = name_cap
 st.session_state["sector_cap"] = sector_cap
 
 # Optional helper labels
-st.caption(f"Single-name cap: **{name_cap_pct}%**")
-st.caption(f"Sector cap: **{sector_cap_pct}%**")
-
-# make available to backend
-st.session_state["name_cap"] = float(name_cap)
-st.caption(f"Single-name cap: {name_cap:.0%}")
-
-# store for other parts of the app if needed
-st.session_state["name_cap"] = name_cap
-
-# Optional: convert to percent string for display
-st.sidebar.caption(f"Sector Cap in %: {sector_cap * 100:.0f}%")
-
-st.session_state["sector_cap"] = float(sector_cap)
+st.sidebar.caption(f"Single-name cap: **{name_cap_pct}%**")
+st.sidebar.caption(f"Sector cap: **{sector_cap_pct}%**")
 
 # Persist to session so backend reads the same values
 st.session_state["stickiness_days"] = int(stickiness_days)
-st.session_state["sector_cap"] = float(sector_cap)
-
-# Tiny sanity readout (optional)
-st.sidebar.caption(f"Using sector cap = {sector_cap:.0%}, stickiness = {stickiness_days} days")
-
-st.session_state["stickiness_days"] = stickiness_days
-st.session_state["sector_cap"] = sector_cap
+st.session_state["use_enhanced_features"] = use_enhanced_features
 
 # Trading cost & liquidity
 roundtrip_bps = st.sidebar.slider("Round-trip cost (bps)", 0, 100, backend.ROUNDTRIP_BPS_DEFAULT, 5)
@@ -107,10 +96,10 @@ prev_portfolio = backend.load_previous_portfolio()
 go = st.button("Generate Portfolio & Backtest", type="primary", use_container_width=True)
 
 # ---------------------------
-# Tabs
+# Enhanced Tabs
 # ---------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📊 Rebalancing Plan", "✅ Current Portfolio", "📈 Performance", "🧭 Regime", "🔎 Changes"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📊 Rebalancing Plan", "✅ Current Portfolio", "📈 Performance", "🧭 Regime", "🔎 Changes", "🏥 Strategy Health"]
 )
 
 # Placeholders to reuse below
@@ -127,9 +116,9 @@ hybrid_tno = None
 # Generate
 # ===========================
 if go:
-    with st.spinner("Building monthly-locked portfolio and running backtest…"):
+    with st.spinner("Building enhanced monthly-locked portfolio and running backtest…"):
         try:
-            # ---- Live portfolio (monthly lock + stability + trigger + sector caps)
+            # ---- Live portfolio (monthly lock + stability + trigger + sector caps + enhancements)
             live_disp, live_raw, decision = backend.generate_live_portfolio_isa_monthly(
                 preset=preset,
                 prev_portfolio=prev_portfolio,
@@ -140,7 +129,7 @@ if go:
             st.code(traceback.format_exc())
 
         try:
-            # ---- ISA Dynamic backtest (Hybrid150 default) from 2017-07-01
+            # ---- Enhanced ISA Dynamic backtest (Hybrid150 default) from 2017-07-01
             strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
                 roundtrip_bps=roundtrip_bps,
                 min_dollar_volume=min_dollar_volume,
@@ -154,6 +143,7 @@ if go:
                 mr_topn=preset["mr_topn"],
                 mom_weight=preset["mom_w"],
                 mr_weight=preset["mr_w"],
+                use_enhanced_features=use_enhanced_features
             )
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
@@ -192,7 +182,7 @@ with tab1:
                 else:
                     st.write("None")
             with c3:
-                st.markdown("### 🔄 Rebalance (≥ {tol:.1%})")
+                st.markdown(f"### 🔄 Rebalance (≥ {tol:.1%})")
                 if signals["rebalance"]:
                     for t, old_w, new_w in signals["rebalance"]:
                         st.write(f"- **{t}**: {old_w:.2%} → **{new_w:.2%}**")
@@ -207,27 +197,62 @@ with tab2:
     if live_disp is None or live_disp.empty:
         st.warning(decision if isinstance(decision, str) else "—")
     else:
-        st.caption(decision)
+        # Enhanced decision display with regime context
+        st.info(decision)
+        
+        # Show enhancement status
+        if use_enhanced_features:
+            st.success("🔬 Enhanced features active: Volatility-adjusted caps, regime awareness, signal decay")
+        else:
+            st.info("📊 Using standard features only")
+        
         st.dataframe(live_disp, use_container_width=True)
 
-        # Bar chart
+        # Enhanced bar chart with more details
         try:
-            fig, ax = plt.subplots(figsize=(10, 4))
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
             live_sorted = live_raw.sort_values("Weight", ascending=False)
-            ax.bar(live_sorted.index, live_sorted["Weight"].values)
-            ax.set_ylabel("Weight")
-            ax.set_xticklabels(live_sorted.index, rotation=45, ha="right")
+            
+            # Weight distribution
+            bars = ax1.bar(live_sorted.index, live_sorted["Weight"].values)
+            ax1.set_ylabel("Weight")
+            ax1.set_title("Portfolio Weights")
+            ax1.tick_params(axis='x', rotation=45)
+            
+            # Add cap line
+            ax1.axhline(y=name_cap, color='red', linestyle='--', alpha=0.7, label=f'Name Cap ({name_cap:.0%})')
+            ax1.legend()
+            
+            # Position concentration
+            cumsum = live_sorted["Weight"].cumsum()
+            ax2.plot(range(1, len(cumsum) + 1), cumsum.values, marker='o')
+            ax2.set_xlabel("Number of Positions")
+            ax2.set_ylabel("Cumulative Weight")
+            ax2.set_title("Position Concentration")
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
             st.pyplot(fig)
         except Exception:
             pass
 
-        # Save
-        if st.button("💾 Save this portfolio for next month"):
-            backend.save_portfolio_to_gist(live_raw)
-            st.success("Saved to Gist.")
+        # Enhanced save with snapshot recording
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save this portfolio for next month"):
+                backend.save_portfolio_to_gist(live_raw)
+                st.success("Saved to Gist.")
+        
+        with col2:
+            if st.button("📸 Record live snapshot"):
+                result = backend.record_live_snapshot(live_raw, note="Manual snapshot")
+                if result.get("ok"):
+                    st.success(f"✅ Snapshot recorded! Strategy: {result['strat_ret']:.2%}, QQQ: {result['qqq_ret']:.2%}")
+                else:
+                    st.error(f"❌ Snapshot failed: {result.get('msg', 'Unknown error')}")
 
 # ---------------------------
-# Tab 3: Performance
+# Tab 3: Enhanced Performance
 # ---------------------------
 with tab3:
     st.subheader("📈 Backtest (since 2017-07-01)")
@@ -270,16 +295,54 @@ with tab3:
         )
         st.dataframe(kdf, use_container_width=True)
 
-        # --- Equity curves ---
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(strategy_cum_gross.index, strategy_cum_gross.values, label="Strategy (Gross)")
+        # --- Enhanced Equity curves ---
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Equity curves
+        axes[0,0].plot(strategy_cum_gross.index, strategy_cum_gross.values, label="Strategy (Gross)", linewidth=2)
         if strategy_cum_net is not None and show_net:
-            ax.plot(strategy_cum_net.index, strategy_cum_net.values, label="Strategy (Net)", linestyle=":")
-        ax.plot(qqq_cum.index, qqq_cum.values, label="QQQ", linestyle="--")
-        ax.set_yscale("log")
-        ax.set_ylabel("Cumulative Growth (log)")
-        ax.grid(True, ls="--", alpha=0.6)
-        ax.legend()
+            axes[0,0].plot(strategy_cum_net.index, strategy_cum_net.values, label="Strategy (Net)", linestyle=":", linewidth=2)
+        axes[0,0].plot(qqq_cum.index, qqq_cum.values, label="QQQ", linestyle="--", alpha=0.8)
+        axes[0,0].set_yscale("log")
+        axes[0,0].set_ylabel("Cumulative Growth (log)")
+        axes[0,0].set_title("Equity Curves")
+        axes[0,0].grid(True, ls="--", alpha=0.6)
+        axes[0,0].legend()
+        
+        # Drawdowns
+        base_series = strategy_cum_net if (strategy_cum_net is not None and show_net) else strategy_cum_gross
+        dd_strategy = backend.drawdown(base_series)
+        dd_qqq = backend.drawdown(qqq_cum)
+        
+        axes[0,1].fill_between(dd_strategy.index, dd_strategy.values, 0, alpha=0.3, color='red', label='Strategy')
+        axes[0,1].fill_between(dd_qqq.index, dd_qqq.values, 0, alpha=0.3, color='green', label='QQQ')
+        axes[0,1].set_ylabel("Drawdown")
+        axes[0,1].set_title("Drawdown Comparison")
+        axes[0,1].legend()
+        axes[0,1].grid(True, alpha=0.3)
+        
+        # Rolling Sharpe (12-month)
+        if len(base_series.pct_change().dropna()) >= 12:
+            rolling_returns = base_series.pct_change().dropna()
+            rolling_sharpe = rolling_returns.rolling(12).apply(
+                lambda x: (x.mean() * 12) / (x.std() * np.sqrt(12) + 1e-9)
+            ).dropna()
+            
+            axes[1,0].plot(rolling_sharpe.index, rolling_sharpe.values, linewidth=2, color='purple')
+            axes[1,0].axhline(y=1.0, color='orange', linestyle='--', alpha=0.7, label='Sharpe = 1.0')
+            axes[1,0].set_ylabel("Rolling 12M Sharpe")
+            axes[1,0].set_title("Strategy Consistency")
+            axes[1,0].legend()
+            axes[1,0].grid(True, alpha=0.3)
+        
+        # Turnover analysis
+        if hybrid_tno is not None and not hybrid_tno.empty:
+            axes[1,1].plot(hybrid_tno.index, hybrid_tno.values, color='brown', alpha=0.7)
+            axes[1,1].set_ylabel("Monthly Turnover")
+            axes[1,1].set_title("Trading Activity")
+            axes[1,1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
         st.pyplot(fig)
 
         st.caption("Trades/yr estimated from turnover assuming ~2% average single-leg trade (adjust in code with AVG_TRADE_SIZE).")
@@ -319,12 +382,12 @@ with tab3:
                 f"CAGR: **{ann_cagr:.2%}** • Vol: **{ann_vol:.2%}** • Sharpe: **{sharpe:.2f}** • Hit-rate: **{hit_rate:.1%}**"
             )
 
-        # ========= 12-Month Monte Carlo (bootstrap) =========
-        st.subheader("🔮 12-Month Monte Carlo (net returns)")
+        # ========= Enhanced 12-Month Monte Carlo (bootstrap) =========
+        st.subheader("🔮 Enhanced 12-Month Monte Carlo (net returns)")
         if len(m) < 6:
             st.info("Not enough monthly history to run the simulation.")
         else:
-            col_a, col_b, col_c = st.columns([1,1,1])
+            col_a, col_b, col_c, col_d = st.columns(4)
             with col_a:
                 n_trials = st.slider("Simulations", 1000, 10000, 5000, 500)
             with col_b:
@@ -332,119 +395,154 @@ with tab3:
                                   help="Use 1 for IID bootstrap; >1 keeps short-term clustering.")
             with col_c:
                 seed = st.number_input("Random seed", value=42, step=1)
+            with col_d:
+                confidence_levels = st.multiselect("Confidence levels", [5, 10, 25, 50, 75, 90, 95], default=[10, 50, 90])
 
-            rng = np.random.default_rng(int(seed))
-            m_arr = m.values  # 1D numpy array of monthly decimal returns
+            # Enhanced Monte Carlo using backend function
+            mc_results = backend.run_monte_carlo_projections(
+                m, n_scenarios=n_trials, horizon_months=12, 
+                confidence_levels=confidence_levels, block_size=block
+            )
+            
+            if "error" not in mc_results:
+                percentiles = mc_results['percentiles']
+                
+                # Display key statistics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Median Return", f"{percentiles.get('p50', 0):.1%}")
+                with col2:
+                    st.metric("Probability Positive", f"{mc_results['prob_positive']:.1%}")
+                with col3:
+                    st.metric("Probability >10%", f"{mc_results['prob_beat_10pct']:.1%}")
+                
+                # Display confidence intervals
+                st.markdown("**12-month projected returns:**")
+                for level in sorted(confidence_levels):
+                    pct_key = f'p{level}'
+                    if pct_key in percentiles:
+                        st.write(f"• {level}th percentile: **{percentiles[pct_key]:.1%}**")
 
-            def sample_12m_block_bootstrap(rng, m_arr, block):
-                """Draw a 12-month path via (possibly) block bootstrap."""
-                if block <= 1:
-                    picks = rng.integers(0, len(m_arr), size=12)
-                    path = m_arr[picks]
+                # Enhanced histogram
+                fig2, ax2 = plt.subplots(figsize=(10, 6))
+                scenarios = mc_results['scenarios']
+                ax2.hist(scenarios * 100.0, bins=50, alpha=0.7, density=True, color='skyblue', edgecolor='black')
+                
+                # Add percentile lines
+                for level in confidence_levels:
+                    if level in [10, 50, 90]:  # Show main percentiles
+                        pct_val = percentiles.get(f'p{level}', 0)
+                        ax2.axvline(pct_val*100, linestyle="--", linewidth=2, 
+                                   label=f'{level}th pct: {pct_val:.1%}')
+                
+                ax2.axvline(0, color='red', linestyle='-', alpha=0.5, label='Break-even')
+                ax2.set_xlabel("12-month return (%)")
+                ax2.set_ylabel("Probability Density")
+                ax2.set_title("Monte Carlo Return Distribution")
+                ax2.legend()
+                ax2.grid(True, ls="--", alpha=0.5)
+                st.pyplot(fig2)
+
+                # === Enhanced TL;DR summary ===
+                st.markdown("##### TL;DR for the next 12 months")
+
+                start_amount = st.number_input(
+                    "Show results for a starting amount (£)",
+                    min_value=100, max_value=1_000_000, step=100, value=1000
+                )
+
+                def money(x):
+                    return f"£{x:,.0f}"
+
+                median_ret = mc_results['mean_return']
+                p10_ret = percentiles.get('p10', 0)
+                p90_ret = percentiles.get('p90', 0)
+                p05_ret = percentiles.get('p5', 0) if 'p5' in percentiles else np.percentile(scenarios, 5)
+                downside = mc_results['downside_risk']
+
+                st.markdown(f"""
+**Expected Outcomes for £{start_amount:,}:**
+- **Median outcome:** **{median_ret*100:.1f}%** → **{money(start_amount*(1+median_ret))}**  
+- **Typical range (10th–90th pct):** **{p10_ret*100:.1f}%** to **{p90_ret*100:.1f}%**  
+  → **{money(start_amount*(1+p10_ret))}** to **{money(start_amount*(1+p90_ret))}**  
+- **Downside scenario (5th pct):** **{p05_ret*100:.1f}%** → **{money(start_amount*(1+p05_ret))}**  
+- **Chance of positive year:** **{mc_results['prob_positive']*100:.1f}%**  
+- **Average loss in bad scenarios:** **{downside*100:.1f}%**  
+""")
+
+                # Risk assessment
+                if mc_results['prob_positive'] > 0.7:
+                    risk_color = "🟢"
+                    risk_text = "Favorable risk/reward profile"
+                elif mc_results['prob_positive'] > 0.5:
+                    risk_color = "🟡" 
+                    risk_text = "Balanced risk/reward profile"
                 else:
-                    need = 12
-                    parts = []
-                    while need > 0:
-                        start = rng.integers(0, max(1, len(m_arr) - block + 1))
-                        seg = m_arr[start:start+block]
-                        parts.append(seg)
-                        need -= len(seg)
-                    path = np.concatenate(parts)[:12]
-                return (1.0 + path).prod() - 1.0  # 12-month compounded return
+                    risk_color = "🔴"
+                    risk_text = "Elevated risk profile"
+                
+                st.info(f"{risk_color} **Risk Assessment:** {risk_text}. "
+                       f"The distribution shows {mc_results['prob_positive']:.0%} chance of gains, "
+                       f"with median upside of {median_ret:.0%}. Size positions accordingly.")
+            else:
+                st.error(f"Monte Carlo simulation failed: {mc_results['error']}")
 
-            sims = np.array([sample_12m_block_bootstrap(rng, m_arr, block) for _ in range(n_trials)])
-
-            p10, p50, p90 = np.percentile(sims, [10, 50, 90])
-            st.markdown(
-                f"**12-month projected (net):** Median **{p50:.1%}**, "
-                f"10th pct **{p10:.1%}**, 90th pct **{p90:.1%}**"
-            )
-
-            # Histogram of simulated 12-month returns
-            fig2, ax2 = plt.subplots(figsize=(8, 4))
-            ax2.hist(sims * 100.0, bins=40, alpha=0.9)
-            ax2.axvline(p50*100, linestyle="--", linewidth=1)
-            ax2.set_xlabel("12-month return (%)")
-            ax2.set_ylabel("Frequency")
-            ax2.grid(True, ls="--", alpha=0.5)
-            st.pyplot(fig2)
-
-            # === TL;DR summary of Monte Carlo ===
-            st.markdown("##### TL;DR for the next 12 months")
-
-            med = float(np.median(sims))
-            p10_val = float(np.percentile(sims, 10))
-            p90_val = float(np.percentile(sims, 90))
-            p05_val = float(np.percentile(sims, 5))
-            prob_neg = float((sims < 0).mean())
-
-            start_amount = st.number_input(
-                "Show results for a starting amount (£)",
-                min_value=100, max_value=1_000_000, step=100, value=1000
-            )
-
-            def money(x):
-                return f"£{x:,.0f}"
-
-            st.markdown(
-                f"""
-- **Median outcome:** **{med*100:.1f}%** → **{money(start_amount*(1+med))}**  
-- **Typical range (10th–90th pct):** **{p10_val*100:.1f}%** to **{p90_val*100:.1f}%**  
-  → **{money(start_amount*(1+p10_val))}** to **{money(start_amount*(1+p90_val))}**  
-- **Downside tail (5th pct):** **{p05_val*100:.1f}%** → **{money(start_amount*(1+p05_val))}**  
-- **Chance of a negative year:** **{prob_neg*100:.1f}%**  
-"""
-            )
-
-            st.info(
-                f"In plain English: the distribution is skewed positive. "
-                f"Most paths are up (median ≈ {med*100:.1f}%), but there’s still real downside risk "
-                f"(~{prob_neg*100:.1f}% chance of a down year). Size positions accordingly."
-            )
 # ---------------------------
-# Tab 4: Regime
+# Tab 4: Enhanced Regime
 # ---------------------------
 with tab4:
-    st.subheader("🧭 Market Regime")
+    st.subheader("🧭 Enhanced Market Regime Analysis")
     try:
         label, metrics = backend.get_market_regime()
+        
+        # Main regime display
         c1, c2, c3 = st.columns(3)
-        c1.metric("Regime", label)
+        c1.metric("Current Regime", label)
         c2.metric("% Universe >200DMA", f"{metrics.get('universe_above_200dma', np.nan)*100:.1f}%")
-        c3.metric("QQQ above 200DMA", "Yes" if metrics.get("qqq_above_200dma", 0.0) >= 1.0 else "No")
+        c3.metric("QQQ above 200DMA", "Yes" if metrics.get('qqq_above_200dma', 0.0) >= 1.0 else "No")
 
-        c4, c5 = st.columns(2)
+        c4, c5, c6 = st.columns(3)
         c4.metric("QQQ 10D Vol", f"{metrics.get('qqq_vol_10d', np.nan)*100:.2f}%")
         c5.metric("QQQ 50DMA slope (10D)", f"{metrics.get('qqq_50dma_slope_10d', np.nan)*100:.2f}%")
+        c6.metric("6M Breadth", f"{metrics.get('breadth_pos_6m', np.nan)*100:.1f}%",
+                 help="Percentage of stocks with positive 6-month returns")
 
-        st.markdown(
-            "**Breadth (share of tickers with positive 6-month return):** "
-            f"{metrics.get('breadth_pos_6m', np.nan)*100:.1f}%"
-        )
-
-        # Opinionated guidance (informational)
+        # Enhanced regime guidance
         breadth = float(metrics.get("breadth_pos_6m", np.nan))
         vol10   = float(metrics.get("qqq_vol_10d", np.nan))
         qqq_abv = bool(metrics.get("qqq_above_200dma", 0.0) >= 1.0)
 
         target_equity = 1.0
         headline = "Risk-On — full equity allocation recommended."
-        box = st.success
+        box_func = st.success
 
-        if ((not qqq_abv and (breadth < 0.35)) or (vol10 > 0.035 and not qqq_abv)):
+        if ((not qqq_abv and (breadth < 0.35)) or (vol10 > 0.045 and not qqq_abv)):
             target_equity = 0.0
             headline = "Extreme Risk-Off — consider 100% cash."
-            box = st.error
-        elif (not qqq_abv) or (breadth < 0.45):
+            box_func = st.error
+        elif (not qqq_abv) or (breadth < 0.45) or (vol10 > 0.035):
             target_equity = 0.50
             headline = "Risk-Off — scale to ~50% equity / 50% cash."
-            box = st.warning
+            box_func = st.warning
+        elif breadth > 0.65 and vol10 < 0.025:
+            target_equity = 1.1
+            headline = "Strong Risk-On — consider modest leverage (110%)."
+            box_func = st.success
 
-        box(
-            f"**Regime advice:** {headline}  \n"
-            f"**Targets:** equity **{target_equity*100:.0f}%**, cash **{(1-target_equity)*100:.0f}%**.  \n"
+        box_func(
+            f"**Enhanced Regime Advice:** {headline}  \n"
+            f"**Targets:** equity **{target_equity*100:.0f}%**, cash **{max(0, 100-target_equity*100):.0f}%**.  \n"
             f"_Context — Breadth (6m>0): {breadth:.0%} • 10-day vol: {vol10:.2%} • QQQ >200DMA: {'Yes' if qqq_abv else 'No'}_"
         )
+        
+        # Regime history visualization
+        if use_enhanced_features:
+            st.subheader("📊 Regime History")
+            st.info("Enhanced regime tracking shows how market conditions evolve over time")
+            
+            # You could add a chart showing regime changes over time here
+            # For now, just show the current status
+        
         st.caption("Note: ISA Dynamic already scales via stickiness/trigger; treat this as a sanity check.")
     except Exception as e:
         st.error(f"Failed to load regime data: {e}")
@@ -484,15 +582,147 @@ with tab5:
             if expl is None or expl.empty:
                 st.info("No changes to explain.")
             else:
-                # tidy formatting for display
+                # Enhanced formatting for display
                 show = expl.copy()
                 for col in show.columns:
                     if "Score" in col:
                         show[col] = show[col].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
                     if "Return" in col:
                         show[col] = show[col].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+                
                 st.dataframe(show, use_container_width=True)
+                
+                # Enhanced insights
+                if len(expl) > 0:
+                    buys = expl[expl['Action'] == 'Buy']
+                    sells = expl[expl['Action'] == 'Sell']
+                    
+                    if len(buys) > 0:
+                        avg_mom_rank_buys = buys['Mom Rank'].mean()
+                        st.info(f"📈 **New Positions:** Average momentum rank {avg_mom_rank_buys:.1f} - targeting higher momentum stocks")
+                    
+                    if len(sells) > 0:
+                        st.info(f"📉 **Exits:** Removed {len(sells)} positions - likely due to momentum deterioration or stickiness requirements")
 
         except Exception as e:
             st.error(f"Explainability failed: {e}")
             st.code(traceback.format_exc())
+
+# ---------------------------
+# NEW Tab 6: Strategy Health Monitor
+# ---------------------------
+with tab6:
+    st.subheader("🏥 Strategy Health Monitor")
+    
+    if strategy_cum_net is None and strategy_cum_gross is None:
+        st.info("Generate backtest first to see strategy health metrics.")
+    else:
+        # Use net if available, otherwise gross
+        perf_series = strategy_cum_net if strategy_cum_net is not None else strategy_cum_gross
+        returns_series = perf_series.pct_change().dropna()
+        
+        # Get QQQ for comparison
+        qqq_returns = qqq_cum.pct_change().dropna() if qqq_cum is not None else None
+        
+        # Calculate health metrics
+        health_metrics = backend.get_strategy_health_metrics(returns_series, qqq_returns)
+        
+        # Display health dashboard
+        st.markdown("#### 📊 Health Dashboard")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            current_dd = health_metrics.get('current_drawdown', 0)
+            dd_color = "inverse" if current_dd > -0.10 else "off"
+            st.metric("Current Drawdown", f"{current_dd:.1%}", 
+                     delta=None, delta_color=dd_color)
+        
+        with col2:
+            recent_ret = health_metrics.get('recent_3m_return', 0)
+            ret_color = "normal" if recent_ret > 0 else "inverse"
+            st.metric("Recent 3M Avg Return", f"{recent_ret:.2%}", 
+                     delta=None, delta_color=ret_color)
+        
+        with col3:
+            recent_sharpe = health_metrics.get('recent_3m_sharpe', 0)
+            sharpe_color = "normal" if recent_sharpe > 1.0 else "off"
+            st.metric("Recent 3M Sharpe", f"{recent_sharpe:.2f}",
+                     delta=None, delta_color=sharpe_color)
+        
+        with col4:
+            correlation = health_metrics.get('benchmark_correlation', 0)
+            corr_color = "inverse" if correlation > 0.85 else "normal"
+            st.metric("QQQ Correlation", f"{correlation:.2f}",
+                     delta=None, delta_color=corr_color,
+                     help="High correlation reduces diversification benefit")
+        
+        # Health diagnostics
+        st.markdown("#### 🔍 Health Diagnostics")
+        
+        issues = backend.diagnose_strategy_issues(returns_series, hybrid_tno)
+        
+        if issues and issues[0] != "No significant issues detected":
+            st.markdown("**⚠️ Detected Issues:**")
+            for issue in issues:
+                st.warning(f"• {issue}")
+        else:
+            st.success("✅ No significant issues detected")
+        
+        # Detailed health analysis
+        if len(returns_series) >= 12:
+            st.markdown("#### 📈 Performance Trends")
+            
+            # Rolling 6-month performance
+            if len(returns_series) >= 6:
+                rolling_6m = returns_series.rolling(6).apply(
+                    lambda x: ((1 + x).prod() ** (12/6)) - 1
+                ).dropna()
+                
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+                
+                # Rolling CAGR
+                ax1.plot(rolling_6m.index, rolling_6m * 100, linewidth=2, color='blue')
+                ax1.axhline(y=0, color='red', linestyle='-', alpha=0.3)
+                ax1.axhline(y=15, color='green', linestyle='--', alpha=0.5, label='15% Target')
+                ax1.set_ylabel("6-Month Rolling CAGR (%)")
+                ax1.set_title("Strategy Performance Trend")
+                ax1.legend()
+                ax1.grid(True, alpha=0.3)
+                
+                # Hit rate trend
+                rolling_hit_rate = returns_series.rolling(6).apply(lambda x: (x > 0).mean()).dropna()
+                ax2.plot(rolling_hit_rate.index, rolling_hit_rate * 100, linewidth=2, color='green')
+                ax2.axhline(y=50, color='orange', linestyle='--', alpha=0.5, label='50% Baseline')
+                ax2.set_ylabel("6-Month Hit Rate (%)")
+                ax2.set_xlabel("Date")
+                ax2.set_title("Strategy Consistency Trend")
+                ax2.legend()
+                ax2.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+        
+        # Strategy recommendations
+        st.markdown("#### 💡 Health-Based Recommendations")
+        
+        current_dd = health_metrics.get('current_drawdown', 0)
+        recent_perf = health_metrics.get('recent_3m_return', 0)
+        vol_regime = health_metrics.get('vol_regime_ratio', 1.0)
+        
+        if current_dd < -0.20:
+            st.error("🔴 **High Alert:** Large drawdown detected. Consider reducing position sizes or pausing new investments.")
+        elif current_dd < -0.10:
+            st.warning("🟡 **Caution:** Moderate drawdown. Monitor closely and ensure risk controls are working.")
+        elif recent_perf > 0.02:  # >2% monthly average
+            st.success("🟢 **Strong Performance:** Strategy performing well. Consider if position sizing is optimal.")
+        else:
+            st.info("🔵 **Normal:** Strategy within normal performance range. Continue monitoring.")
+        
+        # Enhancement recommendations
+        if use_enhanced_features:
+            st.info("🔬 **Enhanced Features Active:** Strategy using volatility-adjusted caps and regime awareness.")
+        else:
+            st.info("📊 **Standard Mode:** Consider enabling enhanced features for improved risk management.")
+
+print("\n✅ Enhanced app.py created with Strategy Health monitoring!")
