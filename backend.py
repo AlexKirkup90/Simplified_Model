@@ -947,10 +947,11 @@ def generate_live_portfolio_isa_monthly(
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
-                decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
-                return _format_display(prev_w)
-            else:
-                decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
+    decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
+    disp, raw = _format_display(new_w)
+return disp, raw, decision
+else:
+    decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
     return *_format_display(new_w), decision
 
@@ -1029,9 +1030,10 @@ def run_backtest_isa_dynamic(
     hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight)
     
     # Apply drawdown-based exposure adjustment
-    if use_enhanced_features:
+if use_enhanced_features:
     hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
-    hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
+
+hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     # Cum curves
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
