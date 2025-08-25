@@ -8,8 +8,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-import sys, os
-sys.path.append(os.path.dirname(__file__))
 import backend  # all logic lives here
 
 # ---------------------------
@@ -244,6 +242,7 @@ with tab2:
             if st.button("💾 Save this portfolio for next month"):
                 backend.save_portfolio_to_gist(live_raw)
                 st.success("Saved to Gist.")
+        
         with col2:
             if st.button("📸 Record live snapshot"):
                 result = backend.record_live_snapshot(live_raw, note="Manual snapshot")
@@ -444,7 +443,7 @@ with tab3:
                 ax2.grid(True, ls="--", alpha=0.5)
                 st.pyplot(fig2)
 
-                      # === Enhanced TL;DR summary ===
+                # === Enhanced TL;DR summary ===
                 st.markdown("##### TL;DR for the next 12 months")
 
                 start_amount = st.number_input(
@@ -452,17 +451,14 @@ with tab3:
                     min_value=100, max_value=1_000_000, step=100, value=1000
                 )
 
-                def money(x: float) -> str:
+                def money(x):
                     return f"£{x:,.0f}"
 
-                # Safe pulls with sensible fallbacks
-                scenarios = mc_results.get('scenarios', np.array([]))
-                median_ret = float(percentiles.get('p50', mc_results.get('mean_return', 0.0)))
-                p10_ret    = float(percentiles.get('p10', np.percentile(scenarios, 10))) if scenarios.size else 0.0
-                p90_ret    = float(percentiles.get('p90', np.percentile(scenarios, 90))) if scenarios.size else 0.0
-                p05_ret    = float(percentiles.get('p5',  np.percentile(scenarios, 5)))  if scenarios.size else 0.0
-                downside   = float(mc_results.get('downside_risk', 0.0))
-                prob_pos   = float(mc_results.get('prob_positive', 0.0))
+                median_ret = mc_results['mean_return']
+                p10_ret = percentiles.get('p10', 0)
+                p90_ret = percentiles.get('p90', 0)
+                p05_ret = percentiles.get('p5', 0) if 'p5' in percentiles else np.percentile(scenarios, 5)
+                downside = mc_results['downside_risk']
 
                 st.markdown(f"""
 **Expected Outcomes for £{start_amount:,}:**
@@ -470,16 +466,26 @@ with tab3:
 - **Typical range (10th–90th pct):** **{p10_ret*100:.1f}%** to **{p90_ret*100:.1f}%**  
   → **{money(start_amount*(1+p10_ret))}** to **{money(start_amount*(1+p90_ret))}**  
 - **Downside scenario (5th pct):** **{p05_ret*100:.1f}%** → **{money(start_amount*(1+p05_ret))}**  
-- **Chance of positive year:** **{prob_pos*100:.1f}%**  
+- **Chance of positive year:** **{mc_results['prob_positive']*100:.1f}%**  
 - **Average loss in bad scenarios:** **{downside*100:.1f}%**  
 """)
 
-                st.info(
-                    f"In plain English: the distribution is skewed positive. "
-                    f"Most paths are up (median ≈ {median_ret*100:.1f}%), "
-                    f"but there’s still real downside risk (~{prob_pos*100:.1f}% chance of a positive year). "
-                    f"Size positions accordingly."
-                )
+                # Risk assessment
+                if mc_results['prob_positive'] > 0.7:
+                    risk_color = "🟢"
+                    risk_text = "Favorable risk/reward profile"
+                elif mc_results['prob_positive'] > 0.5:
+                    risk_color = "🟡" 
+                    risk_text = "Balanced risk/reward profile"
+                else:
+                    risk_color = "🔴"
+                    risk_text = "Elevated risk profile"
+                
+                st.info(f"{risk_color} **Risk Assessment:** {risk_text}. "
+                       f"The distribution shows {mc_results['prob_positive']:.0%} chance of gains, "
+                       f"with median upside of {median_ret:.0%}. Size positions accordingly.")
+            else:
+                st.error(f"Monte Carlo simulation failed: {mc_results['error']}")
 
 # ---------------------------
 # Tab 4: Enhanced Regime
