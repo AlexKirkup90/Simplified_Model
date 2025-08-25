@@ -39,35 +39,141 @@ STRATEGY_PRESETS = {
 }
 
 # =========================
-# NEW: Enhanced Data Validation
+# NEW: Enhanced Data Validation & Cleaning
 # =========================
-def validate_market_data(prices_df: pd.DataFrame) -> List[str]:
-    """Comprehensive data quality checks"""
+def clean_extreme_moves(prices_df: pd.DataFrame, max_daily_move: float = 0.30, 
+                       min_price: float = 1.0) -> pd.DataFrame:
+    """Clean extreme price moves that are likely data errors"""
+    if prices_df.empty:
+        return prices_df
+    
+    cleaned_df = prices_df.copy()
+    total_corrections = 0
+    
+    for column in cleaned_df.columns:
+        series = cleaned_df[column].copy()
+        
+        # Remove prices below minimum (likely stock splits not handled)
+        low_price_mask = series < min_price
+        if low_price_mask.any():
+            # Forward fill from last good price
+            series = series.where(~low_price_mask).ffill()
+        
+        # Calculate daily returns
+        daily_returns = series.pct_change().abs()
+        
+        # Find extreme moves
+        extreme_moves = daily_returns > max_daily_move
+        extreme_dates = daily_returns[extreme_moves].index
+        
+        if len(extreme_dates) > 0:
+            total_corrections += len(extreme_dates)
+            
+            for date in extreme_dates:
+                # Replace extreme move with interpolated value
+                date_idx = series.index.get_loc(date)
+                
+                if date_idx > 0 and date_idx < len(series) - 1:
+                    # Interpolate between previous and next valid price
+                    prev_price = series.iloc[date_idx - 1]
+                    next_price = series.iloc[date_idx + 1]
+                    
+                    if pd.notna(prev_price) and pd.notna(next_price):
+                        series.iloc[date_idx] = (prev_price + next_price) / 2
+                    elif pd.notna(prev_price):
+                        series.iloc[date_idx] = prev_price
+                    elif pd.notna(next_price):
+                        series.iloc[date_idx] = next_price
+                elif date_idx > 0:
+                    # Use previous price
+                    series.iloc[date_idx] = series.iloc[date_idx - 1]
+        
+        cleaned_df[column] = series
+    
+    if total_corrections > 0:
+        st.info(f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks")
+    
+    return cleaned_df
+
+def fill_missing_data(prices_df: pd.DataFrame, max_gap_days: int = 5) -> pd.DataFrame:
+    """Fill missing data gaps with intelligent interpolation"""
+    if prices_df.empty:
+        return prices_df
+    
+    filled_df = prices_df.copy()
+    total_filled = 0
+    
+    for column in filled_df.columns:
+        series = filled_df[column].copy()
+        missing_mask = series.isna()
+        
+        if missing_mask.any():
+            # Count consecutive missing values
+            missing_groups = (missing_mask != missing_mask.shift()).cumsum()
+            missing_counts = missing_mask.groupby(missing_groups).sum()
+            
+            # Only fill gaps smaller than max_gap_days
+            small_gaps = missing_counts[missing_counts <= max_gap_days]
+            
+            for group_id in small_gaps.index:
+                gap_mask = missing_groups == group_id
+                gap_indices = series.index[gap_mask]
+                
+                if len(gap_indices) > 0:
+                    # Forward fill first, then backward fill if needed
+                    series = series.ffill()
+                    series = series.bfill()
+                    total_filled += len(gap_indices)
+        
+        filled_df[column] = series
+    
+    if total_filled > 0:
+        st.info(f"🔧 Data filling: Filled {total_filled} missing data points with interpolation")
+    
+    return filled_df
+
+def validate_and_clean_market_data(prices_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """Comprehensive data validation and cleaning pipeline"""
+    if prices_df.empty:
+        return prices_df, ["No data to clean"]
+    
+    original_shape = prices_df.shape
     alerts = []
     
-    if prices_df.empty:
-        return ["No market data available"]
+    # Step 1: Clean extreme moves
+    cleaned_df = clean_extreme_moves(prices_df, max_daily_move=0.25, min_price=0.50)
     
-    # Check for suspicious price moves (>20% daily moves)
-    daily_moves = prices_df.pct_change().abs()
-    extreme_moves = daily_moves > 0.20
+    # Step 2: Fill missing data gaps
+    filled_df = fill_missing_data(cleaned_df, max_gap_days=3)
     
-    if extreme_moves.any().any():
-        extreme_count = extreme_moves.sum().sum()
-        alerts.append(f"Warning: {extreme_count} extreme price moves (>20%) detected")
+    # Step 3: Remove columns with too much missing data
+    missing_pct = filled_df.isnull().sum() / len(filled_df)
+    good_columns = missing_pct[missing_pct < 0.20].index  # Keep columns with <20% missing
     
-    # Check for stale data
-    latest_date = prices_df.index.max()
-    days_stale = (pd.Timestamp.now() - latest_date).days
-    if days_stale > 3:
-        alerts.append(f"Warning: Price data is {days_stale} days old")
+    if len(good_columns) < len(filled_df.columns):
+        removed = len(filled_df.columns) - len(good_columns)
+        alerts.append(f"Removed {removed} stocks with >20% missing data")
+        filled_df = filled_df[good_columns]
     
-    # Check data completeness
-    missing_pct = prices_df.isnull().sum().sum() / (len(prices_df) * len(prices_df.columns)) * 100
-    if missing_pct > 5:
-        alerts.append(f"Warning: {missing_pct:.1f}% missing data points")
+    # Step 4: Final validation
+    remaining_missing = filled_df.isnull().sum().sum()
+    total_points = filled_df.shape[0] * filled_df.shape[1]
+    final_missing_pct = (remaining_missing / total_points) * 100 if total_points > 0 else 0
     
-    return alerts
+    if final_missing_pct > 0:
+        alerts.append(f"Final missing data: {final_missing_pct:.1f}%")
+    
+    # Step 5: Check for remaining extreme moves
+    for col in filled_df.columns:
+        daily_rets = filled_df[col].pct_change().abs()
+        extreme_count = (daily_rets > 0.25).sum()
+        if extreme_count > 0:
+            alerts.append(f"{col}: {extreme_count} remaining extreme moves")
+    
+    final_shape = filled_df.shape
+    alerts.append(f"Data shape: {original_shape} → {final_shape}")
+    
+    return filled_df, alerts
 
 # =========================
 # NEW: Volatility-Adjusted Position Sizing
@@ -318,7 +424,7 @@ def _prepare_universe_for_backtest(
     start_date: str,
     end_date: str
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str], str]:
-    """Fetches prices/volumes, applies Hybrid150 filter if needed."""
+    """Fetches prices/volumes, applies Hybrid150 filter if needed, with enhanced data cleaning."""
     base_tickers, base_sectors, label = get_universe(universe_choice)
     if not base_tickers:
         return pd.DataFrame(), pd.DataFrame(), {}, label
@@ -327,12 +433,7 @@ def _prepare_universe_for_backtest(
     if close.empty or "QQQ" not in close.columns:
         return pd.DataFrame(), pd.DataFrame(), {}, label
 
-    # Validate data quality
-    alerts = validate_market_data(close)
-    if alerts:
-        for alert in alerts[:3]:  # Show max 3 alerts
-            st.warning(alert)
-
+    # Enhanced data validation is now built into fetch_price_volume
     sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns if t != "QQQ"}
 
     if label == "Hybrid Top150":
@@ -348,6 +449,7 @@ def _prepare_universe_for_backtest(
             vol   = vol[keep_cols + ["QQQ"]]
             sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep_cols}
 
+    # Ensure timezone-naive datetimes
     for _df in (close, vol):
         idx = pd.to_datetime(_df.index)
         if getattr(idx, "tz", None) is not None:
@@ -368,12 +470,19 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         
         result = data.dropna(axis=1, how="all")
         
-        # Validate the fetched data
-        alerts = validate_market_data(result)
-        if alerts:
-            st.info(f"Data quality check: {alerts[0]}")  # Show first alert only
+        # Enhanced data cleaning pipeline
+        if not result.empty:
+            cleaned_result, cleaning_alerts = validate_and_clean_market_data(result)
+            
+            # Show cleaning summary
+            if cleaning_alerts:
+                for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
+                    st.info(f"🧹 Data cleaning: {alert}")
+            
+            return cleaned_result
         
         return result
+        
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
         return pd.DataFrame()
@@ -397,15 +506,28 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     vol.columns   = [tickers[0]]
             else:
                 return pd.DataFrame(), pd.DataFrame()
+        
         close = close.dropna(axis=1, how="all")
         vol   = vol.reindex_like(close).fillna(0)
         
-        # Validate data
-        alerts = validate_market_data(close)
-        if alerts and len(alerts) > 0:
-            st.info(f"Price data validation: {alerts[0]}")
+        # Enhanced data cleaning for prices
+        if not close.empty:
+            cleaned_close, close_alerts = validate_and_clean_market_data(close)
+            
+            # Clean volume data (less aggressive)
+            vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
+            # Replace any negative or extreme volumes
+            vol_aligned = vol_aligned.clip(lower=0, upper=vol_aligned.quantile(0.99, axis=0))
+            
+            # Show cleaning summary
+            if close_alerts:
+                for alert in close_alerts[:1]:  # Show top cleaning action
+                    st.info(f"🧹 Price/Volume cleaning: {alert}")
+            
+            return cleaned_close, vol_aligned
         
         return close, vol
+        
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()
