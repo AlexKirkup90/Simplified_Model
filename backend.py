@@ -1013,7 +1013,7 @@ def run_backtest_isa_dynamic(
         stickiness_days=stickiness_days,
         use_enhanced_features=use_enhanced_features
     )
-    mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, lookbook_period_mr=21, top_n_mr=mr_topn, long_ma_days=200)
+    mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200)
 
     # Combine + costs
     hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight)
