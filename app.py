@@ -8,6 +8,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+import sys, os
+sys.path.append(os.path.dirname(__file__))
 import backend  # all logic lives here
 
 # ---------------------------
