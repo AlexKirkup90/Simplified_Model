@@ -516,8 +516,13 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
             
             # Clean volume data (less aggressive)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
-            # Replace any negative or extreme volumes
-            vol_aligned = vol_aligned.clip(lower=0, upper=vol_aligned.quantile(0.99, axis=0))
+            # Replace any negative or extreme volumes with more robust method
+            for col in vol_aligned.columns:
+                col_data = vol_aligned[col]
+                if len(col_data.dropna()) > 0:
+                    # Clip extreme volumes per column
+                    q99 = col_data.quantile(0.99)
+                    vol_aligned[col] = col_data.clip(lower=0, upper=q99)
             
             # Show cleaning summary
             if close_alerts:
