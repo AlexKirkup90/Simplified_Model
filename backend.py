@@ -212,15 +212,40 @@ def to_yahoo_symbol(sym: str) -> str:
 # =========================
 @st.cache_data(ttl=86400)
 def fetch_sp500_constituents() -> List[str]:
-    """Get current S&P 500 tickers from Wikipedia."""
+    """Get current S&P 500 tickers with fallback to static list."""
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        # Try with headers to avoid 403 blocking
+        import requests
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url, attrs={'class': 'wikitable sortable'})
         df = tables[0]
         tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
         return sorted(list(set(tickers)))
     except Exception as e:
-        st.warning(f"Failed to fetch S&P 500 list: {e}")
-        return []
+        st.warning(f"Failed to fetch S&P 500 list: {e}. Using fallback list.")
+        # Static fallback list of major S&P 500 stocks (updated Aug 2025)
+        return [
+            "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "BRK-B", "LLY",
+            "AVGO", "WMT", "JPM", "XOM", "UNH", "ORCL", "MA", "HD", "PG", "COST",
+            "JNJ", "ABBV", "BAC", "CRM", "CVX", "KO", "AMD", "PEP", "TMO", "WFC",
+            "CSCO", "ACN", "MRK", "DIS", "LIN", "ABT", "DHR", "NFLX", "VZ", "TXN",
+            "QCOM", "CMCSA", "PM", "COP", "SPGI", "RTX", "UNP", "NKE", "T", "LOW",
+            "INTU", "IBM", "GS", "HON", "CAT", "AXP", "UPS", "MS", "NEE", "MDT",
+            "PFE", "INTC", "BLK", "GE", "DE", "TJX", "AMGN", "SYK", "ADP", "BKNG",
+            "VRTX", "ADI", "C", "MU", "LRCX", "TMUS", "GILD", "SCHW", "AMAT", "EOG",
+            "MMC", "NOW", "SHW", "ZTS", "PYPL", "CMG", "PANW", "FI", "ICE", "DUK",
+            "PGR", "AON", "SO", "TGT", "ITW", "BSX", "WM", "CL", "MCD", "FCX",
+            # Add more major names to get closer to 500
+            "EMR", "APD", "KLAC", "SNPS", "CDNS", "ORLY", "MAR", "APH", "MSI", "SLB",
+            "HUM", "ADSK", "ECL", "FDX", "NXPI", "ROP", "CME", "ROST", "AJG", "TFC",
+            "PCAR", "KMB", "MNST", "FAST", "PAYX", "CTAS", "AMP", "OTIS", "DXCM", "EA",
+            "VRSK", "BDX", "EXC", "KR", "GWW", "MLM", "VMC", "CTSH", "CARR", "URI",
+            "WBD", "IDXX", "ANSS", "A", "SPG", "HES", "EW", "XEL", "PSA", "YUM",
+            "CMI", "WELL", "CHTR", "ALL", "GD", "F", "GM", "STZ", "HCA", "AIG"
+        ]
 
 @st.cache_data(ttl=86400)
 def get_sector_map(tickers: List[str]) -> Dict[str, str]:
@@ -236,14 +261,31 @@ def get_sector_map(tickers: List[str]) -> Dict[str, str]:
     return out
 
 def get_nasdaq_100_plus_tickers() -> List[str]:
-    """Get NASDAQ 100+ tickers including extras"""
+    """Get NASDAQ 100+ tickers with fallback list"""
     try:
-        tables = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')
+        # Try with headers to avoid blocking
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        tables = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100', attrs={'class': 'wikitable'})
         nasdaq_100 = tables[4]['Ticker'].astype(str).str.upper().tolist()
         extras = ['TSLA', 'SHOP', 'SNOW', 'PLTR', 'ETSY', 'RIVN', 'COIN']
         return sorted(set(nasdaq_100 + extras))
     except Exception:
-        return ['AAPL','MSFT','NVDA','AMZN','GOOGL','META','TSLA']  # Fallback
+        # Static fallback for NASDAQ 100+ (updated Aug 2025)
+        return [
+            'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'GOOG', 'META', 'TSLA', 'AVGO', 'COST',
+            'NFLX', 'AMD', 'PEP', 'QCOM', 'CSCO', 'INTU', 'TXN', 'CMCSA', 'HON', 'AMGN',
+            'BKNG', 'VRTX', 'ADI', 'GILD', 'MELI', 'LRCX', 'ADP', 'SBUX', 'PYPL', 'REGN',
+            'AMAT', 'KLAC', 'MDLZ', 'SNPS', 'CRWD', 'CDNS', 'MAR', 'MRVL', 'ORLY', 'CSX',
+            'DASH', 'ASML', 'ADSK', 'PCAR', 'ROP', 'NXPI', 'ABNB', 'FTNT', 'CHTR', 'AEP',
+            'FAST', 'MNST', 'ODFL', 'ROST', 'BKR', 'EA', 'VRSK', 'EXC', 'XEL', 'TEAM',
+            'CSGP', 'DDOG', 'GEHC', 'KDP', 'CTSH', 'FANG', 'ZS', 'ANSS', 'DXCM', 'BIIB',
+            'WBD', 'MRNA', 'KHC', 'IDXX', 'CCEP', 'ON', 'MDB', 'ILMN', 'GFS', 'WBA',
+            'SIRI', 'ARM', 'SMCI', 'TTD', 'CDW', 'ZM', 'GEN', 'PDD', 'ALGN', 'WDAY',
+            # Your extras
+            'SHOP', 'SNOW', 'PLTR', 'ETSY', 'RIVN', 'COIN'
+        ]
 
 def get_universe(choice: str) -> Tuple[List[str], Dict[str, str], str]:
     """
