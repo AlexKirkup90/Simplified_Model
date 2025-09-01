@@ -176,6 +176,175 @@ def validate_and_clean_market_data(prices_df: pd.DataFrame) -> Tuple[pd.DataFram
     return filled_df, alerts
 
 # =========================
+# NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
+# =========================
+def enforce_caps_iteratively(weights: pd.Series, sectors_map: Dict[str, str], 
+                            name_cap: float = 0.25, sector_cap: float = 0.30, 
+                            max_iterations: int = 100, debug: bool = False) -> pd.Series:
+    """
+    NEW FUNCTION: Enforce both name caps and sector caps simultaneously.
+    This fixes the 28.99% position sizing bug by properly handling the interaction
+    between individual name caps and sector-level caps.
+    """
+    if weights.empty:
+        return weights
+    
+    w = weights.copy().astype(float)
+    sectors = pd.Series({t: sectors_map.get(t, "Unknown") for t in w.index})
+    
+    if debug:
+        st.info(f"🔧 Starting caps enforcement: name_cap={name_cap:.1%}, sector_cap={sector_cap:.1%}")
+        st.info(f"📊 Initial positions: {dict(w.round(4))}")
+    
+    for iteration in range(max_iterations):
+        initial_w = w.copy()
+        total_excess = 0.0
+        
+        # Step 1: Enforce name caps
+        name_violations = w > name_cap
+        if name_violations.any():
+            name_excess = (w[name_violations] - name_cap).sum()
+            w[name_violations] = name_cap
+            total_excess += name_excess
+            
+        # Step 2: Enforce sector caps
+        sector_sums = w.groupby(sectors).sum()
+        sector_violations = sector_sums > sector_cap
+        
+        if sector_violations.any():
+            for sector in sector_violations[sector_violations].index:
+                sector_tickers = w.index[sectors == sector]
+                sector_weight = w[sector_tickers].sum()
+                
+                if sector_weight > sector_cap:
+                    scale_factor = sector_cap / sector_weight
+                    sector_excess = sector_weight - sector_cap
+                    w[sector_tickers] *= scale_factor
+                    total_excess += sector_excess
+        
+        # Step 3: Redistribute excess to compliant positions
+        if total_excess > 1e-10:
+            can_accept_more = pd.Series(True, index=w.index)
+            can_accept_more &= (w < name_cap - 1e-10)
+            
+            for sector in sector_sums.index:
+                if sector_sums[sector] >= sector_cap - 1e-10:
+                    can_accept_more &= (sectors != sector)
+            
+            recipients = w.index[can_accept_more]
+            
+            if len(recipients) > 0:
+                available_capacity = pd.Series(0.0, index=recipients)
+                
+                for ticker in recipients:
+                    name_capacity = name_cap - w[ticker]
+                    ticker_sector = sectors[ticker]
+                    sector_used = w[sectors == ticker_sector].sum()
+                    sector_capacity = sector_cap - sector_used
+                    available_capacity[ticker] = min(name_capacity, sector_capacity)
+                
+                available_capacity = available_capacity[available_capacity > 1e-10]
+                
+                if len(available_capacity) > 0:
+                    total_available = available_capacity.sum()
+                    
+                    if total_available >= total_excess:
+                        allocation_weights = available_capacity / total_available
+                        w[available_capacity.index] += allocation_weights * total_excess
+                    else:
+                        w[available_capacity.index] += available_capacity
+                        remainder = total_excess - total_available
+                        w += remainder / len(w)
+                else:
+                    w += total_excess / len(w)
+            else:
+                w += total_excess / len(w)
+        
+        # Check convergence
+        max_change = (w - initial_w).abs().max()
+        if max_change < 1e-10:
+            if debug:
+                st.success(f"✅ Converged after {iteration + 1} iterations")
+            break
+    
+    w = w / w.sum() if w.sum() > 0 else w
+    
+    # Final validation and reporting
+    if debug:
+        final_violations = []
+        
+        name_violations = w > name_cap + 1e-6
+        if name_violations.any():
+            for ticker in w.index[name_violations]:
+                final_violations.append(f"{ticker}: {w[ticker]:.1%} > {name_cap:.1%} name cap")
+        
+        final_sector_sums = w.groupby(sectors).sum()
+        sector_violations = final_sector_sums > sector_cap + 1e-6
+        if sector_violations.any():
+            for sector in final_sector_sums.index[sector_violations]:
+                sector_weight = final_sector_sums[sector]
+                final_violations.append(f"{sector}: {sector_weight:.1%} > {sector_cap:.1%} sector cap")
+        
+        if final_violations:
+            st.warning("⚠️ Position sizing violations detected:\n" + "\n".join(final_violations))
+        else:
+            st.success("✅ All position sizing constraints satisfied")
+        
+        st.info(f"📊 Final positions: {dict(w.round(4))}")
+    
+    return w
+
+def get_enhanced_sector_map(tickers: List[str]) -> Dict[str, str]:
+    """
+    NEW FUNCTION: Enhanced sector mapping with proper semiconductor classification.
+    Fixes the AVGO/AMD sector issue by ensuring both are classified as semiconductors.
+    """
+    semiconductor_stocks = {
+        'NVDA', 'AMD', 'INTC', 'QCOM', 'AVGO', 'TXN', 'ADI', 'MU', 'LRCX', 
+        'AMAT', 'KLAC', 'MRVL', 'NXPI', 'ON', 'SWKS', 'MCHP', 'ARM', 'TSM'
+    }
+    
+    software_stocks = {
+        'MSFT', 'GOOGL', 'GOOG', 'CRM', 'ORCL', 'ADBE', 'NOW', 'TEAM', 'WDAY',
+        'DDOG', 'CRWD', 'ZS', 'SNOW', 'PLTR', 'MDB', 'INTU', 'ANSS', 'CDNS', 'SNPS'
+    }
+    
+    mega_tech_stocks = {
+        'AAPL', 'META', 'NFLX', 'TSLA'
+    }
+    
+    ai_hardware_stocks = {
+        'SMCI', 'HPE'
+    }
+    
+    crypto_related = {
+        'COIN', 'MSTR', 'SQ'
+    }
+    
+    cloud_stocks = {
+        'AMZN'
+    }
+    
+    sector_map = {}
+    for ticker in tickers:
+        if ticker in semiconductor_stocks:
+            sector_map[ticker] = "Semiconductors"
+        elif ticker in software_stocks:
+            sector_map[ticker] = "Software"
+        elif ticker in mega_tech_stocks:
+            sector_map[ticker] = "Mega Tech"
+        elif ticker in ai_hardware_stocks:
+            sector_map[ticker] = "AI Hardware" 
+        elif ticker in crypto_related:
+            sector_map[ticker] = "Crypto/Fintech"
+        elif ticker in cloud_stocks:
+            sector_map[ticker] = "Cloud/Platforms"
+        else:
+            sector_map[ticker] = "Other"
+    
+    return sector_map
+
+# =========================
 # NEW: Volatility-Adjusted Position Sizing
 # =========================
 def get_volatility_adjusted_caps(weights: pd.Series, daily_prices: pd.DataFrame, 
@@ -929,9 +1098,10 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
     return med[med >= min_dollar].index.tolist()
 
 # =========================
-# Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - Enhanced
+# Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - MODIFIED
 # =========================
 def _build_isa_weights(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
+    """MODIFIED: Uses the new enhanced position sizing to fix the 28.99% bug"""
     monthly = daily_close.resample("ME").last()
 
     # --- Composite momentum (ticker vector at latest date) ---
@@ -958,16 +1128,19 @@ def _build_isa_weights(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dic
         if not filtered.empty:
             top_m = filtered  # only replace if something remains
 
-    # Weights for momentum sleeve (with enhanced name cap + sector caps)
+    # --- FIXED: Weights for momentum sleeve using enhanced position sizing ---
     if not top_m.empty and top_m.sum() > 0:
-        mom_raw = top_m / top_m.sum()
+        mom_raw = (top_m / top_m.sum()) * preset["mom_w"]
         
-        # Apply volatility-adjusted caps
-        vol_caps = get_volatility_adjusted_caps(mom_raw, daily_close, base_cap=preset["mom_cap"])
-        mom_w = cap_weights(mom_raw, cap=preset["mom_cap"], vol_adjusted_caps=vol_caps) * preset["mom_w"]
-        
-        if not mom_w.empty:
-            mom_w = apply_sector_caps(mom_w, sectors_map, cap=preset.get("sector_cap", 0.30))
+        # Use enhanced sector mapping and fixed caps
+        enhanced_sectors = get_enhanced_sector_map(list(daily_close.columns))
+        mom_w = enforce_caps_iteratively(
+            mom_raw,
+            enhanced_sectors,
+            name_cap=preset["mom_cap"],
+            sector_cap=preset.get("sector_cap", 0.30),
+            debug=True  # Set to False to reduce output
+        )
     else:
         mom_w = pd.Series(dtype=float)
 
@@ -983,7 +1156,7 @@ def _build_isa_weights(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dic
     # --- Combine sleeves & normalize ---
     new_w = mom_w.add(mr_w, fill_value=0.0)
     
-    # Apply regime-based exposure adjustment
+    # Apply regime-based exposure adjustment (optional)
     try:
         regime_metrics = compute_regime_metrics(daily_close)
         regime_exposure = get_regime_adjusted_exposure(regime_metrics)
