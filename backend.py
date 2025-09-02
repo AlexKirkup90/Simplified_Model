@@ -178,157 +178,162 @@ def validate_and_clean_market_data(prices_df: pd.DataFrame) -> Tuple[pd.DataFram
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
 # =========================
+
+# ---- Software split caps (Option 2) ----
+ENABLE_SOFTWARE_SUBCAPS: bool = True   # turn on/off the feature
+PARENT_SOFTWARE_CAP: float = 0.30      # keep total Software <= 30%
+SOFTWARE_SUBCAP: float = 0.18          # each Software sub-bucket <= 18%
+
 def enforce_caps_iteratively(
     weights: pd.Series,
-    sectors_map: Dict[str, str],
+    sector_labels: dict[str, str],
     name_cap: float = 0.25,
     sector_cap: float = 0.30,
-    max_iterations: int = 200,
+    group_caps: dict[str, float] | None = None,
+    max_iter: int = 200,
     debug: bool = False
 ) -> pd.Series:
     """
-    Enforce name and sector caps simultaneously.
-    Key differences vs. earlier version:
-      • No end-of-function renormalization (preserves caps; unallocated = cash)
-      • No 'give excess to everyone' fallback
-      • Recompute sector sums after each enforcement before redistribution
+    Enforce name caps, per-sector caps, and optional per-group (hierarchical) caps.
+    - sector_labels: mapping ticker -> label (can be "Software:Security", etc.)
+    - sector_cap: default cap for any sector not explicitly listed in group_caps
+    - group_caps: optional dict like {"Software": 0.30, "Software:Security": 0.18, ...}
+                  Parent groups are labels with no ":" (e.g., "Software").
+    We *do not* force re-distribution; trimmed weight becomes cash (i.e., sum <= 1),
+    which matches your existing preview behavior.
     """
-    if weights is None or len(weights) == 0:
-        return pd.Series(dtype=float)
 
-    w = weights.copy().astype(float)
-    sectors = pd.Series({t: sectors_map.get(t, "Unknown") for t in w.index})
-    unallocated = 0.0  # what we couldn't place due to caps → becomes cash
+    if weights.empty:
+        return weights
 
-    if debug:
-        st.info(f"🔧 Starting caps enforcement: name_cap={name_cap:.1%}, sector_cap={sector_cap:.1%}")
-        st.info(f"📊 Initial positions: {dict(w.round(4))}")
+    w = weights.astype(float).copy()
+    w[w < 0] = 0.0
 
-    for it in range(max_iterations):
+    # Normalize only if clearly >1 because some callers already pre-normalize
+    if w.sum() > 1.0 + 1e-9:
+        w = w / w.sum()
+
+    # Vectorized helpers
+    ser_sector = pd.Series({k: sector_labels.get(k, "Unknown") for k in w.index})
+    ser_top = ser_sector.map(lambda s: s.split(":")[0])
+
+    def _apply_name_caps(w: pd.Series) -> tuple[pd.Series, bool]:
+        over = w[w > name_cap]
+        if over.empty:
+            return w, False
+        w.loc[over.index] = name_cap
+        return w, True
+
+    def _apply_sector_caps(w: pd.Series) -> tuple[pd.Series, bool]:
         changed = False
-
-        # 1) Enforce NAME caps
-        over_name = w > (name_cap + 1e-12)
-        if over_name.any():
-            excess = float((w[over_name] - name_cap).sum())
-            w[over_name] = name_cap
-            unallocated += excess
-            changed = True
-
-        # 2) Enforce SECTOR caps (using current weights)
-        sector_sums = w.groupby(sectors).sum()
-        for sec, sec_sum in sector_sums.items():
-            if sec_sum > sector_cap + 1e-12:
-                idx = w.index[sectors == sec]
-                before = float(w.loc[idx].sum())
-                scale = sector_cap / sec_sum if sec_sum > 0 else 1.0
-                w.loc[idx] *= scale
-                after = float(w.loc[idx].sum())
-                unallocated += max(before - after, 0.0)
+        sums = w.groupby(ser_sector).sum()
+        for sec, s in sums.items():
+            cap = (group_caps.get(sec) if group_caps and sec in group_caps else sector_cap)
+            if s > cap + 1e-12:
+                f = cap / s
+                idx = ser_sector[ser_sector == sec].index
+                w.loc[idx] = w.loc[idx] * f
                 changed = True
+        return w, changed
 
-        # 3) Try to re-distribute some unallocated to names with capacity
-        if unallocated > 1e-12:
-            # recompute sector sums after enforcement
-            sector_sums = w.groupby(sectors).sum()
+    def _apply_parent_caps(w: pd.Series) -> tuple[pd.Series, bool]:
+        if not group_caps:
+            return w, False
+        changed = False
+        parent_labels = [k for k in group_caps.keys() if ":" not in k]
+        if not parent_labels:
+            return w, False
+        sums = w.groupby(ser_top).sum()
+        for parent in parent_labels:
+            if parent in sums.index and sums[parent] > group_caps[parent] + 1e-12:
+                f = group_caps[parent] / sums[parent]
+                idx = ser_top[ser_top == parent].index
+                w.loc[idx] = w.loc[idx] * f
+                changed = True
+        return w, changed
 
-            capacity = pd.Series(0.0, index=w.index)
-            for t in w.index:
-                # name capacity
-                c_name = max(0.0, name_cap - w[t])
-                # sector capacity
-                sec = sectors[t]
-                c_sector = max(0.0, sector_cap - sector_sums.get(sec, 0.0))
-                capacity[t] = min(c_name, c_sector)
+    for _ in range(max_iter):
+        changed_any = False
 
-            capacity = capacity[capacity > 1e-12]
-            if len(capacity) > 0:
-                alloc = min(unallocated, float(capacity.sum()))
-                if alloc > 0:
-                    weights_share = capacity / capacity.sum()
-                    w[capacity.index] += weights_share * alloc
-                    unallocated -= alloc
-                    changed = True
-            # If no capacity, we keep the unallocated as cash (do NOT force it in)
+        w, c1 = _apply_name_caps(w)
+        w, c2 = _apply_sector_caps(w)
+        w, c3 = _apply_parent_caps(w)
 
-        # Exit if nothing changed and we have no violations we can fix further
-        sector_sums = w.groupby(sectors).sum()
-        name_ok = not (w > name_cap + 1e-9).any()
-        sector_ok = not (sector_sums > sector_cap + 1e-9).any()
-        if (not changed) and (unallocated < 1e-9 or (name_ok and sector_ok)):
+        changed_any = c1 or c2 or c3
+        if not changed_any:
             break
 
-    # Final validation (no renormalization)
-    if debug:
-        violations = []
-        if (w > name_cap + 1e-6).any():
-            for t in w.index[w > name_cap + 1e-6]:
-                violations.append(f"{t}: {w[t]:.1%} > {name_cap:.1%} name cap")
-        final_sector = w.groupby(sectors).sum()
-        for sec in final_sector.index[final_sector > sector_cap + 1e-6]:
-            violations.append(f"{sec}: {final_sector[sec]:.1%} > {sector_cap:.1%} sector cap")
-
-        if violations:
-            st.warning("⚠️ Position sizing violations detected: " + " • ".join(violations))
-        else:
-            st.success("✅ All position sizing constraints satisfied")
-
-        st.info(f"📊 Final positions: {dict(w.round(4))}")
-        if unallocated > 1e-9:
-            st.info(f"💰 Unallocated (cash): {unallocated:.2%}")
-
-    # Return as-is (may sum to < 1.0 → implicit cash)
+    # Safety: clip tiny negatives from numerical noise
+    w[w < 0] = 0.0
     return w
 
 # --- Enhanced sector bucketing -----------------------------------------------
 from typing import Dict, List, Optional
 
-def get_enhanced_sector_map(
-    tickers: List[str],
-    base_map: Optional[Dict[str, str]] = None
-) -> Dict[str, str]:
+def get_enhanced_sector_map(tickers: list[str], base_map: dict[str, str] | None = None) -> dict[str, str]:
     """
-    Map tickers into a small set of 'enhanced' sectors used for caps.
-    - If a base sector map is provided, we use it to help decide.
-    - Otherwise we fall back to ticker-based overrides and sensible defaults.
+    Return an 'enhanced' sector map. If a ticker is 'Software' in the base map,
+    split it into sub-buckets to allow finer caps: Security, Data/AI, AdTech,
+    Collaboration, Commerce, Other. Everything else passes through.
 
-    Buckets: 'Mega Tech', 'Semiconductors', 'Crypto/Fintech', 'Software', 'Other'
+    Priority: if base_map is provided, use it. Otherwise fall back to 'Unknown'.
     """
 
     base_map = base_map or {}
 
-    MEGA_TECH = {
-        "AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN", "TSLA", "NFLX"
+    # --- software sub-buckets (ticker heuristics) ---
+    sec_security = {
+        "CRWD","ZS","FTNT","PANW","OKTA","S","TENB","NET"
     }
-    SEMIS = {
-        "NVDA", "AMD", "AVGO", "ASML", "KLAC", "LRCX", "AMAT", "QCOM", "MRVL",
-        "ON", "TXN", "INTC", "ADBE", "ARM", "SMCI"
+    sec_data_ai = {
+        "PLTR","SNOW","MDB","DDOG","NRTX","AI"  # keep PLTR here
     }
-    CRYPTO_FINTECH = {
-        "COIN", "MSTR", "PYPL", "SQ", "HOOD", "SOFI"
-    }
-    SOFTWARE_OVERRIDES = {
-        # cybersecurity / SaaS / data
-        "CRWD", "ZS", "FTNT", "PANW", "DDOG", "SNOW", "MDB", "TEAM", "WDAY",
-        "NOW", "ADBE", "SHOP", "PLTR", "APP", "TTD"
-    }
+    sec_adtech = {"APP","TTD"}
+    sec_collab = {"ZM","TEAM"}
+    sec_commerce = {"SHOP","MELI","ETSY","SQ","ADYEY","AFRM"}
 
-    def normalize(base_sector: Optional[str], t: str) -> str:
-        t = t.upper()
-        if t in MEGA_TECH:
-            return "Mega Tech"
-        if t in SEMIS or (base_sector and "semic" in base_sector.lower()):
-            return "Semiconductors"
-        if t in CRYPTO_FINTECH:
-            return "Crypto/Fintech"
-        if t in SOFTWARE_OVERRIDES or (base_sector and "software" in base_sector.lower()):
-            return "Software"
-        return "Other"
+    # Convenience helper
+    def _software_bucket(t: str) -> str:
+        u = t.upper()
+        if u in sec_security:  return "Software:Security"
+        if u in sec_data_ai:   return "Software:Data/AI"
+        if u in sec_adtech:    return "Software:AdTech"
+        if u in sec_collab:    return "Software:Collab"
+        if u in sec_commerce:  return "Software:Commerce"
+        return "Software:Other"
 
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for t in tickers:
-        out[t] = normalize(base_map.get(t), t)
+        base = (base_map.get(t)
+                or base_map.get(t.upper())
+                or "Unknown")
+
+        # keep a few custom buckets you already use if present in base
+        if base in {"AI Hardware","Crypto/Fintech","Mega Tech","Semiconductors"}:
+            out[t] = base
+        elif base == "Software":
+            out[t] = _software_bucket(t)
+        else:
+            out[t] = base
     return out
+
+def build_group_caps(enhanced_map: dict[str, str]) -> dict[str, float]:
+    """
+    Build a dictionary of caps to apply in enforce_caps_iteratively.
+    We keep the global Software cap AND add mini-caps to any present sub-buckets.
+    """
+    if not ENABLE_SOFTWARE_SUBCAPS:
+        return {}
+
+    caps: dict[str, float] = {}
+    # Parent cap
+    caps["Software"] = PARENT_SOFTWARE_CAP
+
+    # Sub-buckets that actually appear
+    present = {v for v in enhanced_map.values() if v.startswith("Software:")}
+    for sb in present:
+        caps[sb] = min(SOFTWARE_SUBCAP, PARENT_SOFTWARE_CAP)
+    return caps
 
 # =========================
 # NEW: Volatility-Adjusted Position Sizing
@@ -971,9 +976,7 @@ def run_momentum_composite_param(
     use_enhanced_features: bool = True,
 ):
     """Enhanced momentum sleeve with stickiness, volatility-aware name caps, and
-    simultaneous sector+name enforcement using the enhanced taxonomy."""
-
-    # Optional verbose logging toggle from UI
+    simultaneous sector+name (and group) enforcement using the enhanced taxonomy."""
     debug_caps = bool(st.session_state.get("debug_caps", False))
 
     monthly = daily.resample("ME").last()
@@ -983,45 +986,50 @@ def run_momentum_composite_param(
     prev_w = pd.Series(dtype=float)
 
     for m in monthly.index:
-        # Use data up to month m
         hist = daily.loc[:m]
 
-        # Composite momentum score (higher is better)
-        comp = composite_score(hist)
+        # Composite momentum score -> 1-D vector for the current month
+        comp_all = composite_score(hist)
+        if isinstance(comp_all, pd.DataFrame):
+            comp = comp_all.iloc[-1].dropna()
+        else:
+            comp = pd.Series(comp_all).dropna()
+
         if comp.empty:
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
+            prev_w = pd.Series(dtype=float)
             continue
 
         # Restrict to positive blended momentum universe
         momz = blended_momentum_z(hist.resample("ME").last())
-        comp = comp[momz.index]  # align
+        comp = comp.reindex(momz.index).dropna()
         sel  = comp[momz > 0].dropna()
         if sel.empty:
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
+            prev_w = pd.Series(dtype=float)
             continue
 
-        # Pick top-N
+        # Pick top-N by score
         picks = sel.nlargest(top_n)
 
-        # Signal decay (optional)
+        # Optional: signal decay shaping
         if use_enhanced_features:
-            days_since_signal = 0  # placeholder; wire up when tracking signal ages
+            days_since_signal = 0  # TODO: wire up true signal age if you track it
             picks = apply_signal_decay(picks, days_since_signal)
 
-        # Stickiness filter (require names to persist in the top cohort)
-        stable = momentum_stable_names(hist, top_n=top_n, days=stickiness_days)
-        if len(stable) > 0:
+        # Stickiness filter (prefer persistent names)
+        stable = set(momentum_stable_names(hist, top_n=top_n, days=stickiness_days))
+        if stable:
             filtered = picks.reindex([t for t in picks.index if t in stable]).dropna()
             if not filtered.empty:
                 picks = filtered
             else:
-                # if stickiness removes all, fall back to original top-N for continuity
-                picks = sel.nlargest(top_n)
+                picks = sel.nlargest(top_n)  # fallback if stickiness empties set
 
-        # Raw equalized by score
-        if picks.sum() == 0 or picks.empty:
+        # Raw weights ~ proportional to scores
+        if picks.empty or np.isclose(picks.sum(), 0.0):
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
             prev_w = pd.Series(dtype=float)
@@ -1029,59 +1037,53 @@ def run_momentum_composite_param(
 
         raw = (picks / picks.sum()).astype(float)
 
-        # Optionally shape raw weights by volatility-aware name caps (soft)
+        # Soft cap by volatility-aware name caps (optional)
         if use_enhanced_features:
             vol_caps = get_volatility_adjusted_caps(raw, hist, base_cap=name_cap)
             raw = cap_weights(raw, cap=name_cap, vol_adjusted_caps=vol_caps)
         else:
             raw = cap_weights(raw, cap=name_cap)
 
-        # Enforce name + sector caps together using enhanced taxonomy (hard)
-        enhanced_sectors = get_enhanced_sector_map(list(raw.index), sectors_map)
-        # fallback to provided sectors_map where enhanced taxonomy doesn't have an entry
+        # Enhanced taxonomy + hierarchical group caps (e.g., Software parent + sub-buckets)
+        enhanced_sectors = get_enhanced_sector_map(list(raw.index), base_map=sectors_map)
+        # Ensure any missing tickers fall back to provided base map
         for t in raw.index:
             if t not in enhanced_sectors:
                 enhanced_sectors[t] = sectors_map.get(t, "Other")
+        group_caps = build_group_caps(enhanced_sectors)
 
+        # Hard enforcement of name + sector (and group) caps
         w = enforce_caps_iteratively(
-            raw,
+            raw.astype(float),
             enhanced_sectors,
             name_cap=name_cap,
             sector_cap=sector_cap,
-            debug=debug_caps
+            group_caps=group_caps,
+            debug=debug_caps,
         )
 
-        # Regime-based exposure scaling (keeps weights un-normalized to reflect exposure)
+        # Regime-based exposure scaling (keeps exposure < 1 when risk-off)
         if use_enhanced_features and len(hist) > 0 and len(w) > 0:
             try:
-                regime_metrics = compute_regime_metrics(hist)
+                regime_metrics  = compute_regime_metrics(hist)
                 regime_exposure = get_regime_adjusted_exposure(regime_metrics)
                 w = w * regime_exposure
             except Exception:
-                pass  # if regime metrics fail, keep w as-is
+                pass
 
-        # If no valid weights, zero this month and continue
-        if w is None or len(w) == 0 or np.isclose(w.sum(), 0.0):
+        if w is None or len(w) == 0 or np.isclose(w.sum(), 0.0) or m not in fwd.index:
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
             prev_w = pd.Series(dtype=float)
             continue
 
-        # Compute next-month return for these weights
+        # Next-month return with these weights
         valid = [t for t in w.index if t in fwd.columns]
-        if len(valid) == 0 or m not in fwd.index:
-            rets.loc[m] = 0.0
-            tno.loc[m]  = 0.0
-            prev_w = w
-            continue
-
         rets.loc[m] = float((fwd.loc[m, valid] * w.reindex(valid).fillna(0.0)).sum())
 
-        # Turnover: 0.5 * L1 distance between this and previous month weights
+        # Turnover (0.5 * L1 distance)
         tno.loc[m] = 0.5 * float(
-            (w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0))
-            .abs()
-            .sum()
+            (w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0)).abs().sum()
         )
         prev_w = w
 
@@ -1164,10 +1166,12 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
 # =========================
 # Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - MODIFIED
 # =========================
-def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
-    """FIXED VERSION: Apply position sizing to final combined portfolio"""
-
-    # Toggle verbose cap-enforcement logs from the UI (e.g., a sidebar checkbox)
+def _build_isa_weights_fixed(
+    daily_close: pd.DataFrame,
+    preset: Dict,
+    sectors_map: Dict[str, str]
+) -> pd.Series:
+    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio."""
     debug_caps = bool(st.session_state.get("debug_caps", False))
 
     if debug_caps:
@@ -1184,16 +1188,20 @@ def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_ma
     comp_vec = comp_vec.reindex(pos_idx).dropna()
     top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
 
-    # Stickiness filter
-    stable_names = set(momentum_stable_names(
-        daily_close, top_n=preset["mom_topn"], days=preset.get("stability_days", 7)
-    ))
+    # Stickiness filter (keep names that have persisted in the top set)
+    stable_names = set(
+        momentum_stable_names(
+            daily_close,
+            top_n=preset["mom_topn"],
+            days=preset.get("stickiness_days", 7)  # <- align key name with the rest of the app
+        )
+    )
     if stable_names and not top_m.empty:
         filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
         if not filtered.empty:
             top_m = filtered
 
-    # Raw momentum weights (NO CAPS - just relative scoring)
+    # Raw momentum weights (scaled by sleeve weight)
     mom_raw = (top_m / top_m.sum()) * preset["mom_w"] if not top_m.empty and top_m.sum() > 0 else pd.Series(dtype=float)
 
     # --- Mean Reversion Component (NO CAPS YET) ---
@@ -1214,22 +1222,24 @@ def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_ma
     if debug_caps:
         st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
 
-    # Use enhanced sector map for tighter grouping (e.g., semis vs software)
-    enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index))
+    # Enhanced sector map (uses your base sectors_map) + hierarchical caps for Software sub-buckets
+    enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index), base_map=sectors_map)
+    group_caps = build_group_caps(enhanced_sectors)  # <- adds Software parent (30%) + sub-caps (e.g., 18%)
 
     if debug_caps:
-        sector_breakdown = {}
+        sector_breakdown: Dict[str, float] = {}
         for ticker, weight in combined_raw.items():
             sec = enhanced_sectors.get(ticker, "Other")
-            sector_breakdown[sec] = sector_breakdown.get(sec, 0.0) + weight
-        st.info(f"📊 Pre-caps sectors: {dict(sorted(sector_breakdown.items(), key=lambda x: x[1], reverse=True))}")
+            sector_breakdown[sec] = sector_breakdown.get(sec, 0.0) + float(weight)
+        st.info("📊 Pre-caps sectors: " + str(dict(sorted(sector_breakdown.items(), key=lambda x: x[1], reverse=True))))
 
     # --- Enforce caps on the COMPLETE portfolio ---
     final_weights = enforce_caps_iteratively(
-        combined_raw,
+        combined_raw.astype(float),
         enhanced_sectors,
         name_cap=preset["mom_cap"],
         sector_cap=preset.get("sector_cap", 0.30),
+        group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
         debug=debug_caps
     )
 
@@ -1240,12 +1250,15 @@ def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_ma
 
     # Optional: sanity check (logs only)
     if debug_caps:
-        violations = check_constraint_violations(final_weights, enhanced_sectors, preset["mom_cap"], preset.get("sector_cap", 0.30))
+        violations = check_constraint_violations(
+            final_weights, enhanced_sectors, preset["mom_cap"], preset.get("sector_cap", 0.30)
+        )
         if violations:
             st.warning("⚠️ Post-enforcement violations (unexpected): " + "; ".join(violations))
         else:
             st.success("✅ Post-enforcement: no constraint violations detected.")
 
+    # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
     return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
 def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str], 
