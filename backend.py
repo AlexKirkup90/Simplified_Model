@@ -178,120 +178,106 @@ def validate_and_clean_market_data(prices_df: pd.DataFrame) -> Tuple[pd.DataFram
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
 # =========================
-def enforce_caps_iteratively(weights: pd.Series, sectors_map: Dict[str, str], 
-                            name_cap: float = 0.25, sector_cap: float = 0.30, 
-                            max_iterations: int = 100, debug: bool = False) -> pd.Series:
+def enforce_caps_iteratively(
+    weights: pd.Series,
+    sectors_map: Dict[str, str],
+    name_cap: float = 0.25,
+    sector_cap: float = 0.30,
+    max_iterations: int = 200,
+    debug: bool = False
+) -> pd.Series:
     """
-    NEW FUNCTION: Enforce both name caps and sector caps simultaneously.
-    This fixes the 28.99% position sizing bug by properly handling the interaction
-    between individual name caps and sector-level caps.
+    Enforce name and sector caps simultaneously.
+    Key differences vs. earlier version:
+      • No end-of-function renormalization (preserves caps; unallocated = cash)
+      • No 'give excess to everyone' fallback
+      • Recompute sector sums after each enforcement before redistribution
     """
-    if weights.empty:
-        return weights
-    
+    if weights is None or len(weights) == 0:
+        return pd.Series(dtype=float)
+
     w = weights.copy().astype(float)
     sectors = pd.Series({t: sectors_map.get(t, "Unknown") for t in w.index})
-    
+    unallocated = 0.0  # what we couldn't place due to caps → becomes cash
+
     if debug:
         st.info(f"🔧 Starting caps enforcement: name_cap={name_cap:.1%}, sector_cap={sector_cap:.1%}")
         st.info(f"📊 Initial positions: {dict(w.round(4))}")
-    
-    for iteration in range(max_iterations):
-        initial_w = w.copy()
-        total_excess = 0.0
-        
-        # Step 1: Enforce name caps
-        name_violations = w > name_cap
-        if name_violations.any():
-            name_excess = (w[name_violations] - name_cap).sum()
-            w[name_violations] = name_cap
-            total_excess += name_excess
-            
-        # Step 2: Enforce sector caps
+
+    for it in range(max_iterations):
+        changed = False
+
+        # 1) Enforce NAME caps
+        over_name = w > (name_cap + 1e-12)
+        if over_name.any():
+            excess = float((w[over_name] - name_cap).sum())
+            w[over_name] = name_cap
+            unallocated += excess
+            changed = True
+
+        # 2) Enforce SECTOR caps (using current weights)
         sector_sums = w.groupby(sectors).sum()
-        sector_violations = sector_sums > sector_cap
-        
-        if sector_violations.any():
-            for sector in sector_violations[sector_violations].index:
-                sector_tickers = w.index[sectors == sector]
-                sector_weight = w[sector_tickers].sum()
-                
-                if sector_weight > sector_cap:
-                    scale_factor = sector_cap / sector_weight
-                    sector_excess = sector_weight - sector_cap
-                    w[sector_tickers] *= scale_factor
-                    total_excess += sector_excess
-        
-        # Step 3: Redistribute excess to compliant positions
-        if total_excess > 1e-10:
-            can_accept_more = pd.Series(True, index=w.index)
-            can_accept_more &= (w < name_cap - 1e-10)
-            
-            for sector in sector_sums.index:
-                if sector_sums[sector] >= sector_cap - 1e-10:
-                    can_accept_more &= (sectors != sector)
-            
-            recipients = w.index[can_accept_more]
-            
-            if len(recipients) > 0:
-                available_capacity = pd.Series(0.0, index=recipients)
-                
-                for ticker in recipients:
-                    name_capacity = name_cap - w[ticker]
-                    ticker_sector = sectors[ticker]
-                    sector_used = w[sectors == ticker_sector].sum()
-                    sector_capacity = sector_cap - sector_used
-                    available_capacity[ticker] = min(name_capacity, sector_capacity)
-                
-                available_capacity = available_capacity[available_capacity > 1e-10]
-                
-                if len(available_capacity) > 0:
-                    total_available = available_capacity.sum()
-                    
-                    if total_available >= total_excess:
-                        allocation_weights = available_capacity / total_available
-                        w[available_capacity.index] += allocation_weights * total_excess
-                    else:
-                        w[available_capacity.index] += available_capacity
-                        remainder = total_excess - total_available
-                        w += remainder / len(w)
-                else:
-                    w += total_excess / len(w)
-            else:
-                w += total_excess / len(w)
-        
-        # Check convergence
-        max_change = (w - initial_w).abs().max()
-        if max_change < 1e-10:
-            if debug:
-                st.success(f"✅ Converged after {iteration + 1} iterations")
+        for sec, sec_sum in sector_sums.items():
+            if sec_sum > sector_cap + 1e-12:
+                idx = w.index[sectors == sec]
+                before = float(w.loc[idx].sum())
+                scale = sector_cap / sec_sum if sec_sum > 0 else 1.0
+                w.loc[idx] *= scale
+                after = float(w.loc[idx].sum())
+                unallocated += max(before - after, 0.0)
+                changed = True
+
+        # 3) Try to re-distribute some unallocated to names with capacity
+        if unallocated > 1e-12:
+            # recompute sector sums after enforcement
+            sector_sums = w.groupby(sectors).sum()
+
+            capacity = pd.Series(0.0, index=w.index)
+            for t in w.index:
+                # name capacity
+                c_name = max(0.0, name_cap - w[t])
+                # sector capacity
+                sec = sectors[t]
+                c_sector = max(0.0, sector_cap - sector_sums.get(sec, 0.0))
+                capacity[t] = min(c_name, c_sector)
+
+            capacity = capacity[capacity > 1e-12]
+            if len(capacity) > 0:
+                alloc = min(unallocated, float(capacity.sum()))
+                if alloc > 0:
+                    weights_share = capacity / capacity.sum()
+                    w[capacity.index] += weights_share * alloc
+                    unallocated -= alloc
+                    changed = True
+            # If no capacity, we keep the unallocated as cash (do NOT force it in)
+
+        # Exit if nothing changed and we have no violations we can fix further
+        sector_sums = w.groupby(sectors).sum()
+        name_ok = not (w > name_cap + 1e-9).any()
+        sector_ok = not (sector_sums > sector_cap + 1e-9).any()
+        if (not changed) and (unallocated < 1e-9 or (name_ok and sector_ok)):
             break
-    
-    w = w / w.sum() if w.sum() > 0 else w
-    
-    # Final validation and reporting
+
+    # Final validation (no renormalization)
     if debug:
-        final_violations = []
-        
-        name_violations = w > name_cap + 1e-6
-        if name_violations.any():
-            for ticker in w.index[name_violations]:
-                final_violations.append(f"{ticker}: {w[ticker]:.1%} > {name_cap:.1%} name cap")
-        
-        final_sector_sums = w.groupby(sectors).sum()
-        sector_violations = final_sector_sums > sector_cap + 1e-6
-        if sector_violations.any():
-            for sector in final_sector_sums.index[sector_violations]:
-                sector_weight = final_sector_sums[sector]
-                final_violations.append(f"{sector}: {sector_weight:.1%} > {sector_cap:.1%} sector cap")
-        
-        if final_violations:
-            st.warning("⚠️ Position sizing violations detected:\n" + "\n".join(final_violations))
+        violations = []
+        if (w > name_cap + 1e-6).any():
+            for t in w.index[w > name_cap + 1e-6]:
+                violations.append(f"{t}: {w[t]:.1%} > {name_cap:.1%} name cap")
+        final_sector = w.groupby(sectors).sum()
+        for sec in final_sector.index[final_sector > sector_cap + 1e-6]:
+            violations.append(f"{sec}: {final_sector[sec]:.1%} > {sector_cap:.1%} sector cap")
+
+        if violations:
+            st.warning("⚠️ Position sizing violations detected: " + " • ".join(violations))
         else:
             st.success("✅ All position sizing constraints satisfied")
-        
+
         st.info(f"📊 Final positions: {dict(w.round(4))}")
-    
+        if unallocated > 1e-9:
+            st.info(f"💰 Unallocated (cash): {unallocated:.2%}")
+
+    # Return as-is (may sum to < 1.0 → implicit cash)
     return w
 
 def get_enhanced_sector_map(tickers: List[str]) -> Dict[str, str]:
