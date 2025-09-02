@@ -229,13 +229,13 @@ def enforce_caps_iteratively(
 ) -> pd.Series:
     """
     Enforce name caps, per-sector caps, and optional per-group (hierarchical) caps.
-    - sector_labels: mapping ticker -> label (can be "Software:Security", etc.)
-    - sector_cap: default cap for any sector not explicitly listed in group_caps
-    - group_caps: optional dict like {"Software": 0.30, "Software:Security": 0.18, ...}
-                  Parent groups are labels with no ":" (e.g., "Software").
-    We *do not* force re-distribution; trimmed weight becomes cash (i.e., sum <= 1),
-    which matches your existing preview behavior.
     """
+    if debug:
+        print(f"\n🔍 DEBUG: enforce_caps_iteratively started")
+        print(f"  Input: {len(weights)} positions, sum={weights.sum():.3f}")
+        print(f"  Name cap: {name_cap:.1%}, Sector cap: {sector_cap:.1%}")
+        if group_caps:
+            print(f"  Group caps: {group_caps}")
 
     if weights.empty:
         return weights
@@ -243,7 +243,7 @@ def enforce_caps_iteratively(
     w = weights.astype(float).copy()
     w[w < 0] = 0.0
 
-    # Normalize only if clearly >1 because some callers already pre-normalize
+    # Normalize only if clearly >1 
     if w.sum() > 1.0 + 1e-9:
         w = w / w.sum()
 
@@ -251,8 +251,17 @@ def enforce_caps_iteratively(
     ser_sector = pd.Series({k: sector_labels.get(k, "Unknown") for k in w.index})
     ser_top = ser_sector.map(lambda s: s.split(":")[0])
 
+    if debug:
+        # Show initial sector breakdown
+        sector_sums = w.groupby(ser_sector).sum().sort_values(ascending=False)
+        print(f"\n  Initial sector weights:")
+        for sec, wt in sector_sums.head(5).items():
+            print(f"    {sec}: {wt:.1%}")
+
     def _apply_name_caps(w: pd.Series) -> tuple[pd.Series, bool]:
         over = w[w > name_cap]
+        if debug and not over.empty:
+            print(f"  📌 Name cap violations: {list(over.index)} @ {over.values}")
         if over.empty:
             return w, False
         w.loc[over.index] = name_cap
@@ -264,6 +273,8 @@ def enforce_caps_iteratively(
         for sec, s in sums.items():
             cap = (group_caps.get(sec) if group_caps and sec in group_caps else sector_cap)
             if s > cap + 1e-12:
+                if debug:
+                    print(f"  📊 Sector '{sec}' at {s:.1%} > cap {cap:.1%}, scaling down")
                 f = cap / s
                 idx = ser_sector[ser_sector == sec].index
                 w.loc[idx] = w.loc[idx] * f
@@ -280,13 +291,17 @@ def enforce_caps_iteratively(
         sums = w.groupby(ser_top).sum()
         for parent in parent_labels:
             if parent in sums.index and sums[parent] > group_caps[parent] + 1e-12:
+                if debug:
+                    print(f"  🏢 Parent '{parent}' at {sums[parent]:.1%} > cap {group_caps[parent]:.1%}, scaling down")
                 f = group_caps[parent] / sums[parent]
                 idx = ser_top[ser_top == parent].index
                 w.loc[idx] = w.loc[idx] * f
                 changed = True
         return w, changed
 
-    for _ in range(max_iter):
+    iteration_count = 0
+    for i in range(max_iter):
+        iteration_count = i + 1
         changed_any = False
 
         w, c1 = _apply_name_caps(w)
@@ -297,7 +312,27 @@ def enforce_caps_iteratively(
         if not changed_any:
             break
 
-    # Safety: clip tiny negatives from numerical noise
+    if debug:
+        print(f"\n  ✅ Converged after {iteration_count} iterations")
+        print(f"  Final sum: {w.sum():.3f}")
+        
+        # Final verification
+        final_sector_sums = w.groupby(ser_sector).sum().sort_values(ascending=False)
+        print(f"\n  Final sector weights:")
+        for sec, wt in final_sector_sums.head(5).items():
+            cap = group_caps.get(sec, sector_cap) if group_caps else sector_cap
+            status = "✓" if wt <= cap + 0.001 else "✗"
+            print(f"    {status} {sec}: {wt:.1%} (cap: {cap:.1%})")
+        
+        # Check for any remaining violations
+        violations = []
+        for ticker, weight in w.items():
+            if weight > name_cap + 0.001:
+                violations.append(f"{ticker}: {weight:.1%}")
+        if violations:
+            print(f"\n  ⚠️ Name cap violations remain: {violations}")
+
+    # Safety: clip tiny negatives
     w[w < 0] = 0.0
     return w
 
