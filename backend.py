@@ -1101,12 +1101,11 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
 # =========================
 # Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - MODIFIED
 # =========================
-st.error(f"DEBUG: Function called with {len(daily_close.columns)} stocks")
 def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
-    """
-    FIXED VERSION: Apply position sizing to final combined portfolio
-    This prevents the mathematical impossibility of capping incomplete portfolios
-    """
+    """FIXED VERSION: Apply position sizing to final combined portfolio"""
+    
+    st.error(f"DEBUG: Function called with {len(daily_close.columns)} stocks")  # <-- HERE
+    
     monthly = daily_close.resample("ME").last()
 
     # --- Momentum Component (NO CAPS YET) ---
