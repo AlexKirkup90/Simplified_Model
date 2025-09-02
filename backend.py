@@ -446,6 +446,21 @@ def get_drawdown_adjusted_exposure(current_returns: pd.Series, max_dd_threshold:
     
     return 1.0
 
+def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
+                                   max_dd_threshold: float = 0.15) -> pd.Series:
+    """
+    Walk-forward scaling: for each month, compute drawdown of history up to the
+    previous month and scale that month’s return by an exposure derived from it.
+    """
+    r = pd.Series(monthly_returns).copy().fillna(0.0)
+    out = []
+    hist = pd.Series(dtype=float)
+    for dt, val in r.items():
+        exp = get_drawdown_adjusted_exposure(hist, max_dd_threshold=max_dd_threshold) if len(hist) else 1.0
+        out.append((dt, val * exp))
+        hist = pd.concat([hist, pd.Series([val], index=[dt])])
+    return pd.Series(dict(out)).reindex(r.index)
+
 # =========================
 # NEW: Portfolio Correlation Monitoring
 # =========================
@@ -960,67 +975,130 @@ def momentum_stable_names(daily: pd.DataFrame, top_n: int, days: int) -> List[st
 # =========================
 # Sleeves (composite momentum + MR) with turnover (Enhanced)
 # =========================
-def run_momentum_composite_param(daily: pd.DataFrame, sectors_map: dict,
-                                 top_n=8, name_cap=0.25, sector_cap=0.30, stickiness_days=7,
-                                 use_enhanced_features=True):
-    """Enhanced momentum composite with volatility-adjusted caps and regime awareness"""
+def run_momentum_composite_param(
+    daily: pd.DataFrame,
+    sectors_map: dict,
+    top_n: int = 8,
+    name_cap: float = 0.25,
+    sector_cap: float = 0.30,
+    stickiness_days: int = 7,
+    use_enhanced_features: bool = True,
+):
+    """Enhanced momentum sleeve with stickiness, volatility-aware name caps, and
+    simultaneous sector+name enforcement using the enhanced taxonomy."""
+
+    # Optional verbose logging toggle from UI
+    debug_caps = bool(st.session_state.get("debug_caps", False))
+
     monthly = daily.resample("ME").last()
-    fwd = monthly.pct_change().shift(-1)
+    fwd = monthly.pct_change().shift(-1)  # next-month returns
     rets = pd.Series(index=monthly.index, dtype=float)
     tno  = pd.Series(index=monthly.index, dtype=float)
     prev_w = pd.Series(dtype=float)
-    
+
     for m in monthly.index:
+        # Use data up to month m
         hist = daily.loc[:m]
+
+        # Composite momentum score (higher is better)
         comp = composite_score(hist)
-        if comp.empty: 
-            rets.loc[m]=0.0; tno.loc[m]=0.0; continue
-            
+        if comp.empty:
+            rets.loc[m] = 0.0
+            tno.loc[m]  = 0.0
+            continue
+
+        # Restrict to positive blended momentum universe
         momz = blended_momentum_z(hist.resample("ME").last())
-        comp = comp[momz.index]
+        comp = comp[momz.index]  # align
         sel  = comp[momz > 0].dropna()
-        if sel.empty: 
-            rets.loc[m]=0.0; tno.loc[m]=0.0; continue
-            
+        if sel.empty:
+            rets.loc[m] = 0.0
+            tno.loc[m]  = 0.0
+            continue
+
+        # Pick top-N
         picks = sel.nlargest(top_n)
-        
-        # Apply signal decay if enabled
+
+        # Signal decay (optional)
         if use_enhanced_features:
-            days_since_signal = 0  # Could be enhanced to track actual signal age
+            days_since_signal = 0  # placeholder; wire up when tracking signal ages
             picks = apply_signal_decay(picks, days_since_signal)
-        
-        # Stickiness filter
+
+        # Stickiness filter (require names to persist in the top cohort)
         stable = momentum_stable_names(hist, top_n=top_n, days=stickiness_days)
-        if len(stable)>0:
-            picks = picks.reindex([t for t in picks.index if t in stable]).dropna()
-            if picks.empty: 
+        if len(stable) > 0:
+            filtered = picks.reindex([t for t in picks.index if t in stable]).dropna()
+            if not filtered.empty:
+                picks = filtered
+            else:
+                # if stickiness removes all, fall back to original top-N for continuity
                 picks = sel.nlargest(top_n)
-        
+
+        # Raw equalized by score
+        if picks.sum() == 0 or picks.empty:
+            rets.loc[m] = 0.0
+            tno.loc[m]  = 0.0
+            prev_w = pd.Series(dtype=float)
+            continue
+
         raw = (picks / picks.sum()).astype(float)
-        
-        # Enhanced position sizing with volatility adjustment
+
+        # Optionally shape raw weights by volatility-aware name caps (soft)
         if use_enhanced_features:
             vol_caps = get_volatility_adjusted_caps(raw, hist, base_cap=name_cap)
             raw = cap_weights(raw, cap=name_cap, vol_adjusted_caps=vol_caps)
         else:
             raw = cap_weights(raw, cap=name_cap)
-            
-        w = apply_sector_caps(raw, sectors_map, cap=sector_cap)
-        
-        # Apply regime-based exposure adjustment
-        if use_enhanced_features:
+
+        # Enforce name + sector caps together using enhanced taxonomy (hard)
+        enhanced_sectors = get_enhanced_sector_map(list(raw.index))
+        # fallback to provided sectors_map where enhanced taxonomy doesn't have an entry
+        for t in raw.index:
+            if t not in enhanced_sectors:
+                enhanced_sectors[t] = sectors_map.get(t, "Other")
+
+        w = enforce_caps_iteratively(
+            raw,
+            enhanced_sectors,
+            name_cap=name_cap,
+            sector_cap=sector_cap,
+            debug=debug_caps
+        )
+
+        # Regime-based exposure scaling (keeps weights un-normalized to reflect exposure)
+        if use_enhanced_features and len(hist) > 0 and len(w) > 0:
             try:
                 regime_metrics = compute_regime_metrics(hist)
                 regime_exposure = get_regime_adjusted_exposure(regime_metrics)
                 w = w * regime_exposure
-            except:
-                pass  # Fall back to original weights if regime calc fails
-        
+            except Exception:
+                pass  # if regime metrics fail, keep w as-is
+
+        # If no valid weights, zero this month and continue
+        if w is None or len(w) == 0 or np.isclose(w.sum(), 0.0):
+            rets.loc[m] = 0.0
+            tno.loc[m]  = 0.0
+            prev_w = pd.Series(dtype=float)
+            continue
+
+        # Compute next-month return for these weights
         valid = [t for t in w.index if t in fwd.columns]
-        rets.loc[m] = float((fwd.loc[m, valid] * w.reindex(valid)).sum())
-        tno.loc[m]  = 0.5 * float((w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0)).abs().sum())
+        if len(valid) == 0 or m not in fwd.index:
+            rets.loc[m] = 0.0
+            tno.loc[m]  = 0.0
+            prev_w = w
+            continue
+
+        rets.loc[m] = float((fwd.loc[m, valid] * w.reindex(valid).fillna(0.0)).sum())
+
+        # Turnover: 0.5 * L1 distance between this and previous month weights
+        tno.loc[m] = 0.5 * float(
+            (w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0))
+            .abs()
+            .sum()
+        )
         prev_w = w
-        
+
     return rets.fillna(0.0), tno.fillna(0.0)
 
 def run_backtest_mean_reversion(daily_prices: pd.DataFrame,
@@ -1300,7 +1378,6 @@ def generate_live_portfolio_isa_monthly(
     disp, raw = _format_display(new_w)
     return disp, raw, decision
 
-
 def run_backtest_isa_dynamic(
     roundtrip_bps: float = 0.0,
     min_dollar_volume: float = 0.0,
@@ -1354,16 +1431,19 @@ def run_backtest_isa_dynamic(
         stickiness_days=stickiness_days,
         use_enhanced_features=use_enhanced_features
     )
-    mr_rets,  mr_tno  = run_backtest_mean_reversion(daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200)
+    mr_rets, mr_tno = run_backtest_mean_reversion(
+        daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200
+    )
 
     # Combine + costs
-    hybrid_gross, hybrid_tno = combine_hybrid(mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight)
-    
-    # Apply drawdown-based exposure adjustment
+    hybrid_gross, hybrid_tno = combine_hybrid(
+        mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight
+    )
+
+    # Apply drawdown-based exposure adjustment (walk-forward)
     if use_enhanced_features:
-        dd_exposure = get_drawdown_adjusted_exposure(hybrid_gross)
-        hybrid_gross = hybrid_gross * dd_exposure
-    
+        hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
+
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     # Cum curves
