@@ -197,13 +197,20 @@ with tab1:
 # ---------------------------
 with tab2:
     st.subheader("✅ Current Portfolio (Monthly-Locked)")
+
+    # detect whether today is the rebalance day (use your existing flag if you have one)
+    is_rebalance_day = bool(
+        st.session_state.get("is_rebalance_day",
+            st.session_state.get("is_monthly_rebalance_day", False))
+    )
+
     if live_disp is None or live_disp.empty:
         st.warning(decision if isinstance(decision, str) else "—")
     else:
-        # Enhanced decision display with regime context
+        # Decision banner
         st.info(decision)
 
-        # Show enhancement status
+        # Feature badge
         if use_enhanced_features:
             st.success("🔬 Enhanced features active: Volatility-adjusted caps, regime awareness, signal decay")
         else:
@@ -211,77 +218,70 @@ with tab2:
 
         st.dataframe(live_disp, use_container_width=True)
 
-        # === Sector totals (post-caps) ===
-        try:
-            if live_raw is not None and not live_raw.empty:
-                weights = live_raw["Weight"].astype(float)
-                enhanced_sectors = backend.get_enhanced_sector_map(list(weights.index))
-                sec = pd.Series({t: enhanced_sectors.get(t, "Other") for t in weights.index})
-                sector_totals = weights.groupby(sec).sum().sort_values(ascending=False)
+    # ----- Sector totals for the currently held portfolio (no caps if off-day) -----
+    try:
+        weights = live_raw["Weight"].astype(float)
+        enhanced_sectors = backend.get_enhanced_sector_map(list(weights.index))
+        sec = pd.Series({t: enhanced_sectors.get(t, "Other") for t in weights.index})
+        sector_totals = weights.groupby(sec).sum().sort_values(ascending=False)
 
-                st.markdown("**Sector totals (post-caps):**")
-                st.dataframe(
-                    pd.DataFrame({"Weight": sector_totals}).assign(
-                        Weight=lambda s: s["Weight"].map(lambda x: f"{x:.2%}")
-                    ),
-                    use_container_width=True
-                )
+        label = "Sector totals (post-caps)" if is_rebalance_day else "Sector totals (current holdings)"
+        st.markdown(f"**{label}:**")
+        st.dataframe(sector_totals.map(lambda x: f\"{x:.2%}\"), use_container_width=True)
+    except Exception:
+        pass
 
-                # Optional quick sanity check against caps
-                name_cap = st.session_state.get("name_cap", 0.25)
-                sector_cap = st.session_state.get("sector_cap", 0.30)
-                max_name = float(weights.max()) if len(weights) else 0.0
-                max_sector = float(sector_totals.max()) if len(sector_totals) else 0.0
-                st.caption(
-                    f"Max name: {max_name:.2%} (cap {name_cap:.0%}) • "
-                    f"Max sector: {max_sector:.2%} (cap {sector_cap:.0%})"
-                )
-        except Exception as e:
-            st.info(f"Couldn’t render sector totals: {e}")
-    
-        # Enhanced bar chart with more details
-        try:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-            live_sorted = live_raw.sort_values("Weight", ascending=False)
-            
-            # Weight distribution
-            bars = ax1.bar(live_sorted.index, live_sorted["Weight"].values)
-            ax1.set_ylabel("Weight")
-            ax1.set_title("Portfolio Weights")
-            ax1.tick_params(axis='x', rotation=45)
-            
-            # Add cap line
-            ax1.axhline(y=name_cap, color='red', linestyle='--', alpha=0.7, label=f'Name Cap ({name_cap:.0%})')
-            ax1.legend()
-            
-            # Position concentration
-            cumsum = live_sorted["Weight"].cumsum()
-            ax2.plot(range(1, len(cumsum) + 1), cumsum.values, marker='o')
-            ax2.set_xlabel("Number of Positions")
-            ax2.set_ylabel("Cumulative Weight")
-            ax2.set_title("Position Concentration")
-            ax2.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            st.pyplot(fig)
-        except Exception:
-            pass
-
-        # Enhanced save with snapshot recording
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Save this portfolio for next month"):
-                backend.save_portfolio_to_gist(live_raw)
-                st.success("Saved to Gist.")
-        
-        with col2:
-            if st.button("📸 Record live snapshot"):
-                result = backend.record_live_snapshot(live_raw, note="Manual snapshot")
-                if result.get("ok"):
-                    st.success(f"✅ Snapshot recorded! Strategy: {result['strat_ret']:.2%}, QQQ: {result['qqq_ret']:.2%}")
+    # ----- Preview: apply name/sector caps to today's holdings WITHOUT trading -----
+    with st.expander("🔍 Preview today (apply caps now) — no trade, just a look"):
+        preview_now = st.checkbox("Apply caps to carried weights (preview only)")
+        if preview_now:
+            try:
+                # equity-only weights (ignore any implicit cash)
+                w_eq = weights[weights > 0].copy()
+                eq_total = float(w_eq.sum())
+                if eq_total <= 0:
+                    st.warning("No equity positions to preview.")
                 else:
-                    st.error(f"❌ Snapshot failed: {result.get('msg', 'Unknown error')}")
+                    # normalize equities to 100%, apply caps, then scale back to current equity total
+                    w_norm = (w_eq / eq_total).astype(float)
 
+                    # read caps (fallbacks 25%/30%)
+                    name_cap   = float(st.session_state.get("name_cap", 0.25))
+                    sector_cap = float(st.session_state.get("sector_cap", 0.30))
+
+                    enh_map = backend.get_enhanced_sector_map(list(w_norm.index))
+                    w_capped_norm = backend.enforce_caps_iteratively(
+                        w_norm, enh_map, name_cap=name_cap, sector_cap=sector_cap, debug=False
+                    )
+                    w_capped = (w_capped_norm * eq_total).rename("Preview")
+
+                    # assemble comparison
+                    current = w_eq.rename("Current")
+                    both = pd.concat([current, w_capped], axis=1).fillna(0.0)
+                    both["Δ (pp)"] = (both["Preview"] - both["Current"]) * 100
+
+                    st.markdown("**Current vs Preview (caps now, no trade):**")
+                    st.dataframe(
+                        both.sort_values("Preview", ascending=False).applymap(
+                            lambda x: f"{x:.2%}" if isinstance(x, (int, float)) and x <= 1 and x >= -1 else (f"{x:.2f}" if isinstance(x, (int, float)) else x)
+                        ),
+                        use_container_width=True
+                    )
+
+                    # sector totals for the preview
+                    sec_preview = pd.Series({t: enh_map.get(t, "Other") for t in w_capped.index})
+                    sector_totals_preview = w_capped.groupby(sec_preview).sum().sort_values(ascending=False)
+
+                    st.markdown("**Sector totals (preview with caps):**")
+                    st.dataframe(sector_totals_preview.map(lambda x: f"{x:.2%}"), use_container_width=True)
+
+                    # little hint
+                    st.caption(
+                        "Preview holds cash constant and redistributes **equities only** under name/sector caps."
+                    )
+            except Exception as e:
+                st.warning(f"Preview failed: {e}")
+                
 # ---------------------------
 # Tab 3: Enhanced Performance
 # ---------------------------
