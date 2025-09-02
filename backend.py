@@ -403,6 +403,34 @@ def build_group_caps(enhanced_map: dict[str, str]) -> dict[str, float]:
     for sb in present:
         caps[sb] = min(SOFTWARE_SUBCAP, PARENT_SOFTWARE_CAP)
     return caps
+    
+def diagnose_sector_classification(tickers: List[str], base_sectors: Dict[str, str]) -> None:
+    """Diagnostic function to show how sectors are being classified"""
+    enhanced = get_enhanced_sector_map(tickers, base_sectors)
+    
+    df_data = []
+    for ticker in tickers:
+        df_data.append({
+            "Ticker": ticker,
+            "Base Sector": base_sectors.get(ticker, "Unknown"),
+            "Enhanced Sector": enhanced.get(ticker, "Unknown"),
+            "Is Software": enhanced.get(ticker, "").startswith("Software:")
+        })
+    
+    df = pd.DataFrame(df_data)
+    
+    # Show summary
+    st.info(f"Sector Classification Diagnostic:")
+    st.dataframe(df[df["Is Software"]])
+    
+    # Count by enhanced sector
+    sector_counts = df["Enhanced Sector"].value_counts()
+    st.info("Enhanced Sector Distribution:")
+    st.dataframe(sector_counts)
+    
+    # Total software weight
+    software_count = df["Is Software"].sum()
+    st.info(f"Total Software-classified stocks: {software_count}/{len(tickers)}")
 
 # =========================
 # NEW: Volatility-Adjusted Position Sizing
@@ -1057,7 +1085,7 @@ def run_momentum_composite_param(
     for m in monthly.index:
         hist = daily.loc[:m]
 
-        # Composite momentum score -> 1-D vector for the current month
+        # Composite momentum score
         comp_all = composite_score(hist)
         if isinstance(comp_all, pd.DataFrame):
             comp = comp_all.iloc[-1].dropna()
@@ -1085,19 +1113,19 @@ def run_momentum_composite_param(
 
         # Optional: signal decay shaping
         if use_enhanced_features:
-            days_since_signal = 0  # TODO: wire up true signal age if you track it
+            days_since_signal = 0
             picks = apply_signal_decay(picks, days_since_signal)
 
-        # Stickiness filter (prefer persistent names)
+        # Stickiness filter
         stable = set(momentum_stable_names(hist, top_n=top_n, days=stickiness_days))
         if stable:
             filtered = picks.reindex([t for t in picks.index if t in stable]).dropna()
             if not filtered.empty:
                 picks = filtered
             else:
-                picks = sel.nlargest(top_n)  # fallback if stickiness empties set
+                picks = sel.nlargest(top_n)
 
-        # Raw weights ~ proportional to scores
+        # Raw weights
         if picks.empty or np.isclose(picks.sum(), 0.0):
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
@@ -1113,25 +1141,24 @@ def run_momentum_composite_param(
         else:
             raw = cap_weights(raw, cap=name_cap)
 
-        # Enhanced taxonomy + hierarchical group caps (e.g., Software parent + sub-buckets)
+        # USE ENHANCED SECTOR MAP HERE TOO!
         enhanced_sectors = get_enhanced_sector_map(list(raw.index), base_map=sectors_map)
-        # Ensure any missing tickers fall back to provided base map
         for t in raw.index:
             if t not in enhanced_sectors:
                 enhanced_sectors[t] = sectors_map.get(t, "Other")
         group_caps = build_group_caps(enhanced_sectors)
 
-        # Hard enforcement of name + sector (and group) caps
+        # Hard enforcement with enhanced sectors
         w = enforce_caps_iteratively(
             raw.astype(float),
-            enhanced_sectors,
+            enhanced_sectors,  # <-- Use enhanced, not base
             name_cap=name_cap,
             sector_cap=sector_cap,
             group_caps=group_caps,
-            debug=debug_caps,
+            debug=False,  # Don't debug in backtest loop
         )
 
-        # Regime-based exposure scaling (keeps exposure < 1 when risk-off)
+        # Regime-based exposure scaling
         if use_enhanced_features and len(hist) > 0 and len(w) > 0:
             try:
                 regime_metrics  = compute_regime_metrics(hist)
@@ -1146,11 +1173,11 @@ def run_momentum_composite_param(
             prev_w = pd.Series(dtype=float)
             continue
 
-        # Next-month return with these weights
+        # Next-month return
         valid = [t for t in w.index if t in fwd.columns]
         rets.loc[m] = float((fwd.loc[m, valid] * w.reindex(valid).fillna(0.0)).sum())
 
-        # Turnover (0.5 * L1 distance)
+        # Turnover
         tno.loc[m] = 0.5 * float(
             (w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0)).abs().sum()
         )
