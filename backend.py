@@ -1180,16 +1180,19 @@ def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_ma
     violations = check_constraint_violations(final_weights, enhanced_sectors, 
                                            preset["mom_cap"], preset.get("sector_cap", 0.30))
     
-    if violations:
-        st.warning(f"⚠️ Unresolvable constraint violations detected. Implementing cash fallback.")
-        
-        # Scale down entire portfolio to make room for cash
-        cash_allocation = 0.30  # Force 30% cash when constraints can't be satisfied
-        equity_target = 1.0 - cash_allocation
-        
-        final_weights = final_weights * equity_target
-        
-        st.info(f"💰 Final allocation: {equity_target:.1%} equity, {cash_allocation:.1%} cash")
+   if violations:
+    st.warning("⚠️ Unresolvable constraint violations detected. Implementing cash fallback.")
+    cash_allocation = 0.30
+    equity_target   = 1.0 - cash_allocation
+
+    # Scale equity down to target and explicitly add a CASH line
+    final_weights = final_weights * equity_target
+    final_weights.loc["CASH"] = cash_allocation
+
+# IMPORTANT: Do NOT renormalize away the cash line.
+total = final_weights.sum()
+
+return final_weights if abs(total - 1.0) < 1e-9 else (final_weights / total)
     
     return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
@@ -1281,10 +1284,11 @@ def generate_live_portfolio_isa_monthly(
         else:
             decision = "No saved portfolio; proposing initial allocation (monthly lock applies from next month)."
 
-    # Build candidate weights (enhanced)
+    # Build candidate weights (enhanced) – keep UI overrides!
     params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
-    params["stability_days"] = stickiness_days
-    params["sector_cap"]     = sector_cap
+    params["stability_days"] = int(stickiness_days)
+    params["sector_cap"]     = float(sector_cap)
+    params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
 
     new_w = _build_isa_weights_fixed(close, params, sectors_map)
 
