@@ -202,15 +202,43 @@ with tab2:
     else:
         # Enhanced decision display with regime context
         st.info(decision)
-        
+
         # Show enhancement status
         if use_enhanced_features:
             st.success("🔬 Enhanced features active: Volatility-adjusted caps, regime awareness, signal decay")
         else:
             st.info("📊 Using standard features only")
-        
+
         st.dataframe(live_disp, use_container_width=True)
 
+        # === Sector totals (post-caps) ===
+        try:
+            if live_raw is not None and not live_raw.empty:
+                weights = live_raw["Weight"].astype(float)
+                enhanced_sectors = backend.get_enhanced_sector_map(list(weights.index))
+                sec = pd.Series({t: enhanced_sectors.get(t, "Other") for t in weights.index})
+                sector_totals = weights.groupby(sec).sum().sort_values(ascending=False)
+
+                st.markdown("**Sector totals (post-caps):**")
+                st.dataframe(
+                    pd.DataFrame({"Weight": sector_totals}).assign(
+                        Weight=lambda s: s["Weight"].map(lambda x: f"{x:.2%}")
+                    ),
+                    use_container_width=True
+                )
+
+                # Optional quick sanity check against caps
+                name_cap = st.session_state.get("name_cap", 0.25)
+                sector_cap = st.session_state.get("sector_cap", 0.30)
+                max_name = float(weights.max()) if len(weights) else 0.0
+                max_sector = float(sector_totals.max()) if len(sector_totals) else 0.0
+                st.caption(
+                    f"Max name: {max_name:.2%} (cap {name_cap:.0%}) • "
+                    f"Max sector: {max_sector:.2%} (cap {sector_cap:.0%})"
+                )
+        except Exception as e:
+            st.info(f"Couldn’t render sector totals: {e}")
+    
         # Enhanced bar chart with more details
         try:
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
