@@ -1100,72 +1100,120 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
 # =========================
 # Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - MODIFIED
 # =========================
-def _build_isa_weights(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
-    """MODIFIED: Uses the new enhanced position sizing to fix the 28.99% bug"""
+def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
+    """
+    FIXED VERSION: Apply position sizing to final combined portfolio
+    This prevents the mathematical impossibility of capping incomplete portfolios
+    """
     monthly = daily_close.resample("ME").last()
 
-    # --- Composite momentum (ticker vector at latest date) ---
+    # --- Momentum Component (NO CAPS YET) ---
     comp_all = composite_score(daily_close)
     if isinstance(comp_all, pd.DataFrame):
         comp_vec = comp_all.iloc[-1].dropna()
     else:
         comp_vec = pd.Series(comp_all).dropna()
 
-    # --- Long-term blended momentum z-score (month-end) ---
-    momz = blended_momentum_z(monthly)  # Series indexed by ticker
+    momz = blended_momentum_z(monthly)
     pos_idx = momz[momz > 0].index
-
-    # Filter composite by positive momentum universe
     comp_vec = comp_vec.reindex(pos_idx).dropna()
     top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
 
-    # --- Stability (stickiness) filter on entries ---
+    # Stickiness filter
     stable_names = set(momentum_stable_names(
         daily_close, top_n=preset["mom_topn"], days=preset.get("stability_days", 7)
     ))
     if stable_names and not top_m.empty:
         filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
         if not filtered.empty:
-            top_m = filtered  # only replace if something remains
+            top_m = filtered
 
-    # --- FIXED: Weights for momentum sleeve using enhanced position sizing ---
+    # Raw momentum weights (NO CAPS - just relative scoring)
     if not top_m.empty and top_m.sum() > 0:
         mom_raw = (top_m / top_m.sum()) * preset["mom_w"]
-        
-        # Use enhanced sector mapping and fixed caps
-        enhanced_sectors = get_enhanced_sector_map(list(daily_close.columns))
-        mom_w = enforce_caps_iteratively(
-            mom_raw,
-            enhanced_sectors,
-            name_cap=preset["mom_cap"],
-            sector_cap=preset.get("sector_cap", 0.30),
-            debug=True  # Set to False to reduce output
-        )
     else:
-        mom_w = pd.Series(dtype=float)
+        mom_raw = pd.Series(dtype=float)
 
-    # --- Mean-Reversion sleeve (quality + worst ST) ---
+    # --- Mean Reversion Component (NO CAPS YET) ---
     st_ret = daily_close.pct_change(preset["mr_lb"]).iloc[-1]
     long_ma = daily_close.rolling(preset["mr_ma"]).mean().iloc[-1]
     quality = (daily_close.iloc[-1] > long_ma)
     pool = [t for t, ok in quality.items() if ok]
     mr_scores = st_ret.reindex(pool).dropna()
     dips = mr_scores.nsmallest(preset["mr_topn"])
-    mr_w = (pd.Series(1 / len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
+    mr_raw = (pd.Series(1 / len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
 
-    # --- Combine sleeves & normalize ---
-    new_w = mom_w.add(mr_w, fill_value=0.0)
+    # --- Combine Components BEFORE Applying Caps ---
+    combined_raw = mom_raw.add(mr_raw, fill_value=0.0)
     
-    # Apply regime-based exposure adjustment (optional)
-    try:
-        regime_metrics = compute_regime_metrics(daily_close)
-        regime_exposure = get_regime_adjusted_exposure(regime_metrics)
-        new_w = new_w * regime_exposure
-    except:
-        pass  # Fall back to original weights if regime calc fails
+    if combined_raw.empty or combined_raw.sum() <= 0:
+        return combined_raw
     
-    return new_w / new_w.sum() if new_w.sum() > 0 else new_w
+    st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
+    
+    # --- NOW Apply Position Sizing to Complete Portfolio ---
+    enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index))
+    
+    # Show sector breakdown before caps
+    sector_breakdown = {}
+    for ticker, weight in combined_raw.items():
+        sector = enhanced_sectors.get(ticker, "Other")
+        sector_breakdown[sector] = sector_breakdown.get(sector, 0) + weight
+    
+    st.info(f"📊 Pre-caps sectors: {dict(sorted(sector_breakdown.items(), key=lambda x: x[1], reverse=True))}")
+    
+    final_weights = enforce_caps_iteratively(
+        combined_raw,
+        enhanced_sectors,
+        name_cap=preset["mom_cap"],
+        sector_cap=preset.get("sector_cap", 0.30),
+        debug=True
+    )
+    
+    # If position sizing fails completely, implement cash fallback
+    if final_weights.empty or final_weights.sum() <= 0:
+        st.warning("⚠️ Position sizing failed - no valid portfolio found")
+        return pd.Series(dtype=float)
+    
+    # Check for remaining violations - if any exist, force cash allocation
+    violations = check_constraint_violations(final_weights, enhanced_sectors, 
+                                           preset["mom_cap"], preset.get("sector_cap", 0.30))
+    
+    if violations:
+        st.warning(f"⚠️ Unresolvable constraint violations detected. Implementing cash fallback.")
+        
+        # Scale down entire portfolio to make room for cash
+        cash_allocation = 0.30  # Force 30% cash when constraints can't be satisfied
+        equity_target = 1.0 - cash_allocation
+        
+        final_weights = final_weights * equity_target
+        
+        st.info(f"💰 Final allocation: {equity_target:.1%} equity, {cash_allocation:.1%} cash")
+    
+    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
+def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str], 
+                              name_cap: float, sector_cap: float) -> List[str]:
+    """
+    Check for constraint violations in final portfolio
+    Returns list of violation descriptions
+    """
+    violations = []
+    
+    # Check name caps
+    for ticker, weight in weights.items():
+        if weight > name_cap + 0.01:  # 1% tolerance
+            violations.append(f"{ticker}: {weight:.1%} > {name_cap:.1%}")
+    
+    # Check sector caps
+    sectors = pd.Series({t: sectors_map.get(t, "Unknown") for t in weights.index})
+    sector_sums = weights.groupby(sectors).sum()
+    
+    for sector, total_weight in sector_sums.items():
+        if total_weight > sector_cap + 0.01:  # 1% tolerance
+            violations.append(f"{sector}: {total_weight:.1%} > {sector_cap:.1%}")
+    
+    return violations
 
 def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
     display_df = pd.DataFrame({"Weight": weights}).sort_values("Weight", ascending=False)
@@ -1237,7 +1285,7 @@ def generate_live_portfolio_isa_monthly(
     params["stability_days"] = stickiness_days
     params["sector_cap"]     = sector_cap
 
-    new_w = _build_isa_weights(close, params, sectors_map)
+    new_w = _build_isa_weights_fixed(close, params, sectors_map)
 
     # Trigger vs previous portfolio (health of current)
     if prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
