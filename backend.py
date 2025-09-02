@@ -1671,7 +1671,82 @@ def generate_live_portfolio_isa_monthly(
 
     disp, raw = _format_display(new_w)
     return disp, raw, decision
-    
+
+def run_backtest_isa_dynamic(
+    roundtrip_bps: float = 0.0,
+    min_dollar_volume: float = 0.0,
+    show_net: bool = True,
+    start_date: str = "2017-07-01",
+    end_date: Optional[str] = None,
+    universe_choice: Optional[str] = "Hybrid Top150",
+    top_n: int = 8,
+    name_cap: float = 0.25,
+    sector_cap: float = 0.30,
+    stickiness_days: int = 7,
+    mr_topn: int = 3,
+    mom_weight: float = 0.85,
+    mr_weight: float = 0.15,
+    use_enhanced_features: bool = True,
+) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+    """
+    Enhanced ISA-Dynamic hybrid backtest with new features
+    """
+    if end_date is None:
+        end_date = datetime.today().strftime("%Y-%m-%d")
+
+    # Universe & data (helper)
+    close, vol, sectors_map, label = _prepare_universe_for_backtest(universe_choice, start_date, end_date)
+    if close.empty or "QQQ" not in close.columns:
+        return None, None, None, None
+
+    # Liquidity floor (optional)
+    if min_dollar_volume > 0:
+        keep = filter_by_liquidity(
+            close.drop(columns=["QQQ"], errors="ignore"),
+            vol.drop(columns=["QQQ"], errors="ignore"),
+            min_dollar_volume
+        )
+        keep_cols = [c for c in keep if c in close.columns]
+        if not keep_cols:
+            return None, None, None, None
+        close = close[keep_cols + ["QQQ"]]
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep_cols}
+
+    daily = close.drop(columns=["QQQ"])
+    qqq  = close["QQQ"]
+
+    # Sleeves (enhanced)
+    mom_rets, mom_tno = run_momentum_composite_param(
+        daily,
+        sectors_map,
+        top_n=top_n,
+        name_cap=name_cap,
+        sector_cap=sector_cap,
+        stickiness_days=stickiness_days,
+        use_enhanced_features=use_enhanced_features
+    )
+    mr_rets, mr_tno = run_backtest_mean_reversion(
+        daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200
+    )
+
+    # Combine + costs
+    hybrid_gross, hybrid_tno = combine_hybrid(
+        mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight
+    )
+
+    # Apply drawdown-based exposure adjustment (walk-forward)
+    if use_enhanced_features:
+        hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
+
+    hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
+
+    # Cum curves
+    strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
+    strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
+    qqq_cum = (1 + qqq.resample("ME").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
+
+    return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
+
 # =========================
 # Diff engine (for Plan tab) - Unchanged
 # =========================
