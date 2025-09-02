@@ -43,6 +43,9 @@ use_enhanced_features = st.sidebar.checkbox(
     help="Enables volatility-adjusted caps, regime awareness, and signal decay"
 )
 
+debug_caps = st.sidebar.checkbox("Show sector-cap debug", value=False)
+st.session_state["debug_caps"] = debug_caps
+
 # Stickiness & sector cap (overrides)
 stickiness_days = st.sidebar.slider(
     "Stickiness (days in top cohort)",
