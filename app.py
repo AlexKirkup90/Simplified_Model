@@ -227,7 +227,7 @@ with tab2:
 
         label = "Sector totals (post-caps)" if is_rebalance_day else "Sector totals (current holdings)"
         st.markdown(f"**{label}:**")
-        st.dataframe(sector_totals.map(lambda x: f\"{x:.2%}\"), use_container_width=True)
+        st.dataframe(sector_totals_preview.map(lambda x: f"{x:.2%}"), use_container_width=True)
     except Exception:
         pass
 
