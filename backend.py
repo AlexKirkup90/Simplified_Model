@@ -1524,11 +1524,11 @@ def _build_isa_weights_fixed(
     )
 
     if final_weights.sum() > 0 and final_weights.sum() < 0.95:  # If significantly underinvested
-    if debug_caps:
-        st.warning(f"⚠️ Weights sum to {final_weights.sum():.1%}, renormalizing to stay fully invested")
-    return final_weights / final_weights.sum()
-else:
-    return final_weights
+        if debug_caps:
+            st.warning(f"⚠️ Weights sum to {final_weights.sum():.1%}, renormalizing to stay fully invested")
+        return final_weights / final_weights.sum()
+    else:
+        return final_weights
 
     # Sanity check
     if debug_caps:
