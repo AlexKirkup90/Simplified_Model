@@ -179,6 +179,40 @@ def validate_and_clean_market_data(prices_df: pd.DataFrame) -> Tuple[pd.DataFram
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
 # =========================
 
+def generate_td1_targets_asof(
+    daily_close: pd.DataFrame,
+    sectors_map: dict,
+    preset: dict,
+    asof: Optional[pd.Timestamp] = None,
+    use_enhanced_features: bool = True,
+) -> pd.Series:
+    """
+    Build targets exactly as on Trading Day 1:
+    - Freeze signals at the most recent month-end prior to `asof`
+    - Run the same screens, ranking, caps, and (if used) exposure scaling
+    """
+    asof = pd.Timestamp(asof or pd.Timestamp.today()).normalize()
+    last_eom = (asof - pd.offsets.MonthBegin(1)) + pd.offsets.MonthEnd(0)
+
+    # Use *only* data available at last_eom
+    hist = daily_close.loc[:last_eom].copy()
+    if hist.empty:
+        return pd.Series(dtype=float)
+
+    # Your existing (fixed) builder runs full selection + caps
+    weights = _build_isa_weights_fixed(hist, preset, sectors_map)  # returns weights summing to equity exposure
+
+    # If TD1 applies regime exposure (not the drawdown scaler on *returns*, but the weight scaler), apply it here too
+    if use_enhanced_features and len(hist) > 0 and len(weights) > 0:
+        try:
+            regime_metrics = compute_regime_metrics(hist)
+            regime_exposure = get_regime_adjusted_exposure(regime_metrics)
+            weights = weights * float(regime_exposure)   # leaves implied cash = 1 - sum(weights)
+        except Exception:
+            pass
+
+    return weights.fillna(0.0)
+
 # ---- Software split caps (Option 2) ----
 ENABLE_SOFTWARE_SUBCAPS: bool = True   # turn on/off the feature
 PARENT_SOFTWARE_CAP: float = 0.30      # keep total Software <= 30%
