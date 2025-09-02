@@ -178,7 +178,6 @@ def validate_and_clean_market_data(prices_df: pd.DataFrame) -> Tuple[pd.DataFram
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
 # =========================
-st.error("DEBUG: About to call enforce_caps_iteratively")
 def enforce_caps_iteratively(weights: pd.Series, sectors_map: Dict[str, str], 
                             name_cap: float = 0.25, sector_cap: float = 0.30, 
                             max_iterations: int = 100, debug: bool = False) -> pd.Series:
@@ -1103,17 +1102,18 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
 # =========================
 def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
     """FIXED VERSION: Apply position sizing to final combined portfolio"""
-    
-    st.error(f"DEBUG: Function called with {len(daily_close.columns)} stocks")  # <-- HERE
-    
+
+    # Toggle verbose cap-enforcement logs from the UI (e.g., a sidebar checkbox)
+    debug_caps = bool(st.session_state.get("debug_caps", False))
+
+    if debug_caps:
+        st.info(f"🔧 _build_isa_weights_fixed(): frame has {len(daily_close.columns)} stocks")
+
     monthly = daily_close.resample("ME").last()
 
     # --- Momentum Component (NO CAPS YET) ---
     comp_all = composite_score(daily_close)
-    if isinstance(comp_all, pd.DataFrame):
-        comp_vec = comp_all.iloc[-1].dropna()
-    else:
-        comp_vec = pd.Series(comp_all).dropna()
+    comp_vec = comp_all.iloc[-1].dropna() if isinstance(comp_all, pd.DataFrame) else pd.Series(comp_all).dropna()
 
     momz = blended_momentum_z(monthly)
     pos_idx = momz[momz > 0].index
@@ -1130,70 +1130,58 @@ def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_ma
             top_m = filtered
 
     # Raw momentum weights (NO CAPS - just relative scoring)
-    if not top_m.empty and top_m.sum() > 0:
-        mom_raw = (top_m / top_m.sum()) * preset["mom_w"]
-    else:
-        mom_raw = pd.Series(dtype=float)
+    mom_raw = (top_m / top_m.sum()) * preset["mom_w"] if not top_m.empty and top_m.sum() > 0 else pd.Series(dtype=float)
 
     # --- Mean Reversion Component (NO CAPS YET) ---
-    st_ret = daily_close.pct_change(preset["mr_lb"]).iloc[-1]
+    st_ret  = daily_close.pct_change(preset["mr_lb"]).iloc[-1]
     long_ma = daily_close.rolling(preset["mr_ma"]).mean().iloc[-1]
     quality = (daily_close.iloc[-1] > long_ma)
-    pool = [t for t, ok in quality.items() if ok]
-    mr_scores = st_ret.reindex(pool).dropna()
-    dips = mr_scores.nsmallest(preset["mr_topn"])
-    mr_raw = (pd.Series(1 / len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
+    pool    = [t for t, ok in quality.items() if ok]
+    dips    = st_ret.reindex(pool).dropna().nsmallest(preset["mr_topn"])
+    mr_raw  = (pd.Series(1 / len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
 
     # --- Combine Components BEFORE Applying Caps ---
     combined_raw = mom_raw.add(mr_raw, fill_value=0.0)
-    
     if combined_raw.empty or combined_raw.sum() <= 0:
+        if debug_caps:
+            st.warning("⚠️ combined_raw is empty; returning early.")
         return combined_raw
-    
-    st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
-    
-    # --- NOW Apply Position Sizing to Complete Portfolio ---
+
+    if debug_caps:
+        st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
+
+    # Use enhanced sector map for tighter grouping (e.g., semis vs software)
     enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index))
-    
-    # Show sector breakdown before caps
-    sector_breakdown = {}
-    for ticker, weight in combined_raw.items():
-        sector = enhanced_sectors.get(ticker, "Other")
-        sector_breakdown[sector] = sector_breakdown.get(sector, 0) + weight
-    
-    st.info(f"📊 Pre-caps sectors: {dict(sorted(sector_breakdown.items(), key=lambda x: x[1], reverse=True))}")
-    
+
+    if debug_caps:
+        sector_breakdown = {}
+        for ticker, weight in combined_raw.items():
+            sec = enhanced_sectors.get(ticker, "Other")
+            sector_breakdown[sec] = sector_breakdown.get(sec, 0.0) + weight
+        st.info(f"📊 Pre-caps sectors: {dict(sorted(sector_breakdown.items(), key=lambda x: x[1], reverse=True))}")
+
+    # --- Enforce caps on the COMPLETE portfolio ---
     final_weights = enforce_caps_iteratively(
         combined_raw,
         enhanced_sectors,
         name_cap=preset["mom_cap"],
         sector_cap=preset.get("sector_cap", 0.30),
-        debug=True
+        debug=debug_caps
     )
-    
-    # If position sizing fails completely, implement cash fallback
+
     if final_weights.empty or final_weights.sum() <= 0:
-        st.warning("⚠️ Position sizing failed - no valid portfolio found")
-        return pd.Series(dtype=float)
-    
-    # Check for remaining violations - if any exist, force cash allocation
-    violations = check_constraint_violations(final_weights, enhanced_sectors, 
-                                           preset["mom_cap"], preset.get("sector_cap", 0.30))
-    
-   if violations:
-    st.warning("⚠️ Unresolvable constraint violations detected. Implementing cash fallback.")
-    cash_allocation = 0.30
-    equity_target   = 1.0 - cash_allocation
+        if debug_caps:
+            st.warning("⚠️ enforce_caps_iteratively returned empty weights; returning empty.")
+        return final_weights
 
-    # Scale equity down to target and explicitly add a CASH line
-    final_weights = final_weights * equity_target
-    final_weights.loc["CASH"] = cash_allocation
+    # Optional: sanity check (logs only)
+    if debug_caps:
+        violations = check_constraint_violations(final_weights, enhanced_sectors, preset["mom_cap"], preset.get("sector_cap", 0.30))
+        if violations:
+            st.warning("⚠️ Post-enforcement violations (unexpected): " + "; ".join(violations))
+        else:
+            st.success("✅ Post-enforcement: no constraint violations detected.")
 
-# IMPORTANT: Do NOT renormalize away the cash line.
-total = final_weights.sum()
-
-return final_weights if abs(total - 1.0) < 1e-9 else (final_weights / total)
-    
     return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
 def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str], 
