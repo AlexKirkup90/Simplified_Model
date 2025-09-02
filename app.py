@@ -198,14 +198,20 @@ with tab1:
 with tab2:
     st.subheader("✅ Current Portfolio (Monthly-Locked)")
 
-    # detect whether today is the rebalance day (use your existing flag if you have one)
+    # Rebalance-day flag (use either key, prefer explicitly set one)
     is_rebalance_day = bool(
-        st.session_state.get("is_rebalance_day",
-            st.session_state.get("is_monthly_rebalance_day", False))
+        st.session_state.get(
+            "is_rebalance_day",
+            st.session_state.get("is_monthly_rebalance_day", False),
+        )
     )
 
+    # -------------------------
+    # Top panel: decision + table
+    # -------------------------
     if live_disp is None or live_disp.empty:
         st.warning(decision if isinstance(decision, str) else "—")
+        weights = None
     else:
         # Decision banner
         st.info(decision)
@@ -218,67 +224,112 @@ with tab2:
 
         st.dataframe(live_disp, use_container_width=True)
 
-    # ----- Sector totals for the currently held portfolio (no caps if off-day) -----
-    try:
-        weights = live_raw["Weight"].astype(float)
-        enhanced_sectors = backend.get_enhanced_sector_map(list(weights.index))
-        sec = pd.Series({t: enhanced_sectors.get(t, "Other") for t in weights.index})
-        sector_totals = weights.groupby(sec).sum().sort_values(ascending=False)
+        # Extract current weights safely
+        try:
+            if "Weight" in live_raw.columns:
+                weights = live_raw["Weight"].astype(float)
+            else:
+                # fallback if the column is named differently or the table is the source
+                col_name = [c for c in live_disp.columns if c.lower() in ("weight", "weights")]
+                weights = live_disp[col_name[0]].astype(float) if col_name else None
+        except Exception:
+            weights = None
 
-        label = "Sector totals (post-caps)" if is_rebalance_day else "Sector totals (current holdings)"
-        st.markdown(f"**{label}:**")
-        st.dataframe(sector_totals_preview.map(lambda x: f"{x:.2%}"), use_container_width=True)
+    # -------------------------
+    # Sector totals (current holdings)
+    # -------------------------
+    try:
+        if weights is not None and len(weights) > 0:
+            # Enhanced sector map with safe fallback to "Other"
+            enh_map = backend.get_enhanced_sector_map(list(weights.index))
+            enh_map = {t: enh_map.get(t, "Other") for t in weights.index}
+
+            sector_series = pd.Series(enh_map).reindex(weights.index)
+            sector_totals = (
+                weights.groupby(sector_series).sum().sort_values(ascending=False)
+            )
+
+            label = "Sector totals (post-caps)" if is_rebalance_day else "Sector totals (current holdings)"
+            st.markdown(f"**{label}:**")
+            st.dataframe(
+                sector_totals.map(lambda x: f"{x:.2%}"),
+                use_container_width=True
+            )
     except Exception:
         pass
 
-    # ----- Preview: apply name/sector caps to today's holdings WITHOUT trading -----
+    # -------------------------
+    # Preview: apply name/sector caps to TODAY'S holdings (no trading)
+    # -------------------------
     with st.expander("🔍 Preview today (apply caps now) — no trade, just a look"):
         preview_now = st.checkbox("Apply caps to carried weights (preview only)")
         if preview_now:
             try:
-                # equity-only weights (ignore any implicit cash)
-                w_eq = weights[weights > 0].copy()
-                eq_total = float(w_eq.sum())
-                if eq_total <= 0:
+                if weights is None or weights.empty:
                     st.warning("No equity positions to preview.")
                 else:
-                    # normalize equities to 100%, apply caps, then scale back to current equity total
-                    w_norm = (w_eq / eq_total).astype(float)
+                    # Equity-only slice (keep cash constant)
+                    w_eq = weights[weights > 0].copy()
+                    eq_total = float(w_eq.sum())
+                    if eq_total <= 0:
+                        st.warning("No equity positions to preview.")
+                    else:
+                        # Normalize equities to 100%, cap there, then scale back to current equity total
+                        w_norm = (w_eq / eq_total).astype(float)
 
-                    # read caps (fallbacks 25%/30%)
-                    name_cap   = float(st.session_state.get("name_cap", 0.25))
-                    sector_cap = float(st.session_state.get("sector_cap", 0.30))
+                        # Caps from UI or defaults
+                        name_cap   = float(st.session_state.get("name_cap", 0.25))
+                        sector_cap = float(st.session_state.get("sector_cap", 0.30))
 
-                    enh_map = backend.get_enhanced_sector_map(list(w_norm.index))
-                    w_capped_norm = backend.enforce_caps_iteratively(
-                        w_norm, enh_map, name_cap=name_cap, sector_cap=sector_cap, debug=False
-                    )
-                    w_capped = (w_capped_norm * eq_total).rename("Preview")
+                        # Consistent enhanced taxonomy
+                        enh_map = backend.get_enhanced_sector_map(list(w_norm.index))
+                        enh_map = {t: enh_map.get(t, "Other") for t in w_norm.index}
 
-                    # assemble comparison
-                    current = w_eq.rename("Current")
-                    both = pd.concat([current, w_capped], axis=1).fillna(0.0)
-                    both["Δ (pp)"] = (both["Preview"] - both["Current"]) * 100
+                        w_capped_norm = backend.enforce_caps_iteratively(
+                            w_norm,
+                            enh_map,
+                            name_cap=name_cap,
+                            sector_cap=sector_cap,
+                            debug=bool(st.session_state.get("debug_caps", False)),
+                        )
+                        # Scale back to current equity share
+                        w_capped = (w_capped_norm * eq_total).rename("Preview")
 
-                    st.markdown("**Current vs Preview (caps now, no trade):**")
-                    st.dataframe(
-                        both.sort_values("Preview", ascending=False).applymap(
-                            lambda x: f"{x:.2%}" if isinstance(x, (int, float)) and x <= 1 and x >= -1 else (f"{x:.2f}" if isinstance(x, (int, float)) else x)
-                        ),
-                        use_container_width=True
-                    )
+                        # Comparison table
+                        current = w_eq.rename("Current")
+                        both = pd.concat([current, w_capped], axis=1).fillna(0.0)
+                        both["Δ (pp)"] = (both["Preview"] - both["Current"]) * 100.0
 
-                    # sector totals for the preview
-                    sec_preview = pd.Series({t: enh_map.get(t, "Other") for t in w_capped.index})
-                    sector_totals_preview = w_capped.groupby(sec_preview).sum().sort_values(ascending=False)
+                        st.markdown("**Current vs Preview (caps now, no trade):**")
+                        # Pretty formatting: % for weights, 2dp for delta in percentage points
+                        def _fmt_cell(val, col_name):
+                            if col_name in ("Current", "Preview"):
+                                return f"{val:.2%}"
+                            if col_name == "Δ (pp)":
+                                return f"{val:.2f}"
+                            return val
 
-                    st.markdown("**Sector totals (preview with caps):**")
-                    st.dataframe(sector_totals_preview.map(lambda x: f"{x:.2%}"), use_container_width=True)
+                        df_show = both.sort_values("Preview", ascending=False).copy()
+                        for col in df_show.columns:
+                            df_show[col] = df_show[col].map(lambda v, c=col: _fmt_cell(v, c))
 
-                    # little hint
-                    st.caption(
-                        "Preview holds cash constant and redistributes **equities only** under name/sector caps."
-                    )
+                        st.dataframe(df_show, use_container_width=True)
+
+                        # Sector totals for the preview
+                        sec_preview = pd.Series(enh_map).reindex(w_capped.index)
+                        sector_totals_preview = (
+                            w_capped.groupby(sec_preview).sum().sort_values(ascending=False)
+                        )
+
+                        st.markdown("**Sector totals (preview with caps):**")
+                        st.dataframe(
+                            sector_totals_preview.map(lambda x: f"{x:.2%}"),
+                            use_container_width=True
+                        )
+
+                        st.caption(
+                            "Preview keeps cash constant and redistributes **equities only** under name/sector caps."
+                        )
             except Exception as e:
                 st.warning(f"Preview failed: {e}")
                 
