@@ -280,55 +280,78 @@ def enforce_caps_iteratively(
     # Return as-is (may sum to < 1.0 → implicit cash)
     return w
 
-def get_enhanced_sector_map(tickers: List[str]) -> Dict[str, str]:
+def get_enhanced_sector_map(tickers: list[str]) -> dict[str, str]:
     """
-    NEW FUNCTION: Enhanced sector mapping with proper semiconductor classification.
-    Fixes the AVGO/AMD sector issue by ensuring both are classified as semiconductors.
+    Returns an enhanced sector taxonomy for the given tickers.
+    Falls back to 'Other' when we don't know a name.
     """
-    semiconductor_stocks = {
-        'NVDA', 'AMD', 'INTC', 'QCOM', 'AVGO', 'TXN', 'ADI', 'MU', 'LRCX', 
-        'AMAT', 'KLAC', 'MRVL', 'NXPI', 'ON', 'SWKS', 'MCHP', 'ARM', 'TSM'
+
+    # --- your existing base map build here (from files/APIs/etc.) ---
+    base_map: dict[str, str] = build_base_sector_map_somehow()  # <-- your current logic
+
+    # Hand curated fixes to reduce "Other"
+    OVERRIDES: dict[str, str] = {
+        # current live/picks you showed
+        "PLTR": "Software",
+        "APP":  "Software",
+        "AXON": "Security/Defense",
+        "MSTR": "Crypto/Fintech",
+        "SHOP": "Software",
+        "DASH": "Ecommerce/Logistics",
+        "AVGO": "Semiconductors",
+        "COIN": "Crypto/Fintech",
+        "CRWD": "Software",
+        "ZS":   "Software",
+        # add more as you like:
+        "ARM":  "Semiconductors",
+        "SMCI": "AI Hardware",
+        "AMD":  "Semiconductors",
+        "NVDA": "Semiconductors",
+        "QCOM": "Semiconductors",
+        "MRVL": "Semiconductors",
+        "ON":   "Semiconductors",
+        "AAPL": "Mega Tech",
+        "AMZN": "Mega Tech",
+        "META": "Mega Tech",
+        "MSFT": "Mega Tech",
+        "GOOGL":"Mega Tech",
+        "TEAM": "Software",
+        "TTD":  "Software",
+        "SNOW": "Software",
+        "MDB":  "Software",
+        "DDOG": "Software",
+        "FTNT": "Software",
+        "ZS":   "Software",
+        "ETSY": "Ecommerce/Marketplaces",
+        "MELI": "Ecommerce/Marketplaces",
+        "PDD":  "Ecommerce/Marketplaces",
+        "COST": "Consumer/Staples",
+        "SBUX": "Consumer/Discretionary",
+        "NFLX": "Media/Streaming",
+        "BKNG": "Travel/Leisure",
+        "GEHC": "Healthcare/Equipment",
+        "DXCM": "Healthcare/Equipment",
+        "MRNA": "Biotech",
+        "VRTX": "Biotech",
+        "REGN": "Biotech",
+        "BIIB": "Biotech",
+        "GILD": "Biotech",
+        "FANG": "Energy",
+        "BKR":  "Energy",
+        "EXC":  "Utilities",
+        "AEP":  "Utilities",
+        "ORLY": "Retail/Auto",
+        "ROST": "Retail/Apparel",
+        "KLAC": "Semiconductors",
+        "LRCX": "Semiconductors",
+        "ASML": "Semiconductors",
+        "QCOM": "Semiconductors",
     }
-    
-    software_stocks = {
-        'MSFT', 'GOOGL', 'GOOG', 'CRM', 'ORCL', 'ADBE', 'NOW', 'TEAM', 'WDAY',
-        'DDOG', 'CRWD', 'ZS', 'SNOW', 'PLTR', 'MDB', 'INTU', 'ANSS', 'CDNS', 'SNPS'
-    }
-    
-    mega_tech_stocks = {
-        'AAPL', 'META', 'NFLX', 'TSLA'
-    }
-    
-    ai_hardware_stocks = {
-        'SMCI', 'HPE'
-    }
-    
-    crypto_related = {
-        'COIN', 'MSTR', 'SQ'
-    }
-    
-    cloud_stocks = {
-        'AMZN'
-    }
-    
-    sector_map = {}
-    for ticker in tickers:
-        if ticker in semiconductor_stocks:
-            sector_map[ticker] = "Semiconductors"
-        elif ticker in software_stocks:
-            sector_map[ticker] = "Software"
-        elif ticker in mega_tech_stocks:
-            sector_map[ticker] = "Mega Tech"
-        elif ticker in ai_hardware_stocks:
-            sector_map[ticker] = "AI Hardware" 
-        elif ticker in crypto_related:
-            sector_map[ticker] = "Crypto/Fintech"
-        elif ticker in cloud_stocks:
-            sector_map[ticker] = "Cloud/Platforms"
-        else:
-            sector_map[ticker] = "Other"
-    
-    return sector_map
+
+    # Merge overrides
+    sector_map = {**base_map, **OVERRIDES}
+    # Return only what was requested
+    return {t: sector_map.get(t, "Other") for t in tickers}
 
 # =========================
 # NEW: Volatility-Adjusted Position Sizing
