@@ -178,6 +178,7 @@ def validate_and_clean_market_data(prices_df: pd.DataFrame) -> Tuple[pd.DataFram
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
 # =========================
+st.error("DEBUG: About to call enforce_caps_iteratively")
 def enforce_caps_iteratively(weights: pd.Series, sectors_map: Dict[str, str], 
                             name_cap: float = 0.25, sector_cap: float = 0.30, 
                             max_iterations: int = 100, debug: bool = False) -> pd.Series:
@@ -1100,6 +1101,7 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
 # =========================
 # Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - MODIFIED
 # =========================
+st.error(f"DEBUG: Function called with {len(daily_close.columns)} stocks")
 def _build_isa_weights_fixed(daily_close: pd.DataFrame, preset: Dict, sectors_map: Dict[str, str]) -> pd.Series:
     """
     FIXED VERSION: Apply position sizing to final combined portfolio
