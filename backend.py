@@ -280,78 +280,55 @@ def enforce_caps_iteratively(
     # Return as-is (may sum to < 1.0 → implicit cash)
     return w
 
-def get_enhanced_sector_map(tickers: list[str]) -> dict[str, str]:
+# --- Enhanced sector bucketing -----------------------------------------------
+from typing import Dict, List, Optional
+
+def get_enhanced_sector_map(
+    tickers: List[str],
+    base_map: Optional[Dict[str, str]] = None
+) -> Dict[str, str]:
     """
-    Returns an enhanced sector taxonomy for the given tickers.
-    Falls back to 'Other' when we don't know a name.
+    Map tickers into a small set of 'enhanced' sectors used for caps.
+    - If a base sector map is provided, we use it to help decide.
+    - Otherwise we fall back to ticker-based overrides and sensible defaults.
+
+    Buckets: 'Mega Tech', 'Semiconductors', 'Crypto/Fintech', 'Software', 'Other'
     """
 
-    # --- your existing base map build here (from files/APIs/etc.) ---
-    base_map: dict[str, str] = build_base_sector_map_somehow()  # <-- your current logic
+    base_map = base_map or {}
 
-    # Hand curated fixes to reduce "Other"
-    OVERRIDES: dict[str, str] = {
-        # current live/picks you showed
-        "PLTR": "Software",
-        "APP":  "Software",
-        "AXON": "Security/Defense",
-        "MSTR": "Crypto/Fintech",
-        "SHOP": "Software",
-        "DASH": "Ecommerce/Logistics",
-        "AVGO": "Semiconductors",
-        "COIN": "Crypto/Fintech",
-        "CRWD": "Software",
-        "ZS":   "Software",
-        # add more as you like:
-        "ARM":  "Semiconductors",
-        "SMCI": "AI Hardware",
-        "AMD":  "Semiconductors",
-        "NVDA": "Semiconductors",
-        "QCOM": "Semiconductors",
-        "MRVL": "Semiconductors",
-        "ON":   "Semiconductors",
-        "AAPL": "Mega Tech",
-        "AMZN": "Mega Tech",
-        "META": "Mega Tech",
-        "MSFT": "Mega Tech",
-        "GOOGL":"Mega Tech",
-        "TEAM": "Software",
-        "TTD":  "Software",
-        "SNOW": "Software",
-        "MDB":  "Software",
-        "DDOG": "Software",
-        "FTNT": "Software",
-        "ZS":   "Software",
-        "ETSY": "Ecommerce/Marketplaces",
-        "MELI": "Ecommerce/Marketplaces",
-        "PDD":  "Ecommerce/Marketplaces",
-        "COST": "Consumer/Staples",
-        "SBUX": "Consumer/Discretionary",
-        "NFLX": "Media/Streaming",
-        "BKNG": "Travel/Leisure",
-        "GEHC": "Healthcare/Equipment",
-        "DXCM": "Healthcare/Equipment",
-        "MRNA": "Biotech",
-        "VRTX": "Biotech",
-        "REGN": "Biotech",
-        "BIIB": "Biotech",
-        "GILD": "Biotech",
-        "FANG": "Energy",
-        "BKR":  "Energy",
-        "EXC":  "Utilities",
-        "AEP":  "Utilities",
-        "ORLY": "Retail/Auto",
-        "ROST": "Retail/Apparel",
-        "KLAC": "Semiconductors",
-        "LRCX": "Semiconductors",
-        "ASML": "Semiconductors",
-        "QCOM": "Semiconductors",
+    MEGA_TECH = {
+        "AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN", "TSLA", "NFLX"
+    }
+    SEMIS = {
+        "NVDA", "AMD", "AVGO", "ASML", "KLAC", "LRCX", "AMAT", "QCOM", "MRVL",
+        "ON", "TXN", "INTC", "ADBE", "ARM", "SMCI"
+    }
+    CRYPTO_FINTECH = {
+        "COIN", "MSTR", "PYPL", "SQ", "HOOD", "SOFI"
+    }
+    SOFTWARE_OVERRIDES = {
+        # cybersecurity / SaaS / data
+        "CRWD", "ZS", "FTNT", "PANW", "DDOG", "SNOW", "MDB", "TEAM", "WDAY",
+        "NOW", "ADBE", "SHOP", "PLTR", "APP", "TTD"
     }
 
-    # Merge overrides
-    sector_map = {**base_map, **OVERRIDES}
-    # Return only what was requested
-    return {t: sector_map.get(t, "Other") for t in tickers}
+    def normalize(base_sector: Optional[str], t: str) -> str:
+        t = t.upper()
+        if t in MEGA_TECH:
+            return "Mega Tech"
+        if t in SEMIS or (base_sector and "semic" in base_sector.lower()):
+            return "Semiconductors"
+        if t in CRYPTO_FINTECH:
+            return "Crypto/Fintech"
+        if t in SOFTWARE_OVERRIDES or (base_sector and "software" in base_sector.lower()):
+            return "Software"
+        return "Other"
+
+    out: Dict[str, str] = {}
+    for t in tickers:
+        out[t] = normalize(base_map.get(t), t)
+    return out
 
 # =========================
 # NEW: Volatility-Adjusted Position Sizing
@@ -1060,7 +1037,7 @@ def run_momentum_composite_param(
             raw = cap_weights(raw, cap=name_cap)
 
         # Enforce name + sector caps together using enhanced taxonomy (hard)
-        enhanced_sectors = get_enhanced_sector_map(list(raw.index))
+        enhanced_sectors = get_enhanced_sector_map(list(raw.index), sectors_map)
         # fallback to provided sectors_map where enhanced taxonomy doesn't have an entry
         for t in raw.index:
             if t not in enhanced_sectors:
