@@ -26,6 +26,10 @@ LOCAL_PORTF_FILE = "last_portfolio.csv"
 ROUNDTRIP_BPS_DEFAULT = 20
 REGIME_MA = 200
 
+# Defaults for regime-based exposure adjustments
+VIX_TS_THRESHOLD_DEFAULT = 1.0   # VIX3M / VIX ratio; <1 implies stress
+HY_OAS_THRESHOLD_DEFAULT = 6.0   # High-yield OAS level (%) signalling stress
+
 # ISA preset
 STRATEGY_PRESETS = {
     "ISA Dynamic (0.75)": {
@@ -426,6 +430,8 @@ def get_regime_adjusted_exposure(regime_metrics: Dict[str, float]) -> float:
     breadth = regime_metrics.get('breadth_pos_6m', 0.5)
     vol_regime = regime_metrics.get('qqq_vol_10d', 0.02)
     qqq_above_ma = regime_metrics.get('qqq_above_200dma', 1.0)
+    vix_ts = regime_metrics.get('vix_term_structure', 1.0)
+    hy_oas = regime_metrics.get('hy_oas', 4.0)
     
     # Base exposure
     exposure = 1.0
@@ -444,6 +450,18 @@ def get_regime_adjusted_exposure(regime_metrics: Dict[str, float]) -> float:
     if vol_regime > 0.035:  # High volatility
         exposure *= 0.8
     elif vol_regime < 0.015:  # Low volatility
+        exposure *= 1.05
+
+    # VIX term structure (3M/1M); backwardation (< threshold) is risk-off
+    vix_thresh = st.session_state.get("vix_ts_threshold", VIX_TS_THRESHOLD_DEFAULT)
+    if vix_ts < vix_thresh:
+        exposure *= 0.8
+
+    # High-yield credit spreads
+    oas_thresh = st.session_state.get("hy_oas_threshold", HY_OAS_THRESHOLD_DEFAULT)
+    if hy_oas > oas_thresh:
+        exposure *= 0.8
+    elif hy_oas < max(0.0, oas_thresh - 2):
         exposure *= 1.05
     
     # Adjust for trend
@@ -1620,7 +1638,12 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
 # Regime & Live paper tracking (Enhanced)
 # =========================
 def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
-    px = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    data = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    try:
+        px = data["Close"]
+    except Exception:
+        # Fallback: take first column if "Close" not present (e.g., FRED series)
+        px = data.iloc[:, 0] if hasattr(data, "iloc") else data
     px = _safe_series(px)
     return pd.Series(px).dropna()
 
@@ -1631,6 +1654,19 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
     start = (universe_prices_daily.index.min() - pd.DateOffset(days=5)).strftime("%Y-%m-%d")
     end   = (universe_prices_daily.index.max() + pd.DateOffset(days=5)).strftime("%Y-%m-%d")
     qqq = get_benchmark_series("QQQ", start, end).reindex(universe_prices_daily.index).ffill().dropna()
+
+    # Additional benchmarks for regime metrics
+    try:
+        vix = get_benchmark_series("^VIX", start, end).reindex(universe_prices_daily.index).ffill()
+        vix3m = get_benchmark_series("^VIX3M", start, end).reindex(universe_prices_daily.index).ffill()
+        vix_ts = float(vix3m.iloc[-1] / vix.iloc[-1]) if len(vix) and len(vix3m) else np.nan
+    except Exception:
+        vix_ts = np.nan
+    try:
+        hy_oas = get_benchmark_series("BAMLH0A0HYM2", start, end).reindex(universe_prices_daily.index).ffill()
+        hy_oas_last = float(hy_oas.iloc[-1]) if len(hy_oas) else np.nan
+    except Exception:
+        hy_oas_last = np.nan
 
     pct_above_ma = (universe_prices_daily.iloc[-1] >
                     universe_prices_daily.rolling(REGIME_MA).mean().iloc[-1]).mean()
@@ -1649,7 +1685,9 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
         "qqq_above_200dma": float(qqq_above_ma),
         "qqq_vol_10d": float(qqq_vol_10d),
         "breadth_pos_6m": float(pos_6m),
-        "qqq_50dma_slope_10d": float(qqq_slope_50) if pd.notna(qqq_slope_50) else np.nan
+        "qqq_50dma_slope_10d": float(qqq_slope_50) if pd.notna(qqq_slope_50) else np.nan,
+        "vix_term_structure": float(vix_ts) if pd.notna(vix_ts) else np.nan,
+        "hy_oas": float(hy_oas_last) if pd.notna(hy_oas_last) else np.nan,
     }
 
 def get_market_regime() -> Tuple[str, Dict[str, float]]:
