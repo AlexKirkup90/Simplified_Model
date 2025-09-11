@@ -487,35 +487,61 @@ def get_regime_adjusted_exposure(regime_metrics: Dict[str, float]) -> float:
 # =========================
 # NEW: Enhanced Drawdown Controls
 # =========================
-def get_drawdown_adjusted_exposure(current_returns: pd.Series, max_dd_threshold: float = 0.15) -> float:
-    """Reduce exposure during sustained drawdowns"""
-    if current_returns.empty:
+def get_drawdown_adjusted_exposure(current_returns: pd.Series,
+                                   qqq_returns: pd.Series,
+                                   threshold_fraction: float = 0.8) -> float:
+    """Reduce exposure during sustained drawdowns
+
+    Parameters
+    ----------
+    current_returns : pd.Series
+        Strategy returns leading up to the evaluation point.
+    qqq_returns : pd.Series
+        Corresponding QQQ benchmark returns used to derive a dynamic
+        drawdown threshold.
+    threshold_fraction : float, optional
+        Fraction of QQQ's drawdown used as the maximum tolerable drawdown
+        before scaling, by default 0.8.
+    """
+    if current_returns.empty or qqq_returns.empty:
         return 1.0
-    
+
     equity_curve = (1 + current_returns.fillna(0)).cumprod()
-    current_dd = (equity_curve / equity_curve.cummax() - 1).iloc[-1]
-    
-    if current_dd < -max_dd_threshold:
-        # Scale down exposure based on drawdown severity
-        dd_severity = abs(current_dd)
+    strat_dd = (equity_curve / equity_curve.cummax() - 1).iloc[-1]
+
+    qqq_curve = (1 + qqq_returns.fillna(0)).cumprod()
+    qqq_dd = (qqq_curve / qqq_curve.cummax() - 1).iloc[-1]
+
+    max_dd_threshold = threshold_fraction * abs(qqq_dd)
+
+    if strat_dd < -max_dd_threshold:
+        dd_severity = abs(strat_dd)
         exposure_reduction = min(dd_severity * 0.5, 0.7)  # Max 70% reduction
         return max(1.0 - exposure_reduction, 0.3)  # Never below 30%
-    
+
     return 1.0
 
 def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
-                                   max_dd_threshold: float = 0.15) -> pd.Series:
+                                   qqq_monthly_returns: pd.Series,
+                                   threshold_fraction: float = 0.8) -> pd.Series:
     """
-    Walk-forward scaling: for each month, compute drawdown of history up to the
-    previous month and scale that month’s return by an exposure derived from it.
+    Walk-forward scaling: for each month, compute drawdowns of strategy history
+    and the QQQ benchmark up to the previous month. The strategy's drawdown is
+    compared against a threshold defined as ``threshold_fraction`` times the
+    QQQ drawdown to determine the exposure for the following month.
     """
     r = pd.Series(monthly_returns).copy().fillna(0.0)
+    qqq = pd.Series(qqq_monthly_returns).reindex(r.index).fillna(0.0)
     out = []
     hist = pd.Series(dtype=float)
+    qqq_hist = pd.Series(dtype=float)
     for dt, val in r.items():
-        exp = get_drawdown_adjusted_exposure(hist, max_dd_threshold=max_dd_threshold) if len(hist) else 1.0
+        q_val = qqq.loc[dt]
+        exp = (get_drawdown_adjusted_exposure(hist, qqq_hist, threshold_fraction)
+               if len(hist) and len(qqq_hist) else 1.0)
         out.append((dt, val * exp))
         hist = pd.concat([hist, pd.Series([val], index=[dt])])
+        qqq_hist = pd.concat([qqq_hist, pd.Series([q_val], index=[dt])])
     return pd.Series(dict(out)).reindex(r.index)
 
 # =========================
@@ -1541,7 +1567,10 @@ def run_backtest_isa_dynamic(
 
     # Apply drawdown-based exposure adjustment (walk-forward)
     if use_enhanced_features:
-        hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
+        qqq_monthly = qqq.resample('ME').last().pct_change()
+        hybrid_gross = apply_dynamic_drawdown_scaling(
+            hybrid_gross, qqq_monthly, threshold_fraction=0.8
+        )
 
     # Optional QQQ hedge taken from cash
     if enable_hedge and hedge_size > 0:
