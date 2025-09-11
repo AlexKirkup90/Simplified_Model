@@ -407,9 +407,50 @@ def get_volatility_adjusted_caps(weights: pd.Series, daily_prices: pd.DataFrame,
     return adj_caps
 
 # =========================
+# NEW: Risk Parity Weighting
+# =========================
+def risk_parity_weights(prices: pd.DataFrame, tickers: List[str], lookback: int = 63) -> pd.Series:
+    """Compute inverse-volatility risk parity weights.
+
+    Parameters
+    ----------
+    prices : pd.DataFrame
+        Daily price history for the universe of tickers.
+    tickers : List[str]
+        List of tickers to weight.
+    lookback : int, optional
+        Number of trading days for volatility calculation, by default 63.
+
+    Returns
+    -------
+    pd.Series
+        Risk-parity weights summing to 1.0 for the provided tickers.
+    """
+    if not tickers:
+        return pd.Series(dtype=float)
+
+    # Ensure we have the necessary price data
+    sub_prices = prices.reindex(columns=tickers)
+    returns = sub_prices.pct_change().dropna()
+    if returns.empty or len(returns) < lookback:
+        # Fall back to equal weighting if not enough data
+        return pd.Series(1 / len(tickers), index=tickers)
+
+    vols = returns.rolling(lookback).std().iloc[-1]
+    vols = vols.replace(0, np.nan)
+
+    inv_vol = 1 / vols
+    inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan).dropna()
+    if inv_vol.empty:
+        return pd.Series(1 / len(tickers), index=tickers)
+
+    weights = inv_vol / inv_vol.sum()
+    return weights.reindex(tickers).fillna(0.0)
+
+# =========================
 # NEW: Signal Decay Modeling
 # =========================
-def apply_signal_decay(momentum_scores: pd.Series, signal_age_days: int = 0, 
+def apply_signal_decay(momentum_scores: pd.Series, signal_age_days: int = 0,
                       half_life: int = 45) -> pd.Series:
     """Apply exponential decay to momentum signals based on age"""
     if signal_age_days <= 0:
@@ -1255,6 +1296,11 @@ def _build_isa_weights_fixed(
 
     if debug_caps:
         st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
+
+    # Apply risk parity weights before enforcing caps
+    rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
+    combined_raw = combined_raw.mul(rp_weights, fill_value=0.0)
+    combined_raw = combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
 
     # Enhanced sector map (uses your base sectors_map) + hierarchical caps for Software sub-buckets
     enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index), base_map=sectors_map)
