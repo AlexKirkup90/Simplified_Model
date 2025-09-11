@@ -87,6 +87,13 @@ min_dollar_volume = st.sidebar.number_input("Min 60d median $ volume (optional)"
 # Net toggle
 show_net = st.sidebar.checkbox("Show net of costs", value=True)
 
+# Hedge controls
+enable_hedge = st.sidebar.toggle("Enable QQQ Hedge", value=False)
+hedge_size_pct = st.sidebar.slider("Hedge size (%)", 0, 30, 10, 1) if enable_hedge else 0
+hedge_size = hedge_size_pct / 100.0
+st.session_state["enable_hedge"] = enable_hedge
+st.session_state["hedge_size"] = hedge_size
+
 # Rebalance tolerance for plan
 tol = st.sidebar.slider("Rebalance tolerance (abs Δ weight)", 0.005, 0.05, 0.01, 0.005, format="%.3f")
 
@@ -146,7 +153,9 @@ if go:
                 mr_topn=preset["mr_topn"],
                 mom_weight=preset["mom_w"],
                 mr_weight=preset["mr_w"],
-                use_enhanced_features=use_enhanced_features
+                use_enhanced_features=use_enhanced_features,
+                enable_hedge=enable_hedge,
+                hedge_size=hedge_size
             )
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
