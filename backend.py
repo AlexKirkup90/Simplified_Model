@@ -185,6 +185,8 @@ def generate_td1_targets_asof(
     preset: dict,
     asof: Optional[pd.Timestamp] = None,
     use_enhanced_features: bool = True,
+    enable_hedge: bool = False,
+    hedge_size: float = 0.0,
 ) -> pd.Series:
     """
     Build targets exactly as on Trading Day 1:
@@ -202,12 +204,24 @@ def generate_td1_targets_asof(
     # Your existing (fixed) builder runs full selection + caps
     weights = _build_isa_weights_fixed(hist, preset, sectors_map)  # returns weights summing to equity exposure
 
+    regime_metrics: Dict[str, float] = {}
     # If TD1 applies regime exposure (not the drawdown scaler on *returns*, but the weight scaler), apply it here too
     if use_enhanced_features and len(hist) > 0 and len(weights) > 0:
         try:
             regime_metrics = compute_regime_metrics(hist)
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
             weights = weights * float(regime_exposure)   # leaves implied cash = 1 - sum(weights)
+        except Exception:
+            regime_metrics = {}
+
+    # Optional QQQ hedge
+    if enable_hedge and hedge_size > 0 and len(hist) > 0 and len(weights) > 0:
+        try:
+            returns = hist.pct_change().dropna()
+            port_rets = (returns[weights.index] * weights).sum(axis=1)
+            hedge_w = build_hedge_weight(port_rets, regime_metrics, hedge_size)
+            if hedge_w > 0:
+                weights.loc["QQQ"] = -hedge_w
         except Exception:
             pass
 
@@ -509,9 +523,41 @@ def calculate_portfolio_correlation_to_market(portfolio_returns: pd.Series,
     
     port_aligned = portfolio_returns.reindex(common_dates)
     market_aligned = market_returns.reindex(common_dates)
-    
+
     correlation = port_aligned.corr(market_aligned)
     return correlation if not pd.isna(correlation) else 0.0
+
+# =========================
+# NEW: QQQ Hedge Builder
+# =========================
+def build_hedge_weight(portfolio_returns: pd.Series,
+                       regime_metrics: Dict[str, float],
+                       hedge_size: float,
+                       corr_threshold: float = 0.8) -> float:
+    """Determine QQQ hedge weight based on correlation and regime.
+
+    The hedge activates only when the portfolio exhibits high correlation
+    to QQQ *and* regime metrics flag bearish conditions. Returned weight is
+    the fraction of capital to short in QQQ (0 <= w <= hedge_size).
+    """
+    if hedge_size <= 0 or portfolio_returns is None or portfolio_returns.empty:
+        return 0.0
+
+    corr = calculate_portfolio_correlation_to_market(portfolio_returns)
+    if pd.isna(corr) or corr < 0:
+        return 0.0
+
+    bearish = (
+        regime_metrics.get("qqq_above_200dma", 1.0) < 1.0 or
+        regime_metrics.get("breadth_pos_6m", 1.0) < 0.40 or
+        regime_metrics.get("qqq_50dma_slope_10d", 0.0) < 0.0
+    )
+
+    if not bearish or corr < corr_threshold:
+        return 0.0
+
+    scale = min(1.0, (corr - corr_threshold) / max(1e-6, 1 - corr_threshold))
+    return float(np.clip(scale * hedge_size, 0.0, hedge_size))
 
 # =========================
 # Helpers (Enhanced)
@@ -1426,9 +1472,11 @@ def run_backtest_isa_dynamic(
     mom_weight: float = 0.85,
     mr_weight: float = 0.15,
     use_enhanced_features: bool = True,
+    enable_hedge: bool = False,
+    hedge_size: float = 0.0,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
-    Enhanced ISA-Dynamic hybrid backtest with new features
+    Enhanced ISA-Dynamic hybrid backtest with new features and optional QQQ hedge.
     """
     if end_date is None:
         end_date = datetime.today().strftime("%Y-%m-%d")
@@ -1476,6 +1524,20 @@ def run_backtest_isa_dynamic(
     # Apply drawdown-based exposure adjustment (walk-forward)
     if use_enhanced_features:
         hybrid_gross = apply_dynamic_drawdown_scaling(hybrid_gross, max_dd_threshold=0.15)
+
+    # Optional QQQ hedge taken from cash
+    if enable_hedge and hedge_size > 0:
+        qqq_monthly = qqq.resample("ME").last().pct_change().reindex(hybrid_gross.index)
+        hedged = hybrid_gross.copy()
+        for dt in hedged.index:
+            # Use history up to previous month for correlation
+            past_rets = hedged.loc[:dt].iloc[:-1]
+            hist_daily = daily.loc[:dt]
+            regime_metrics = compute_regime_metrics(hist_daily)
+            hedge_w = build_hedge_weight(past_rets, regime_metrics, hedge_size)
+            if hedge_w > 0 and pd.notna(qqq_monthly.loc[dt]):
+                hedged.loc[dt] = hedged.loc[dt] - qqq_monthly.loc[dt] * hedge_w
+        hybrid_gross = hedged
 
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
