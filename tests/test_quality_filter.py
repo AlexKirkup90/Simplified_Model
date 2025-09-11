@@ -1,0 +1,80 @@
+import numpy as np
+import pandas as pd
+import numpy as np
+import streamlit as st
+import sys, pathlib, types
+
+# Provide empty secrets so backend import does not fail
+st.secrets = types.SimpleNamespace(get=lambda *args, **kwargs: None)
+
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
+import backend
+
+
+def test_fundamental_quality_filter_basic():
+    df = pd.DataFrame({
+        "profitability": [0.2, -0.1, 0.05],
+        "leverage": [0.5, 0.4, 3.0],
+    }, index=["AAA", "BBB", "CCC"])
+    keep = backend.fundamental_quality_filter(df, min_profitability=0.0, max_leverage=1.0)
+    assert keep == ["AAA"]
+
+
+def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
+    # Configure thresholds
+    st.session_state["min_profitability"] = 0.0
+    st.session_state["max_leverage"] = 1.0
+
+    dates = pd.date_range("2020-01-01", periods=10, freq="D")
+    close = pd.DataFrame({
+        "AAA": np.linspace(100, 110, len(dates)),
+        "BBB": np.linspace(50, 60, len(dates)),
+        "QQQ": np.linspace(200, 210, len(dates)),
+    }, index=dates)
+    vol = pd.DataFrame(1.0, index=dates, columns=["AAA", "BBB", "QQQ"])
+    sectors_map = {"AAA": "Tech", "BBB": "Tech"}
+
+    def fake_prepare(universe_choice, start_date, end_date):
+        return close, vol, sectors_map, "Test"
+
+    monkeypatch.setattr(backend, "_prepare_universe_for_backtest", fake_prepare)
+
+    fdf = pd.DataFrame({
+        "profitability": [0.2, -0.2],
+        "leverage": [0.5, 0.5],
+    }, index=["AAA", "BBB"])
+
+    def fake_fetch_fundamental_metrics(tickers):
+        return fdf.reindex(tickers)
+
+    monkeypatch.setattr(backend, "fetch_fundamental_metrics", fake_fetch_fundamental_metrics)
+
+    captured = {}
+
+    def fake_momentum(daily, sectors_map, top_n, name_cap, sector_cap, stickiness_days, use_enhanced_features):
+        captured["mom_cols"] = list(daily.columns)
+        series = pd.Series(0.01, index=pd.date_range("2020-01-31", "2020-03-31", freq="M"))
+        return series, series * 0
+
+    def fake_mr(daily, lookback_period_mr, top_n_mr, long_ma_days):
+        captured["mr_cols"] = list(daily.columns)
+        series = pd.Series(0.0, index=pd.date_range("2020-01-31", "2020-03-31", freq="M"))
+        return series, series * 0
+
+    monkeypatch.setattr(backend, "run_momentum_composite_param", fake_momentum)
+    monkeypatch.setattr(backend, "run_backtest_mean_reversion", fake_mr)
+
+    backend.run_backtest_isa_dynamic(
+        min_dollar_volume=0,
+        top_n=1,
+        name_cap=1.0,
+        sector_cap=1.0,
+        stickiness_days=1,
+        mr_topn=1,
+        mom_weight=1.0,
+        mr_weight=0.0,
+        use_enhanced_features=False,
+    )
+
+    assert captured.get("mom_cols") == ["AAA"]
+    assert captured.get("mr_cols") == ["AAA"]
