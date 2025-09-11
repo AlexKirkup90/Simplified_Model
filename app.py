@@ -97,6 +97,20 @@ st.session_state["hedge_size"] = hedge_size
 # Rebalance tolerance for plan
 tol = st.sidebar.slider("Rebalance tolerance (abs Δ weight)", 0.005, 0.05, 0.01, 0.005, format="%.3f")
 
+# Regime metric thresholds
+vix_ts_threshold = st.sidebar.slider(
+    "VIX 3M/1M ratio threshold",
+    0.8, 1.4, backend.VIX_TS_THRESHOLD_DEFAULT, 0.05,
+    help="Below this ratio signals volatility stress"
+)
+hy_oas_threshold = st.sidebar.slider(
+    "HY OAS threshold (%)",
+    2.0, 10.0, backend.HY_OAS_THRESHOLD_DEFAULT, 0.5,
+    help="Above this spread signals credit stress"
+)
+st.session_state["vix_ts_threshold"] = float(vix_ts_threshold)
+st.session_state["hy_oas_threshold"] = float(hy_oas_threshold)
+
 # Prev portfolio (for plan & monthly lock)
 prev_portfolio = backend.load_previous_portfolio()
 
@@ -605,6 +619,12 @@ with tab4:
         c5.metric("QQQ 50DMA slope (10D)", f"{metrics.get('qqq_50dma_slope_10d', np.nan)*100:.2f}%")
         c6.metric("6M Breadth", f"{metrics.get('breadth_pos_6m', np.nan)*100:.1f}%",
                  help="Percentage of stocks with positive 6-month returns")
+
+        c7, c8 = st.columns(2)
+        c7.metric("VIX 3M/1M", f"{metrics.get('vix_term_structure', np.nan):.2f}",
+                 help="Ratio of 3M to 1M VIX; <1 can signal stress")
+        c8.metric("HY OAS (%)", f"{metrics.get('hy_oas', np.nan):.2f}%",
+                 help="High-yield option-adjusted spread")
 
         # Enhanced regime guidance
         breadth = float(metrics.get("breadth_pos_6m", np.nan))
