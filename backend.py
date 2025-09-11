@@ -1314,7 +1314,7 @@ def apply_costs(gross, turnover, roundtrip_bps):
     return gross - turnover*(roundtrip_bps/10000.0)
 
 # =========================
-# Liquidity utils (Hybrid150) - Unchanged
+# Screening utils (liquidity + fundamentals)
 # =========================
 def median_dollar_volume(close_df: pd.DataFrame, vol_df: pd.DataFrame, window: int = 60) -> pd.Series:
     aligned_vol = vol_df.reindex_like(close_df).fillna(0)
@@ -1327,6 +1327,43 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
         return []
     med = median_dollar_volume(close_df, vol_df, window=60)
     return med[med >= min_dollar].index.tolist()
+
+def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
+    """Fetch basic fundamental metrics for the given tickers."""
+    rows = []
+    for t in tickers:
+        profitability = np.nan
+        leverage = np.nan
+        try:
+            info = yf.Ticker(t).info
+            profitability = info.get("returnOnAssets")
+            if profitability is None:
+                profitability = info.get("profitMargins")
+            leverage = info.get("debtToEquity")
+            if leverage is not None and leverage > 10:
+                # many providers return percentage values
+                leverage = leverage / 100.0
+        except Exception:
+            pass
+        rows.append({"Ticker": t, "profitability": profitability, "leverage": leverage})
+    return pd.DataFrame(rows).set_index("Ticker")
+
+def fundamental_quality_filter(
+    fund_df: pd.DataFrame,
+    min_profitability: float = 0.0,
+    max_leverage: float = 2.0,
+    profitability_col: str = "profitability",
+    leverage_col: str = "leverage",
+) -> List[str]:
+    """Return tickers passing simple fundamental quality rules."""
+    if fund_df.empty:
+        return []
+    if profitability_col not in fund_df.columns or leverage_col not in fund_df.columns:
+        return fund_df.index.tolist()
+    df = fund_df.copy()
+    mask = df[profitability_col].fillna(-np.inf) >= min_profitability
+    mask &= df[leverage_col].fillna(np.inf) <= max_leverage
+    return df.index[mask].tolist()
 
 # =========================
 # Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - MODIFIED
@@ -1508,6 +1545,16 @@ def generate_live_portfolio_isa_monthly(
         close = close[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
+    # Fundamental quality filter
+    min_prof = st.session_state.get("min_profitability", 0.0)
+    max_lev = st.session_state.get("max_leverage", 2.0)
+    fundamentals = fetch_fundamental_metrics(close.columns.tolist())
+    keep = fundamental_quality_filter(fundamentals, min_profitability=min_prof, max_leverage=max_lev)
+    if not keep:
+        return None, None, "No tickers pass quality filter."
+    close = close[keep]
+    sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
+
     # Monthly lock check — hold previous if not first trading day
     today = datetime.today().date()
     is_monthly = is_rebalance_today(today, close.index)
@@ -1591,6 +1638,16 @@ def run_backtest_isa_dynamic(
 
     daily = close.drop(columns=["QQQ"])
     qqq  = close["QQQ"]
+
+    # Fundamental quality filter
+    min_prof = st.session_state.get("min_profitability", 0.0)
+    max_lev = st.session_state.get("max_leverage", 2.0)
+    fundamentals = fetch_fundamental_metrics(daily.columns.tolist())
+    keep = fundamental_quality_filter(fundamentals, min_profitability=min_prof, max_leverage=max_lev)
+    if not keep:
+        return None, None, None, None
+    daily = daily[keep]
+    sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
 
     # Sleeves (enhanced)
     mom_rets, mom_tno = run_momentum_composite_param(

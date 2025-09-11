@@ -84,6 +84,16 @@ st.session_state["use_enhanced_features"] = use_enhanced_features
 roundtrip_bps = st.sidebar.slider("Round-trip cost (bps)", 0, 100, backend.ROUNDTRIP_BPS_DEFAULT, 5)
 min_dollar_volume = st.sidebar.number_input("Min 60d median $ volume (optional)", min_value=0, value=0, step=100000)
 
+# Fundamental quality thresholds
+min_profitability = st.sidebar.slider(
+    "Min profitability (ROA)", -0.5, 0.5, 0.0, 0.01
+)
+max_leverage = st.sidebar.slider(
+    "Max leverage (Debt/Equity)", 0.0, 5.0, 2.0, 0.1
+)
+st.session_state["min_profitability"] = float(min_profitability)
+st.session_state["max_leverage"] = float(max_leverage)
+
 # Net toggle
 show_net = st.sidebar.checkbox("Show net of costs", value=True)
 
