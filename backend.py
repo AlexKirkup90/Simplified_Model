@@ -34,7 +34,10 @@ STRATEGY_PRESETS = {
         "mom_w": 0.85, "mr_w": 0.15,
         "trigger": 0.75,
         "stability_days": 7,   # stickiness default
-        "sector_cap": 0.30     # sector cap default
+        "sector_cap": 0.30,    # sector cap default
+        # Quality filter defaults
+        "min_roe": 0.0,        # require ROE >= 0%
+        "max_de": 2.0         # require Debt/Equity <= 2
     }
 }
 
@@ -745,7 +748,26 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()
-        
+
+# Fundamental metrics (e.g., ROE, Debt/Equity)
+@st.cache_data(ttl=43200)
+def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
+    """Fetch basic fundamental metrics for the supplied tickers."""
+    records = []
+    for t in tickers:
+        try:
+            info = yf.Ticker(t).info
+            records.append({
+                "Ticker": t,
+                "roe": info.get("returnOnEquity"),
+                "de": info.get("debtToEquity"),
+            })
+        except Exception:
+            continue
+    if not records:
+        return pd.DataFrame(columns=["roe", "de"])
+    return pd.DataFrame.from_records(records).set_index("Ticker")
+
 # =========================
 # Persistence (Gist + Local) - Unchanged
 # =========================
@@ -1008,10 +1030,30 @@ def run_momentum_composite_param(
     sector_cap: float = 0.30,
     stickiness_days: int = 7,
     use_enhanced_features: bool = True,
+    min_roe: float = 0.0,
+    max_de: float = 2.0,
 ):
     """Enhanced momentum sleeve with stickiness, volatility-aware name caps, and
     simultaneous sector+name (and group) enforcement using the enhanced taxonomy."""
     debug_caps = bool(st.session_state.get("debug_caps", False))
+
+    # Quality filter applied once at start
+    if (min_roe is not None) or (max_de is not None):
+        fundamentals = fetch_fundamental_metrics(list(daily.columns))
+        mask = pd.Series(True, index=daily.columns)
+        if min_roe is not None:
+            mask &= fundamentals["roe"].ge(min_roe).fillna(False)
+        if max_de is not None:
+            mask &= fundamentals["de"].le(max_de).fillna(False)
+        keep = mask[mask].index.tolist()
+        if len(keep) < daily.shape[1]:
+            removed = set(daily.columns) - set(keep)
+            if removed:
+                st.info(f"🧾 Quality filter removed {len(removed)} stocks")
+        daily = daily[keep]
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
+        if daily.empty:
+            return pd.Series(dtype=float), pd.Series(dtype=float)
 
     monthly = daily.resample("ME").last()
     fwd = monthly.pct_change().shift(-1)  # next-month returns
@@ -1211,6 +1253,28 @@ def _build_isa_weights_fixed(
     if debug_caps:
         st.info(f"🔧 _build_isa_weights_fixed(): frame has {len(daily_close.columns)} stocks")
 
+    # -----------------
+    # Quality filter
+    # -----------------
+    min_roe = preset.get("min_roe")
+    max_de  = preset.get("max_de")
+    if (min_roe is not None) or (max_de is not None):
+        fundamentals = fetch_fundamental_metrics(list(daily_close.columns))
+        mask = pd.Series(True, index=daily_close.columns)
+        if min_roe is not None:
+            mask &= fundamentals["roe"].ge(min_roe).fillna(False)
+        if max_de is not None:
+            mask &= fundamentals["de"].le(max_de).fillna(False)
+        keep = mask[mask].index.tolist()
+        if len(keep) < daily_close.shape[1]:
+            removed = set(daily_close.columns) - set(keep)
+            if removed:
+                st.info(f"🧾 Quality filter removed {len(removed)} stocks")
+        daily_close = daily_close[keep]
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
+        if daily_close.empty:
+            return pd.Series(dtype=float)
+
     monthly = daily_close.resample("ME").last()
 
     # --- Momentum Component (NO CAPS YET) ---
@@ -1342,6 +1406,8 @@ def generate_live_portfolio_isa_monthly(
     params["stability_days"] = int(stickiness_days)
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
+    params["min_roe"]        = float(st.session_state.get("min_roe", params.get("min_roe", 0.0)))
+    params["max_de"]         = float(st.session_state.get("max_de", params.get("max_de", 2.0)))
     
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
@@ -1426,6 +1492,8 @@ def run_backtest_isa_dynamic(
     mom_weight: float = 0.85,
     mr_weight: float = 0.15,
     use_enhanced_features: bool = True,
+    min_roe: float = 0.0,
+    max_de: float = 2.0,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
     Enhanced ISA-Dynamic hybrid backtest with new features
@@ -1462,7 +1530,9 @@ def run_backtest_isa_dynamic(
         name_cap=name_cap,
         sector_cap=sector_cap,
         stickiness_days=stickiness_days,
-        use_enhanced_features=use_enhanced_features
+        use_enhanced_features=use_enhanced_features,
+        min_roe=min_roe,
+        max_de=max_de,
     )
     mr_rets, mr_tno = run_backtest_mean_reversion(
         daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200

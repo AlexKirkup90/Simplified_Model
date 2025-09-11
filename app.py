@@ -66,15 +66,35 @@ sector_cap_pct = st.sidebar.slider(
     step=5
 )
 
+# --- Quality filter controls ---
+min_roe_pct = st.sidebar.slider(
+    "Min return on equity (%)",
+    min_value=-10,
+    max_value=40,
+    value=int(preset.get("min_roe", 0.0) * 100),
+    step=5,
+)
+max_de = st.sidebar.slider(
+    "Max debt/equity",
+    min_value=0.0,
+    max_value=5.0,
+    value=float(preset.get("max_de", 2.0)),
+    step=0.1,
+    format="%.1f",
+)
+
 # Convert to fractions for backend and stash in session
 name_cap = name_cap_pct / 100.0
 sector_cap = sector_cap_pct / 100.0
 st.session_state["name_cap"] = name_cap
 st.session_state["sector_cap"] = sector_cap
+st.session_state["min_roe"] = min_roe_pct / 100.0
+st.session_state["max_de"] = float(max_de)
 
 # Optional helper labels
 st.sidebar.caption(f"Single-name cap: **{name_cap_pct}%**")
 st.sidebar.caption(f"Sector cap: **{sector_cap_pct}%**")
+st.sidebar.caption(f"Quality: ROE ≥ {min_roe_pct}% and D/E ≤ {max_de:.1f}")
 
 # Persist to session so backend reads the same values
 st.session_state["stickiness_days"] = int(stickiness_days)
@@ -146,7 +166,9 @@ if go:
                 mr_topn=preset["mr_topn"],
                 mom_weight=preset["mom_w"],
                 mr_weight=preset["mr_w"],
-                use_enhanced_features=use_enhanced_features
+                use_enhanced_features=use_enhanced_features,
+                min_roe=float(st.session_state.get("min_roe", preset.get("min_roe", 0.0))),
+                max_de=float(st.session_state.get("max_de", preset.get("max_de", 2.0))),
             )
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
