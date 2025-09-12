@@ -34,8 +34,19 @@ def _mock_env(monkeypatch):
     def fake_fundamental_quality_filter(df, min_profitability, max_leverage):
         return df.index.tolist()
 
-    def fake_build_weights(close, params, sectors_map):
-        return pd.Series({"AAA": 0.6, "BBB": 0.4})
+    def fake_build_weights(close, params, sectors_map, return_details=False):
+        weights = pd.Series({"AAA": 0.6, "BBB": 0.4})
+        if return_details:
+            details = pd.DataFrame({
+                "Weight": weights,
+                "Sector": ["Tech", "Tech"],
+                "Momentum": [0.0, 0.0],
+                "MeanRev": [0.0, 0.0],
+                "Cap Notes": ["", ""],
+                "Regime Modifier": ["n/a", "n/a"],
+            })
+            return weights, details
+        return weights
 
     monkeypatch.setattr(backend, "get_universe", fake_get_universe)
     monkeypatch.setattr(backend, "fetch_price_volume", fake_fetch_price_volume)
@@ -51,7 +62,7 @@ def test_first_trading_day_saves(monkeypatch):
 
     with patch.object(backend, "save_portfolio_to_gist") as spg, \
          patch.object(backend, "save_current_portfolio") as scp:
-        disp, raw, decision = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 3))
+        disp, raw, details, decision = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 3))
         price_index = st.session_state.get("latest_price_index")
         assert raw is not None and not raw.empty
         saved = backend.save_portfolio_if_rebalance(raw, price_index)
@@ -67,7 +78,7 @@ def test_mid_month_no_save(monkeypatch):
 
     with patch.object(backend, "save_portfolio_to_gist") as spg, \
          patch.object(backend, "save_current_portfolio") as scp:
-        disp, raw, decision = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 17))
+        disp, raw, details, decision = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 17))
         price_index = st.session_state.get("latest_price_index")
         assert raw is not None and not raw.empty
         saved = backend.save_portfolio_if_rebalance(raw, price_index)

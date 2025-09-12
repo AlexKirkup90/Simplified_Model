@@ -86,6 +86,8 @@ if assess:
     st.json(assessment["settings"])
     for k, v in assessment["settings"].items():
         st.session_state[k] = v
+    st.session_state["last_assessment_metrics"] = assessment["metrics"]
+    st.session_state["last_assessment_settings"] = assessment["settings"]
 
     # -------------------------
     # Assessment log & accuracy
@@ -161,7 +163,7 @@ if go:
     with st.spinner("Building enhanced monthly-locked portfolio and running backtest…"):
         try:
             # ---- Live portfolio (monthly lock + stability + trigger + sector caps + enhancements)
-            live_disp, live_raw, decision = backend.generate_live_portfolio_isa_monthly(
+            live_disp, live_raw, details, decision = backend.generate_live_portfolio_isa_monthly(
                 preset=preset,
                 prev_portfolio=prev_portfolio,
                 min_dollar_volume=st.session_state.get("min_dollar_volume", 0),
@@ -197,6 +199,7 @@ if go:
         # save to session for Save button / persistence
         if live_raw is not None and not live_raw.empty:
             st.session_state.latest_portfolio = live_raw.copy()
+            st.session_state.latest_details = details.copy() if details is not None else None
 
 # ---------------------------
 # Tab 1: Rebalancing Plan
@@ -265,6 +268,30 @@ with tab2:
             st.info("Preview only – portfolio not saved")
 
         st.dataframe(live_disp, use_container_width=True)
+
+        # Detailed factor and cap table
+        details = st.session_state.get("latest_details")
+        with st.expander("📋 Factor & Cap Details"):
+            if details is not None and not details.empty:
+                df_show = details.copy()
+                df_show["Weight"] = df_show["Weight"].map(lambda x: f"{x:.2%}")
+                df_show["Momentum"] = df_show["Momentum"].map(lambda x: f"{x:.2f}")
+                df_show["MeanRev"] = df_show["MeanRev"].map(lambda x: f"{x:.2f}")
+                cols = ["Weight", "Sector", "Momentum", "MeanRev", "Cap Notes", "Regime Modifier"]
+                df_show = df_show[cols]
+                st.dataframe(df_show, use_container_width=True)
+            else:
+                st.write("No details available.")
+
+            metrics = st.session_state.get("last_assessment_metrics")
+            settings_used = {
+                "sector_cap": st.session_state.get("sector_cap"),
+                "name_cap": st.session_state.get("name_cap"),
+                "stickiness_days": st.session_state.get("stickiness_days"),
+            }
+            expl = backend.explain_assessment(metrics, settings_used)
+            if expl:
+                st.caption(expl)
 
         # Extract current weights safely
         try:

@@ -1529,9 +1529,15 @@ def fundamental_quality_filter(
 def _build_isa_weights_fixed(
     daily_close: pd.DataFrame,
     preset: Dict,
-    sectors_map: Dict[str, str]
-) -> pd.Series:
-    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio."""
+    sectors_map: Dict[str, str],
+    return_details: bool = False,
+) -> pd.Series | Tuple[pd.Series, pd.DataFrame]:
+    """Apply position sizing + hierarchical caps and optionally return detail rows.
+
+    When ``return_details`` is ``True`` the function returns a tuple of
+    ``(weights, detail_df)`` where ``detail_df`` contains factor scores,
+    sector labels and cap/regime annotations for each security.
+    """
     debug_caps = bool(st.session_state.get("debug_caps", False))
 
     if debug_caps:
@@ -1577,7 +1583,7 @@ def _build_isa_weights_fixed(
     if combined_raw.empty or combined_raw.sum() <= 0:
         if debug_caps:
             st.warning("⚠️ combined_raw is empty; returning early.")
-        return combined_raw
+        return (combined_raw, pd.DataFrame()) if return_details else combined_raw
 
     if debug_caps:
         st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
@@ -1611,7 +1617,7 @@ def _build_isa_weights_fixed(
     if final_weights.empty or final_weights.sum() <= 0:
         if debug_caps:
             st.warning("⚠️ enforce_caps_iteratively returned empty weights; returning empty.")
-        return final_weights
+        return (final_weights, pd.DataFrame()) if return_details else final_weights
 
     # Optional: sanity check (logs only)
     if debug_caps:
@@ -1623,8 +1629,41 @@ def _build_isa_weights_fixed(
         else:
             st.success("✅ Post-enforcement: no constraint violations detected.")
 
-    # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
-    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+    final_weights = final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+
+    if not return_details:
+        return final_weights
+
+    # -------------------------------
+    # Build detail DataFrame
+    # -------------------------------
+    details = pd.DataFrame(index=final_weights.index)
+    details["Weight"] = final_weights
+    details["Sector"] = [enhanced_sectors.get(t, "Other") for t in final_weights.index]
+    # Factor scores
+    details["Momentum"] = comp_vec.reindex(final_weights.index)
+    details["MeanRev"] = st_ret.reindex(final_weights.index)
+
+    # Cap notes
+    cap_notes: Dict[str, str] = {}
+    sector_totals = final_weights.groupby(details["Sector"]).sum()
+    for t in final_weights.index:
+        notes: List[str] = []
+        if abs(final_weights[t] - combined_raw.get(t, 0.0)) > 1e-6:
+            if final_weights[t] >= preset["mom_cap"] - 1e-6:
+                notes.append("Name cap")
+            sec = details.loc[t, "Sector"]
+            if sector_totals.get(sec, 0.0) >= preset.get("sector_cap", 0.30) - 1e-6:
+                notes.append("Sector cap")
+        cap_notes[t] = ", ".join(notes)
+    details["Cap Notes"] = pd.Series(cap_notes)
+
+    regime_label = (
+        st.session_state.get("last_assessment_metrics", {}).get("regime", "n/a")
+    )
+    details["Regime Modifier"] = regime_label
+
+    return final_weights, details
 
 def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str], 
                               name_cap: float, sector_cap: float) -> List[str]:
@@ -1660,7 +1699,7 @@ def generate_live_portfolio_isa_monthly(
     prev_portfolio: Optional[pd.DataFrame],
     min_dollar_volume: float = 0.0,
     as_of: date | None = None,
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
     Now includes regime awareness, volatility adjustments, and an optional `as_of` date.
@@ -1728,7 +1767,7 @@ def generate_live_portfolio_isa_monthly(
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
 
-    new_w = _build_isa_weights_fixed(close, params, sectors_map)
+    new_w, details = _build_isa_weights_fixed(close, params, sectors_map, return_details=True)
 
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
@@ -1743,12 +1782,12 @@ def generate_live_portfolio_isa_monthly(
             if health >= params["trigger"]:
                 decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
                 disp, raw = _format_display(prev_w)
-                return disp, raw, decision
+                return disp, raw, details, decision
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
     disp, raw = _format_display(new_w)
-    return disp, raw, decision
+    return disp, raw, details, decision
 
 def run_backtest_isa_dynamic(
     roundtrip_bps: float = 0.0,
@@ -2171,6 +2210,43 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
         pass
 
     return {"metrics": metrics, "settings": settings}
+
+def explain_assessment(metrics: Dict[str, Any], settings: Dict[str, Any]) -> str:
+    """Generate a brief explanation linking market metrics to settings."""
+    if not metrics or not settings:
+        return ""
+
+    vix_thresh = st.session_state.get("vix_ts_threshold", VIX_TS_THRESHOLD_DEFAULT)
+    oas_thresh = st.session_state.get("hy_oas_threshold", HY_OAS_THRESHOLD_DEFAULT)
+
+    breadth = metrics.get("breadth_pos_6m", np.nan)
+    vol10 = metrics.get("qqq_vol_10d", np.nan)
+    vix_ts = metrics.get("vix_term_structure", np.nan)
+    hy_oas = metrics.get("hy_oas", np.nan)
+    regime = metrics.get("regime", "n/a")
+
+    lines = [
+        f"Regime **{regime}** | Breadth {breadth:.0%} | 10d vol {vol10:.2%} | VIX TS {vix_ts:.2f} | HY OAS {hy_oas:.2f}",
+    ]
+
+    sc = settings.get("sector_cap", 0.30)
+    nc = settings.get("name_cap", 0.25)
+    sd = settings.get("stickiness_days", 7)
+
+    if breadth < 0.35 or vol10 > 0.045 or vix_ts < vix_thresh or hy_oas > oas_thresh:
+        lines.append(
+            f"Stress signals tightened caps to sector {sc:.0%}, name {nc:.0%} with stickiness {sd}d."
+        )
+    elif breadth > 0.65 and vol10 < 0.025 and vix_ts >= vix_thresh and hy_oas < max(0.0, oas_thresh - 1):
+        lines.append(
+            f"Supportive metrics relaxed caps to sector {sc:.0%}, name {nc:.0%} with stickiness {sd}d."
+        )
+    else:
+        lines.append(
+            f"Neutral environment: sector cap {sc:.0%}, name cap {nc:.0%}, stickiness {sd}d."
+        )
+
+    return " — ".join(lines)
 
 # =========================
 # Assessment Logging
