@@ -33,5 +33,6 @@ def test_run_backtest_predictive_produces_positive_returns():
     daily = monthly.resample('D').ffill()
     rets, tno = sc.run_backtest_predictive(daily, lookback_m=2, top_n=1, cap=1.0)
     assert rets.sum() > 0
-    assert (tno > 0).any()
+    # First non-zero turnover should be 0.5 (half the L1 distance)
+    assert np.isclose(tno[tno > 0].iloc[0], 0.5)
 

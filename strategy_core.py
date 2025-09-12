@@ -140,6 +140,8 @@ def volatility_target(returns: pd.Series, target_vol_annual: Optional[float] = N
 def apply_tc(returns: pd.Series, turnover: pd.Series, tc_bps: float = 10.0) -> pd.Series:
     """Apply simple transaction cost model in basis points per 100% turnover per rebalance.
 
+    Turnover is defined as ``0.5 * |w - w_prev|_1`` at each rebalance.
+
     Example: tc_bps=10 means 10 bps * turnover deducted from that period's return.
     """
     drag = (tc_bps / 1e4) * turnover.fillna(0)
@@ -184,6 +186,8 @@ def run_backtest_momentum(daily_prices: pd.DataFrame, lookback_m: int = 6,
     Returns
     -------
     (monthly_returns, monthly_turnover)
+
+    Turnover uses 0.5 × L1 weight change between rebalances.
     """
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
@@ -209,12 +213,9 @@ def run_backtest_momentum(daily_prices: pd.DataFrame, lookback_m: int = 6,
         valid = w.index.intersection(future.columns)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
-        if prev_w is None:
-            tno.loc[dt] = w.abs().sum()  # first allocation
-        else:
-            # turnover = 0.5 * |w - w_prev|_1 is common; here use full L1 as per your UI
-            aligned_prev = prev_w.reindex(w.index).fillna(0)
-            tno.loc[dt] = (w - aligned_prev).abs().sum()
+        # Turnover as 0.5 * L1 weight change (prev_w = 0 if None)
+        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
+        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -290,6 +291,8 @@ def run_backtest_predictive(daily_prices: pd.DataFrame, lookback_m: int = 12,
     Returns
     -------
     (monthly_returns, monthly_turnover)
+
+    Turnover uses 0.5 × L1 weight change between rebalances.
     """
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
@@ -315,11 +318,8 @@ def run_backtest_predictive(daily_prices: pd.DataFrame, lookback_m: int = 12,
         valid = w.index.intersection(future.columns)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
-        if prev_w is None:
-            tno.loc[dt] = w.abs().sum()
-        else:
-            aligned_prev = prev_w.reindex(w.index).fillna(0)
-            tno.loc[dt] = (w - aligned_prev).abs().sum()
+        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
+        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
