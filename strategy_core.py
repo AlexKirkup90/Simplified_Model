@@ -57,36 +57,40 @@ def get_nasdaq_100_plus_tickers(extras: Optional[Iterable[str]] = None,
 
 def fetch_market_data(tickers: Iterable[str],
                       start_date: str,
-                      end_date: Optional[str] = None,
-                      price_field: str = "Close") -> pd.DataFrame:
-    """Fetch daily prices for tickers using yfinance.
+                      end_date: Optional[str] = None) -> pd.DataFrame:
+    """Fetch daily split/dividend-adjusted close prices for tickers using yfinance.
 
     Parameters
     ----------
     tickers : list-like of str
     start_date : YYYY-MM-DD
     end_date : YYYY-MM-DD or None (None = today)
-    price_field : "Close", "Adj Close", etc.
 
     Returns
     -------
     DataFrame indexed by date (daily), columns=tickers.
+
+    Notes
+    -----
+    Prices are adjusted for splits and dividends via ``auto_adjust=True``.
     """
     if not tickers:
         return pd.DataFrame()
     data = yf.download(list(tickers), start=start_date, end=end_date, auto_adjust=True, progress=False)
-    if isinstance(data, pd.DataFrame) and price_field in data:
-        df = data[price_field]
+    if isinstance(data, pd.DataFrame) and "Close" in data:
+        df = data["Close"]
     else:
-        # When yfinance returns a single column (single ticker), coerce to 2D
         if isinstance(data, pd.Series):
-            df = data.to_frame(name=price_field)
+            df = data.to_frame(name="Close")
         else:
-            # Fallback: try to select the last level assuming wide columns
             try:
-                df = data.xs(price_field, axis=1, level=0)
+                df = data.xs("Close", axis=1, level=0)
             except Exception:
                 return pd.DataFrame()
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    if df.shape[1] == 1 and len(list(tickers)) == 1:
+        df.columns = [list(tickers)[0]]
     return df.dropna(how="all", axis=1)
 
 
