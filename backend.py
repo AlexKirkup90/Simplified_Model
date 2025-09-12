@@ -1184,7 +1184,14 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
                 preset = STRATEGY_PRESETS.get("ISA Dynamic (0.75)", {})
                 name_cap = float(preset.get("mom_cap", 0.25))
                 sector_cap = float(preset.get("sector_cap", 0.30))
-                violations = check_constraint_violations(weights, sectors_map, name_cap, sector_cap)
+                group_caps = build_group_caps(sectors_map)
+                violations = check_constraint_violations(
+                    weights,
+                    sectors_map,
+                    name_cap,
+                    sector_cap,
+                    group_caps=group_caps,
+                )
                 if violations:
                     st.sidebar.warning(
                         f"Discarded {source} portfolio: constraint violations {violations}"
@@ -1739,8 +1746,13 @@ def _build_isa_weights_fixed(
     # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
     return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
-def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str], 
-                              name_cap: float, sector_cap: float) -> List[str]:
+def check_constraint_violations(
+    weights: pd.Series,
+    sectors_map: Dict[str, str],
+    name_cap: float,
+    sector_cap: float,
+    group_caps: dict[str, float] | None = None,
+) -> List[str]:
     """
     Check for constraint violations in final portfolio
     Returns list of violation descriptions
@@ -1755,10 +1767,26 @@ def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str],
     # Check sector caps
     sectors = pd.Series({t: sectors_map.get(t, "Unknown") for t in weights.index})
     sector_sums = weights.groupby(sectors).sum()
-    
+
     for sector, total_weight in sector_sums.items():
         if total_weight > sector_cap + 0.01:  # 1% tolerance
             violations.append(f"{sector}: {total_weight:.1%} > {sector_cap:.1%}")
+
+    # Optional hierarchical/group caps (e.g., Software sub-buckets)
+    if group_caps:
+        # Build enhanced sector mapping so group labels match potential sub-buckets
+        enhanced_map = get_enhanced_sector_map(list(weights.index), base_map=sectors_map)
+        ser_group = pd.Series(enhanced_map)
+        group_sums = weights.groupby(ser_group).sum()
+        parent_sums = weights.groupby(ser_group.map(lambda s: s.split(":")[0])).sum()
+
+        for group, cap in group_caps.items():
+            if ":" in group:
+                w = group_sums.get(group, 0.0)
+            else:
+                w = parent_sums.get(group, 0.0)
+            if w > cap + 0.01:  # 1% tolerance
+                violations.append(f"{group}: {w:.1%} > {cap:.1%}")
     
     return violations
 
@@ -1855,12 +1883,16 @@ def generate_live_portfolio_isa_monthly(
 
     # Validate and re-enforce caps if scaling introduced violations
     if len(new_w) > 0:
+        enhanced_sectors = get_enhanced_sector_map(list(new_w.index), base_map=sectors_map)
+        group_caps = build_group_caps(enhanced_sectors)
         violations = check_constraint_violations(
-            new_w, sectors_map, params["mom_cap"], params.get("sector_cap", 0.30)
+            new_w,
+            sectors_map,
+            params["mom_cap"],
+            params.get("sector_cap", 0.30),
+            group_caps=group_caps,
         )
         if violations:
-            enhanced_sectors = get_enhanced_sector_map(list(new_w.index), base_map=sectors_map)
-            group_caps = build_group_caps(enhanced_sectors)
             new_w = enforce_caps_iteratively(
                 new_w.astype(float),
                 enhanced_sectors,
@@ -1869,7 +1901,11 @@ def generate_live_portfolio_isa_monthly(
                 group_caps=group_caps,
             )
             violations = check_constraint_violations(
-                new_w, sectors_map, params["mom_cap"], params.get("sector_cap", 0.30)
+                new_w,
+                sectors_map,
+                params["mom_cap"],
+                params.get("sector_cap", 0.30),
+                group_caps=group_caps,
             )
             if violations:
                 raise ValueError(
