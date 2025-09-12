@@ -9,6 +9,8 @@ from io import StringIO
 import streamlit as st
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from pathlib import Path
 import optimizer
 import strategy_core
 from strategy_core import HybridConfig
@@ -866,26 +868,67 @@ def fetch_sp500_constituents() -> List[str]:
 _SECTOR_CACHE_TTL = 86400
 _SECTOR_CACHE: Dict[str, str] = {}
 
+_SECTOR_OVERRIDE_PATH = Path(__file__).with_name("sector_overrides.csv")
+
+
+def _load_sector_overrides() -> Dict[str, str]:
+    if _SECTOR_OVERRIDE_PATH.exists():
+        try:
+            df = pd.read_csv(_SECTOR_OVERRIDE_PATH)
+            return {
+                str(row["Ticker"]).upper(): str(row["Sector"])
+                for _, row in df.iterrows()
+            }
+        except Exception:
+            return {}
+    return {}
+
+
+_SECTOR_OVERRIDES = _load_sector_overrides()
+
+
+def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
+    """Fetch ``ticker.info`` with a timeout and graceful fallback."""
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(ticker.get_info)
+        try:
+            return future.result(timeout=timeout) or {}
+        except TimeoutError:
+            return {}
+        except Exception:
+            return {}
+
 @st.cache_data(ttl=_SECTOR_CACHE_TTL)
 def get_sector_map(tickers: List[str]) -> Dict[str, str]:
     """Return a mapping from ticker to sector name.
 
-    Each ticker is fetched from :mod:`yfinance` at most once. Results are
-    cached per ticker in the module-level ``_SECTOR_CACHE`` and the full mapping
-    is cached by Streamlit's ``st.cache_data`` decorator for 24 hours
-    (``_SECTOR_CACHE_TTL``). This minimises repeated network requests across
-    executions. Tickers with missing sector information are stored as
-    ``"Unknown"``.
+    Each ticker is fetched from :mod:`yfinance` at most once. Results are cached
+    per ticker in ``_SECTOR_CACHE`` and the full mapping is cached by Streamlit
+    for 24 hours. Local overrides from ``sector_overrides.csv`` take precedence,
+    ``Ticker.fast_info`` is used when possible, and any remaining calls to
+    ``ticker.info`` are wrapped with a timeout to avoid hangs. Tickers with
+    missing sector information are stored as ``"Unknown"``.
     """
+
     new_tickers = [t for t in tickers if t not in _SECTOR_CACHE]
     for t in new_tickers:
+        if t in _SECTOR_OVERRIDES:
+            _SECTOR_CACHE[t] = _SECTOR_OVERRIDES[t]
+            continue
         try:
-            info = yf.Ticker(t).info or {}
-            sector = info.get("sector") or "Unknown"
+            tkr = yf.Ticker(t)
+            sector = tkr.fast_info.get("sector")
+            if not sector:
+                sector = _safe_get_info(tkr).get("sector") or "Unknown"
         except Exception:
             sector = "Unknown"
         _SECTOR_CACHE[t] = sector
-    return {t: _SECTOR_CACHE.get(t, "Unknown") for t in tickers}
+
+    return {
+        t: _SECTOR_OVERRIDES.get(t, _SECTOR_CACHE.get(t, "Unknown"))
+        for t in tickers
+    }
 
 def get_nasdaq_100_plus_tickers() -> List[str]:
     """Get NASDAQ 100+ tickers with fallback list"""
@@ -1528,11 +1571,17 @@ def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
         profitability = np.nan
         leverage = np.nan
         try:
-            info = yf.Ticker(t).info
-            profitability = info.get("returnOnAssets")
+            tkr = yf.Ticker(t)
+            fi = tkr.fast_info
+            profitability = fi.get("returnOnAssets") or fi.get("profitMargins")
+            leverage = fi.get("debtToEquity")
+            info = {}
+            if profitability is None or leverage is None:
+                info = _safe_get_info(tkr)
             if profitability is None:
-                profitability = info.get("profitMargins")
-            leverage = info.get("debtToEquity")
+                profitability = info.get("returnOnAssets") or info.get("profitMargins")
+            if leverage is None:
+                leverage = info.get("debtToEquity")
             if leverage is not None and leverage > 10:
                 # many providers return percentage values
                 leverage = leverage / 100.0
