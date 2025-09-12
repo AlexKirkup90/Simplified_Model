@@ -47,6 +47,8 @@ def grid_search_hybrid(
     daily_prices: pd.DataFrame,
     param_grid: Dict[str, Iterable],
     base_cfg: HybridConfig | None = None,
+    tc_bps: float = 0.0,
+    apply_vol_target: bool = False,
 ) -> Tuple[HybridConfig, pd.DataFrame]:
     """Search over ``param_grid`` and return best config and results table.
 
@@ -58,6 +60,10 @@ def grid_search_hybrid(
         Mapping of ``HybridConfig`` field names to iterables of values.
     base_cfg : HybridConfig, optional
         Configuration to start from.  Defaults to ``HybridConfig()``.
+    tc_bps : float, optional
+        Transaction cost in basis points applied per rebalance.
+    apply_vol_target : bool, optional
+        If True and ``cfg.target_vol_annual`` is set, apply volatility targeting.
 
     Returns
     -------
@@ -70,13 +76,15 @@ def grid_search_hybrid(
     keys = list(param_grid.keys())
     best_score = float("-inf")
     best_cfg = base_cfg
-    rows = []
+    rows: list[dict] = []
 
     for combo in itertools.product(*param_grid.values()):
         params = dict(zip(keys, combo))
         cfg = replace(base_cfg, **params)
-        res = run_hybrid_backtest(daily_prices, cfg)
-        sharpe = _annualized_sharpe(res["hybrid_rets"])
+        cfg = replace(cfg, tc_bps=tc_bps)
+        res = run_hybrid_backtest(daily_prices, cfg, apply_vol_target=apply_vol_target)
+        rets = res.get("hybrid_rets_net", res["hybrid_rets"])
+        sharpe = _annualized_sharpe(rets)
         row = {**params, "sharpe": sharpe}
         rows.append(row)
         if sharpe > best_score:
