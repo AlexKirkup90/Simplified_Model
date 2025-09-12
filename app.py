@@ -263,6 +263,20 @@ with tab1:
                 else:
                     st.write("None")
 
+        # Build rebalancing plan for download
+        picks_rows = []
+        for t in signals["sell"]:
+            old_w = float(prev_portfolio.loc[t, "Weight"]) if prev_portfolio is not None and t in prev_portfolio.index else 0.0
+            picks_rows.append({"Action": "Sell", "Ticker": t, "OldWeight": old_w, "NewWeight": 0.0})
+        for t in signals["buy"]:
+            new_w = float(live_raw.loc[t, "Weight"]) if t in live_raw.index else 0.0
+            picks_rows.append({"Action": "Buy", "Ticker": t, "OldWeight": 0.0, "NewWeight": new_w})
+        for t, old_w, new_w in signals["rebalance"]:
+            picks_rows.append({"Action": "Rebalance", "Ticker": t, "OldWeight": old_w, "NewWeight": new_w})
+        picks = pd.DataFrame(picks_rows)
+        plan_csv = picks.to_csv(index=False).encode("utf-8")
+        st.download_button("Download Plan", plan_csv, "rebalancing_plan.csv", "text/csv")
+
 # ---------------------------
 # Tab 2: Current Portfolio
 # ---------------------------
