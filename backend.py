@@ -1500,7 +1500,8 @@ def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
 def generate_live_portfolio_isa_monthly(
     preset: Dict,
     prev_portfolio: Optional[pd.DataFrame],
-    min_dollar_volume: float = 0.0
+    min_dollar_volume: float = 0.0,
+    as_of: date | None = None,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
@@ -1521,9 +1522,10 @@ def generate_live_portfolio_isa_monthly(
     if not base_tickers:
         return None, None, "No universe available."
 
+    today = as_of or date.today()
     # Fetch prices
-    start = (datetime.today() - relativedelta(months=max(preset["mom_lb"], 12) + 8)).strftime("%Y-%m-%d")
-    end   = datetime.today().strftime("%Y-%m-%d")
+    start = (today - relativedelta(months=max(preset["mom_lb"], 12) + 8)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
     close, vol = fetch_price_volume(base_tickers, start, end)
     if close.empty:
         return None, None, "No price data."
@@ -1556,7 +1558,6 @@ def generate_live_portfolio_isa_monthly(
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
     # Monthly lock check — hold previous if not first trading day
-    today = datetime.today().date()
     is_monthly = is_rebalance_today(today, close.index)
     decision = "Not the monthly rebalance day — holding previous portfolio."
     if not is_monthly:
