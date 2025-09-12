@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore")
 GIST_ID = st.secrets.get("GIST_ID")
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
 GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}" if GIST_ID else None
-HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 GIST_PORTF_FILE = "portfolio.json"
 LIVE_PERF_FILE  = "live_perf.csv"
