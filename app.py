@@ -307,7 +307,11 @@ with tab2:
             total_exp = weights.sum()
             c1, c2 = st.columns(2)
             c1.metric("Max Weight", f"{max_w:.2%}")
-            c2.metric("Total Equity Exposure", f"{total_exp:.2%}")
+            c2.metric(
+                "Total Equity Exposure",
+                f"{total_exp:.2%}",
+                help="Sector/name cap trimming leaves residual cash until final exposure scaling.",
+            )
 
             if violations:
                 st.markdown("**Constraint Violations**")
