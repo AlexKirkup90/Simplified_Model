@@ -1,5 +1,5 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
-import os, io, warnings, json
+import os, io, warnings, json, hashlib
 from typing import Optional, Tuple, Dict, List, Any
 import numpy as np
 import pandas as pd
@@ -939,6 +939,9 @@ _SECTOR_CACHE: Dict[str, str] = {}
 
 _SECTOR_OVERRIDE_PATH = Path(__file__).with_name("sector_overrides.csv")
 
+# Directory for parquet-based caching of downloaded price data
+PARQUET_CACHE_DIR = Path(".parquet_cache")
+
 
 def _load_sector_overrides() -> Dict[str, str]:
     if _SECTOR_OVERRIDE_PATH.exists():
@@ -958,6 +961,27 @@ def _load_sector_overrides() -> Dict[str, str]:
 
 
 _SECTOR_OVERRIDES = _load_sector_overrides()
+
+
+def _parquet_cache_path(prefix: str, tickers: List[str], start_date: str, end_date: str) -> Path:
+    """Return a filesystem path for caching data as parquet.
+
+    A short hash based on the prefix, tickers and date range is used so the
+    filenames remain manageable regardless of the number of tickers provided.
+    The cache directory is created on demand so tests can monkeypatch
+    ``PARQUET_CACHE_DIR`` to a temporary location.
+    """
+
+    PARQUET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key_obj = {
+        "p": prefix,
+        "t": sorted(tickers),
+        "s": start_date,
+        "e": end_date,
+    }
+    key = json.dumps(key_obj, sort_keys=True)
+    fname = hashlib.sha256(key.encode("utf-8")).hexdigest() + ".parquet"
+    return PARQUET_CACHE_DIR / fname
 
 
 def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
@@ -1106,6 +1130,13 @@ def _prepare_universe_for_backtest(
 # =========================
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
+    if cache_path.exists():
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            pass
+
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         frames: List[pd.DataFrame] = []
@@ -1126,15 +1157,23 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
         # Enhanced data cleaning pipeline
         if not result.empty:
-            cleaned_result, cleaning_alerts = validate_and_clean_market_data(result)
+            cleaned_result, cleaning_alerts, _ = validate_and_clean_market_data(result)
 
             # Show cleaning summary
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
                     st.info(f"🧹 Data cleaning: {alert}")
 
+            try:
+                cleaned_result.to_parquet(cache_path)
+            except Exception:
+                pass
             return cleaned_result
 
+        try:
+            result.to_parquet(cache_path)
+        except Exception:
+            pass
         return result
 
     except Exception as e:
@@ -1143,6 +1182,14 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
+    if cache_path.exists():
+        try:
+            combined = pd.read_parquet(cache_path)
+            return combined["Close"], combined["Volume"]
+        except Exception:
+            pass
+
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         close_frames: List[pd.DataFrame] = []
@@ -1177,7 +1224,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
         # Enhanced data cleaning for prices
         if not close.empty:
-            cleaned_close, close_alerts = validate_and_clean_market_data(close)
+            cleaned_close, close_alerts, _ = validate_and_clean_market_data(close)
 
             # Clean volume data (less aggressive)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
@@ -1191,8 +1238,16 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 for alert in close_alerts[:1]:  # Show top cleaning action
                     st.info(f"🧹 Price/Volume cleaning: {alert}")
 
+            try:
+                pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1).to_parquet(cache_path)
+            except Exception:
+                pass
             return cleaned_close, vol_aligned
 
+        try:
+            pd.concat({"Close": close, "Volume": vol}, axis=1).to_parquet(cache_path)
+        except Exception:
+            pass
         return close, vol
 
     except Exception as e:
