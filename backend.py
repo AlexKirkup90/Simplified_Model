@@ -755,9 +755,14 @@ def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
 # =========================
 # NEW: Portfolio Correlation Monitoring
 # =========================
-def calculate_portfolio_correlation_to_market(portfolio_returns: pd.Series, 
+def calculate_portfolio_correlation_to_market(portfolio_returns: pd.Series,
                                             market_returns: pd.Series = None) -> float:
-    """Calculate portfolio correlation to market benchmark"""
+    """Calculate correlation between portfolio and benchmark.
+
+    Both ``portfolio_returns`` and ``market_returns`` should contain daily (or
+    higher frequency) returns. The series are resampled to monthly returns
+    before computing correlation to reduce high‑frequency noise.
+    """
     if market_returns is None:
         # Fetch QQQ data for correlation
         try:
@@ -767,14 +772,18 @@ def calculate_portfolio_correlation_to_market(portfolio_returns: pd.Series,
             market_returns = qqq_data.pct_change().dropna()
         except:
             return np.nan
-    
+
+    # Resample to common monthly frequency
+    port_monthly = (1 + portfolio_returns.dropna()).resample('M').prod() - 1
+    market_monthly = (1 + market_returns.dropna()).resample('M').prod() - 1
+
     # Align periods
-    common_dates = portfolio_returns.index.intersection(market_returns.index)
-    if len(common_dates) < 20:  # Need minimum periods
+    common_dates = port_monthly.index.intersection(market_monthly.index)
+    if len(common_dates) < 3:  # Need minimum periods
         return np.nan
-    
-    port_aligned = portfolio_returns.reindex(common_dates)
-    market_aligned = market_returns.reindex(common_dates)
+
+    port_aligned = port_monthly.reindex(common_dates)
+    market_aligned = market_monthly.reindex(common_dates)
 
     correlation = port_aligned.corr(market_aligned)
     return correlation if not pd.isna(correlation) else 0.0
