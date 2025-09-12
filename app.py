@@ -50,121 +50,25 @@ use_enhanced_features = st.sidebar.checkbox(
 debug_caps = st.sidebar.checkbox("Show sector-cap debug", value=False)
 st.session_state["debug_caps"] = debug_caps
 
-# Stickiness & sector cap (overrides)
-stickiness_days = st.sidebar.slider(
-    "Stickiness (days in top cohort)",
-    3,
-    15,
-    int(st.session_state.get("stickiness_days", preset.get("stability_days", 7))),
-    1,
-    help="Auto-filled from latest market assessment; adjust to override."
-)
-
-# --- Caps (UI in %; backend uses fractions) ---
-name_cap_pct = st.sidebar.slider(
-    "Single-name cap (%)",
-    min_value=20,
-    max_value=50,
-    value=int(st.session_state.get("name_cap", preset.get("mom_cap", 0.25)) * 100),
-    step=5,
-    help="Auto-filled from latest market assessment; adjust to override."
-)
-sector_cap_pct = st.sidebar.slider(
-    "Sector Cap (max % per sector)",
-    min_value=10,
-    max_value=50,
-    value=int(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30)) * 100),
-    step=5,
-    help="Auto-filled from latest market assessment; adjust to override."
-)
-
-# Convert to fractions for backend and stash in session
-name_cap = name_cap_pct / 100.0
-sector_cap = sector_cap_pct / 100.0
-st.session_state["name_cap"] = name_cap
-st.session_state["sector_cap"] = sector_cap
-
-# Optional helper labels
-st.sidebar.caption(f"Single-name cap: **{name_cap_pct}%**")
-st.sidebar.caption(f"Sector cap: **{sector_cap_pct}%**")
-
-# Persist to session so backend reads the same values
-st.session_state["stickiness_days"] = int(stickiness_days)
+# Initialize parameters from presets or prior assessment
+st.session_state.setdefault("stickiness_days", preset.get("stability_days", 7))
+st.session_state.setdefault("name_cap", preset.get("mom_cap", 0.25))
+st.session_state.setdefault("sector_cap", preset.get("sector_cap", 0.30))
+st.session_state.setdefault("roundtrip_bps", backend.ROUNDTRIP_BPS_DEFAULT)
+st.session_state.setdefault("min_dollar_volume", 0)
+st.session_state.setdefault("min_profitability", 0.0)
+st.session_state.setdefault("max_leverage", 2.0)
+st.session_state.setdefault("show_net", True)
+st.session_state.setdefault("enable_hedge", False)
+st.session_state.setdefault("hedge_size", 0.0)
+st.session_state.setdefault("vix_ts_threshold", backend.VIX_TS_THRESHOLD_DEFAULT)
+st.session_state.setdefault("hy_oas_threshold", backend.HY_OAS_THRESHOLD_DEFAULT)
 st.session_state["use_enhanced_features"] = use_enhanced_features
 
-# Trading cost & liquidity
-roundtrip_bps = st.sidebar.slider(
-    "Round-trip cost (bps)",
-    0,
-    100,
-    int(st.session_state.get("roundtrip_bps", backend.ROUNDTRIP_BPS_DEFAULT)),
-    5,
-    help="Auto-filled from latest market assessment; adjust to override."
-)
-min_dollar_volume = st.sidebar.number_input(
-    "Min 60d median $ volume (optional)",
-    min_value=0,
-    value=int(st.session_state.get("min_dollar_volume", 0)),
-    step=100000,
-    help="Auto-filled from latest market assessment; adjust to override."
-)
-st.session_state["roundtrip_bps"] = int(roundtrip_bps)
-st.session_state["min_dollar_volume"] = int(min_dollar_volume)
-
-# Average trade size for turnover-based trade count
-avg_trade_pct = st.sidebar.slider(
-    "Avg single-leg trade size (%)", 0.5, 5.0, AVG_TRADE_SIZE_DEFAULT * 100, 0.5,
-    help="Used to estimate trades/year from turnover"
-)
-AVG_TRADE_SIZE = avg_trade_pct / 100.0
-
-# Fundamental quality thresholds
-min_profitability = st.sidebar.slider(
-    "Min profitability (ROA)", -0.5, 0.5, 0.0, 0.01
-)
-max_leverage = st.sidebar.slider(
-    "Max leverage (Debt/Equity)", 0.0, 5.0, 2.0, 0.1
-)
-st.session_state["min_profitability"] = float(min_profitability)
-st.session_state["max_leverage"] = float(max_leverage)
-
-# Net toggle
-show_net = st.sidebar.checkbox(
-    "Show net of costs",
-    value=st.session_state.get("show_net", True),
-    help="Auto-filled from latest market assessment; adjust to override."
-)
-st.session_state["show_net"] = show_net
-
-# Hedge controls
-enable_hedge = st.sidebar.toggle("Enable QQQ Hedge", value=False)
-hedge_size_pct = st.sidebar.slider("Hedge size (%)", 0, 30, 10, 1) if enable_hedge else 0
-hedge_size = hedge_size_pct / 100.0
-st.session_state["enable_hedge"] = enable_hedge
-st.session_state["hedge_size"] = hedge_size
-
-# Rebalance tolerance for plan
-tol = st.sidebar.slider("Rebalance tolerance (abs Δ weight)", 0.005, 0.05, 0.01, 0.005, format="%.3f")
-
-# Regime metric thresholds
-vix_ts_threshold = st.sidebar.slider(
-    "VIX 3M/1M ratio threshold",
-    0.8,
-    1.4,
-    float(st.session_state.get("vix_ts_threshold", backend.VIX_TS_THRESHOLD_DEFAULT)),
-    0.05,
-    help="Below this ratio signals volatility stress. Auto-filled from latest market assessment; adjust to override.",
-)
-hy_oas_threshold = st.sidebar.slider(
-    "HY OAS threshold (%)",
-    2.0,
-    10.0,
-    float(st.session_state.get("hy_oas_threshold", backend.HY_OAS_THRESHOLD_DEFAULT)),
-    0.5,
-    help="Above this spread signals credit stress. Auto-filled from latest market assessment; adjust to override.",
-)
-st.session_state["vix_ts_threshold"] = float(vix_ts_threshold)
-st.session_state["hy_oas_threshold"] = float(hy_oas_threshold)
+# Derived constants
+AVG_TRADE_SIZE = AVG_TRADE_SIZE_DEFAULT
+tol = 0.01
+show_net = st.session_state["show_net"]
 
 # Prev portfolio (for plan & monthly lock)
 prev_portfolio = backend.load_previous_portfolio()
@@ -576,7 +480,7 @@ with tab3:
         st.pyplot(fig)
 
         st.caption(
-            f"Trades/yr estimated from turnover assuming ~{avg_trade_pct:.1f}% average single-leg trade (adjust in sidebar)."
+            f"Trades/yr estimated from turnover assuming ~{AVG_TRADE_SIZE*100:.1f}% average single-leg trade."
         )
 
         # ========= Monthly Net Returns =========
