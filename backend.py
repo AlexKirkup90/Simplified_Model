@@ -1,6 +1,6 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
 import os, io, warnings
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -1930,6 +1930,87 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
         return label, metrics
     except Exception:
         return "Neutral", {}
+
+
+def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
+    """Assess market conditions and derive configuration settings.
+
+    Parameters
+    ----------
+    as_of : date or None
+        Evaluation date.  Defaults to today when ``None``.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary with two keys:
+        ``metrics`` – market and macro metrics derived from
+        :func:`compute_regime_metrics` and ``get_market_regime``.
+        ``settings`` – recommended caps and other knobs for the
+        strategy based on those metrics.
+    """
+
+    asof_ts = pd.Timestamp(as_of or date.today()).normalize()
+
+    metrics: Dict[str, Any] = {}
+    try:
+        # Build universe and price history for the window preceding ``as_of``
+        univ = st.session_state.get("universe", "Hybrid Top150")
+        base_tickers, _, _ = get_universe(univ)
+        end = asof_ts.strftime("%Y-%m-%d")
+        start = (asof_ts - relativedelta(months=12)).strftime("%Y-%m-%d")
+        hist = fetch_market_data(base_tickers, start, end)
+        metrics.update(compute_regime_metrics(hist))
+    except Exception:
+        metrics = {}
+
+    # Add regime label (uses existing helper which internally recomputes metrics)
+    regime_label, _ = get_market_regime()
+    metrics["regime"] = regime_label
+
+    # Derive settings based on key thresholds
+    breadth = metrics.get("breadth_pos_6m", 0.5)
+    vol10 = metrics.get("qqq_vol_10d", 0.02)
+    vix_ts = metrics.get("vix_term_structure", 1.0)
+    hy_oas = metrics.get("hy_oas", 4.0)
+
+    vix_thresh = st.session_state.get("vix_ts_threshold", VIX_TS_THRESHOLD_DEFAULT)
+    oas_thresh = st.session_state.get("hy_oas_threshold", HY_OAS_THRESHOLD_DEFAULT)
+
+    sector_cap = 0.30
+    name_cap = 0.25
+    stickiness_days = 7
+
+    risk_off = (
+        breadth < 0.35
+        or vol10 > 0.045
+        or vix_ts < vix_thresh
+        or hy_oas > oas_thresh
+    )
+
+    risk_on = (
+        breadth > 0.65
+        and vol10 < 0.025
+        and vix_ts >= vix_thresh
+        and hy_oas < max(0.0, oas_thresh - 1)
+    )
+
+    if risk_off:
+        sector_cap = 0.20
+        name_cap = 0.20
+        stickiness_days = 14
+    elif risk_on:
+        sector_cap = 0.35
+        name_cap = 0.30
+        stickiness_days = 5
+
+    settings = {
+        "sector_cap": float(sector_cap),
+        "name_cap": float(name_cap),
+        "stickiness_days": int(stickiness_days),
+    }
+
+    return {"metrics": metrics, "settings": settings}
 
 # =========================
 # NEW: Strategy Health Monitoring
