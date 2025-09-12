@@ -25,14 +25,17 @@ from typing import Iterable, List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
+from io import StringIO
 
 # ------------------------------
 # 1) Universe & Data
 # ------------------------------
 
-def get_nasdaq_100_plus_tickers(extras: Optional[Iterable[str]] = None,
-                                wikipedia_url: str = "https://en.wikipedia.org/wiki/Nasdaq-100",
-                                table_index: int = 4) -> List[str]:
+def get_nasdaq_100_plus_tickers(
+    extras: Optional[Iterable[str]] = None,
+    wikipedia_url: str = "https://en.wikipedia.org/wiki/Nasdaq-100",
+) -> List[str]:
     """Return current NASDAQ-100 tickers plus optional extras.
 
     Notes
@@ -43,9 +46,14 @@ def get_nasdaq_100_plus_tickers(extras: Optional[Iterable[str]] = None,
     """
     extras = list(extras) if extras else []
     try:
-        tables = pd.read_html(wikipedia_url)
-        tickers = tables[table_index]["Ticker"].astype(str).str.upper().str.strip().tolist()
-        # Cleanups / overrides
+        resp = requests.get(wikipedia_url, headers={'User-Agent': 'Mozilla/5.0'})
+        tables = pd.read_html(StringIO(resp.text))
+        df = next(
+            t for t in tables
+            if any(col.lower() in {"ticker", "symbol"} for col in map(str, t.columns))
+        )
+        col = "Ticker" if "Ticker" in df.columns else "Symbol"
+        tickers = df[col].astype(str).str.upper().str.strip().tolist()
         if "SQ" in extras:
             extras = [x for x in extras if x != "SQ"]  # acquired / renamed
         full = sorted(set(tickers + extras))
