@@ -1,6 +1,6 @@
 # app.py - Enhanced Hybrid Momentum Portfolio (ISA-Dynamic) with Strategy Health Monitoring
 import traceback
-from datetime import datetime, date
+from datetime import date
 from dateutil.relativedelta import relativedelta
 
 import numpy as np
@@ -739,8 +739,8 @@ with tab5:
             # --- build a price frame that DEFINITELY includes all tickers we need ---
             union_tickers = sorted(set(base_df.index) | set(live_raw.index))
             if union_tickers:
-                end   = datetime.today().strftime("%Y-%m-%d")
-                start = (datetime.today() - relativedelta(months=14)).strftime("%Y-%m-%d")
+                end   = date.today().strftime("%Y-%m-%d")
+                start = (date.today() - relativedelta(months=14)).strftime("%Y-%m-%d")
                 px_union = backend.fetch_market_data(union_tickers, start, end)
             else:
                 px_union = pd.DataFrame()
