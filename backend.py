@@ -1514,7 +1514,7 @@ def generate_live_portfolio_isa_monthly(
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
-    Now includes regime awareness and volatility adjustments.
+    Now includes regime awareness, volatility adjustments, and an optional `as_of` date.
     """
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
@@ -1626,7 +1626,7 @@ def run_backtest_isa_dynamic(
     Enhanced ISA-Dynamic hybrid backtest with new features and optional QQQ hedge.
     """
     if end_date is None:
-        end_date = datetime.today().strftime("%Y-%m-%d")
+        end_date = date.today().strftime("%Y-%m-%d")
 
     # Universe & data (helper)
     close, vol, sectors_map, label = _prepare_universe_for_backtest(universe_choice, start_date, end_date)
@@ -1901,8 +1901,8 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
     try:
         univ = st.session_state.get("universe", "Hybrid Top150")
         base_tickers, _, _ = get_universe(univ)
-        end = datetime.today().strftime("%Y-%m-%d")
-        start = (datetime.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
+        end = date.today().strftime("%Y-%m-%d")
+        start = (date.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
         px = fetch_market_data(base_tickers, start, end)
         metrics = compute_regime_metrics(px)
         
@@ -2055,8 +2055,8 @@ def record_live_snapshot(weights_df: pd.DataFrame, note: str = "") -> Dict[str, 
     try:
         universe_choice = st.session_state.get("universe", "Hybrid Top150")
         base_tickers, _, _ = get_universe(universe_choice)
-        end_date = datetime.today().strftime("%Y-%m-%d")
-        start_date = (datetime.today() - relativedelta(days=40)).strftime("%Y-%m-%d")
+        end_date = date.today().strftime("%Y-%m-%d")
+        start_date = (date.today() - relativedelta(days=40)).strftime("%Y-%m-%d")
         px = fetch_market_data(base_tickers + ["QQQ"], start_date, end_date)
         if px.empty or "QQQ" not in px.columns:
             return {"ok": False, "msg": "No price data for live snapshot."}
