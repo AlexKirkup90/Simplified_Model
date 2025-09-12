@@ -2157,6 +2157,79 @@ def record_assessment_outcome(as_of: date | None = None,
     save_assess_log(log)
     return {"ok": True, "portfolio_ret": portfolio_ret, "benchmark_ret": benchmark_ret}
 
+def evaluate_assessment_accuracy(log: pd.DataFrame | None = None) -> Dict[str, Any]:
+    """Evaluate accuracy of past market assessments.
+
+    This reads the assessment log where each entry contains the
+    portfolio and benchmark returns that followed a given assessment
+    date.  It computes whether the portfolio outperformed the benchmark
+    ("correct"), the alpha for each assessment, and aggregates summary
+    statistics for display.
+
+    Parameters
+    ----------
+    log : pd.DataFrame, optional
+        Preloaded assessment log.  If ``None`` the log is loaded using
+        :func:`load_assess_log`.
+
+    Returns
+    -------
+    dict
+        Dictionary containing the original log augmented with ``alpha``
+        and ``correct`` columns along with summary metrics:
+        ``hit_rate`` (share of assessments where the portfolio
+        outperformed), ``avg_alpha`` (average portfolio minus benchmark
+        return) and ``confusion_matrix`` (2x2 counts of portfolio
+        positive/negative vs. benchmark positive/negative).
+    """
+
+    # Load log if not provided
+    if log is None:
+        log = load_assess_log()
+
+    # Ensure required columns exist
+    required_cols = {"portfolio_ret", "benchmark_ret"}
+    if log.empty or not required_cols.issubset(log.columns):
+        return {
+            "history": pd.DataFrame(columns=["date", "portfolio_ret", "benchmark_ret", "alpha", "correct"]),
+            "hit_rate": np.nan,
+            "avg_alpha": np.nan,
+            "confusion_matrix": pd.DataFrame(),
+        }
+
+    df = log.dropna(subset=["portfolio_ret", "benchmark_ret"]).copy()
+    if df.empty:
+        return {
+            "history": pd.DataFrame(columns=["date", "portfolio_ret", "benchmark_ret", "alpha", "correct"]),
+            "hit_rate": np.nan,
+            "avg_alpha": np.nan,
+            "confusion_matrix": pd.DataFrame(),
+        }
+
+    # Calculate alpha and correctness
+    df["alpha"] = df["portfolio_ret"].astype(float) - df["benchmark_ret"].astype(float)
+    df["correct"] = df["alpha"] > 0
+
+    # Summary statistics
+    hit_rate = df["correct"].mean() if len(df) else np.nan
+    avg_alpha = df["alpha"].mean() if len(df) else np.nan
+
+    # Confusion matrix of portfolio vs benchmark positive returns
+    port_pos = df["portfolio_ret"] > 0
+    bench_pos = df["benchmark_ret"] > 0
+    confusion = pd.crosstab(port_pos, bench_pos).reindex(index=[False, True], columns=[False, True], fill_value=0)
+    confusion = confusion.rename(index={False: "port_down", True: "port_up"},
+                                 columns={False: "bench_down", True: "bench_up"})
+
+    summary = {
+        "history": df[["date", "portfolio_ret", "benchmark_ret", "alpha", "correct"]],
+        "hit_rate": float(hit_rate) if pd.notna(hit_rate) else np.nan,
+        "avg_alpha": float(avg_alpha) if pd.notna(avg_alpha) else np.nan,
+        "confusion_matrix": confusion,
+    }
+
+    return summary
+
 # =========================
 # NEW: Strategy Health Monitoring
 # =========================
