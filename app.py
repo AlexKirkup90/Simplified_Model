@@ -23,6 +23,19 @@ st.caption("Enhanced composite momentum + mean reversion, with stickiness, secto
 # ---------------------------
 st.sidebar.header("⚙️ Execution Settings")
 
+# Display market assessment if available
+if "market_metrics" in st.session_state:
+    mm = st.session_state["market_metrics"]
+    with st.sidebar.expander("Market Conditions", expanded=True):
+        st.write(f"Regime: **{mm.get('regime', 'N/A')}**")
+        for k, v in mm.items():
+            if k == "regime":
+                continue
+            if isinstance(v, (int, float)):
+                st.write(f"{k}: {v:.2f}")
+            else:
+                st.write(f"{k}: {v}")
+
 # Universe choice
 universe_choice = st.sidebar.selectbox(
     "Universe",
@@ -50,19 +63,19 @@ st.session_state["debug_caps"] = debug_caps
 stickiness_days = st.sidebar.slider(
     "Stickiness (days in top cohort)",
     3, 15,
-    preset.get("stability_days", 7),
+    st.session_state.get("stickiness_days", preset.get("stability_days", 7)),
     1
 )
 
 # --- Caps (UI in %; backend uses fractions) ---
 name_cap_pct = st.sidebar.slider(
     "Single-name cap (%)",
-    min_value=20, max_value=50, value=int(preset.get("mom_cap", 0.25) * 100),
+    min_value=20, max_value=50, value=int(100 * st.session_state.get("name_cap", preset.get("mom_cap", 0.25))),
     step=5
 )
 sector_cap_pct = st.sidebar.slider(
     "Sector Cap (max % per sector)",
-    min_value=10, max_value=50, value=int(preset.get("sector_cap", 0.30) * 100),
+    min_value=10, max_value=50, value=int(100 * st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))),
     step=5
 )
 
@@ -81,22 +94,25 @@ st.session_state["stickiness_days"] = int(stickiness_days)
 st.session_state["use_enhanced_features"] = use_enhanced_features
 
 # Trading cost & liquidity
-roundtrip_bps = st.sidebar.slider("Round-trip cost (bps)", 0, 100, backend.ROUNDTRIP_BPS_DEFAULT, 5)
-min_dollar_volume = st.sidebar.number_input("Min 60d median $ volume (optional)", min_value=0, value=0, step=100000)
+roundtrip_bps = st.sidebar.slider("Round-trip cost (bps)", 0, 100, int(st.session_state.get("roundtrip_bps", backend.ROUNDTRIP_BPS_DEFAULT)), 5)
+min_dollar_volume = st.sidebar.number_input("Min 60d median $ volume (optional)", min_value=0, value=int(st.session_state.get("min_dollar_volume", 0)), step=100000)
+st.session_state["roundtrip_bps"] = int(roundtrip_bps)
+st.session_state["min_dollar_volume"] = int(min_dollar_volume)
 
 # Average trade size for turnover-based trade count
 avg_trade_pct = st.sidebar.slider(
-    "Avg single-leg trade size (%)", 0.5, 5.0, 2.0, 0.5,
+    "Avg single-leg trade size (%)", 0.5, 5.0, float(st.session_state.get("avg_trade_pct", 2.0)), 0.5,
     help="Used to estimate trades/year from turnover"
 )
 AVG_TRADE_SIZE = avg_trade_pct / 100.0
+st.session_state["avg_trade_pct"] = float(avg_trade_pct)
 
 # Fundamental quality thresholds
 min_profitability = st.sidebar.slider(
-    "Min profitability (ROA)", -0.5, 0.5, 0.0, 0.01
+    "Min profitability (ROA)", -0.5, 0.5, float(st.session_state.get("min_profitability", 0.0)), 0.01
 )
 max_leverage = st.sidebar.slider(
-    "Max leverage (Debt/Equity)", 0.0, 5.0, 2.0, 0.1
+    "Max leverage (Debt/Equity)", 0.0, 5.0, float(st.session_state.get("max_leverage", 2.0)), 0.1
 )
 st.session_state["min_profitability"] = float(min_profitability)
 st.session_state["max_leverage"] = float(max_leverage)
@@ -105,8 +121,12 @@ st.session_state["max_leverage"] = float(max_leverage)
 show_net = st.sidebar.checkbox("Show net of costs", value=True)
 
 # Hedge controls
-enable_hedge = st.sidebar.toggle("Enable QQQ Hedge", value=False)
-hedge_size_pct = st.sidebar.slider("Hedge size (%)", 0, 30, 10, 1) if enable_hedge else 0
+enable_hedge = st.sidebar.toggle("Enable QQQ Hedge", value=st.session_state.get("enable_hedge", False))
+hedge_size_pct = (
+    st.sidebar.slider("Hedge size (%)", 0, 30, int(st.session_state.get("hedge_size", 0.10) * 100), 1)
+    if enable_hedge
+    else 0
+)
 hedge_size = hedge_size_pct / 100.0
 st.session_state["enable_hedge"] = enable_hedge
 st.session_state["hedge_size"] = hedge_size
@@ -117,12 +137,12 @@ tol = st.sidebar.slider("Rebalance tolerance (abs Δ weight)", 0.005, 0.05, 0.01
 # Regime metric thresholds
 vix_ts_threshold = st.sidebar.slider(
     "VIX 3M/1M ratio threshold",
-    0.8, 1.4, backend.VIX_TS_THRESHOLD_DEFAULT, 0.05,
+    0.8, 1.4, float(st.session_state.get("vix_ts_threshold", backend.VIX_TS_THRESHOLD_DEFAULT)), 0.05,
     help="Below this ratio signals volatility stress"
 )
 hy_oas_threshold = st.sidebar.slider(
     "HY OAS threshold (%)",
-    2.0, 10.0, backend.HY_OAS_THRESHOLD_DEFAULT, 0.5,
+    2.0, 10.0, float(st.session_state.get("hy_oas_threshold", backend.HY_OAS_THRESHOLD_DEFAULT)), 0.5,
     help="Above this spread signals credit stress"
 )
 st.session_state["vix_ts_threshold"] = float(vix_ts_threshold)
@@ -130,6 +150,17 @@ st.session_state["hy_oas_threshold"] = float(hy_oas_threshold)
 
 # Prev portfolio (for plan & monthly lock)
 prev_portfolio = backend.load_previous_portfolio()
+
+# ---------------------------
+# Market assessment button
+# ---------------------------
+assess = st.button("Assess Market Conditions", use_container_width=True)
+if assess:
+    settings, metrics = backend.assess_market_conditions(date.today())
+    st.session_state["recommended_settings"] = settings
+    st.session_state["market_metrics"] = metrics
+    st.session_state.update(settings)
+    st.experimental_rerun()
 
 # ---------------------------
 # Go button

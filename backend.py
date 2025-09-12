@@ -1931,10 +1931,56 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
     except Exception:
         return "Neutral", {}
 
+# -------------------------
+# Market assessment helper
+# -------------------------
+def assess_market_conditions(as_of: date) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Evaluate current market conditions and suggest setting overrides.
+
+    Parameters
+    ----------
+    as_of: date
+        Reference date for the assessment (unused, but keeps API flexible).
+
+    Returns
+    -------
+    settings: Dict[str, float]
+        Recommended parameter overrides for the app's controls.
+    metrics: Dict[str, float]
+        Market regime metrics used for the assessment.
+    """
+    regime, metrics = get_market_regime()
+    metrics = dict(metrics)
+    metrics["regime"] = regime
+
+    # Simple heuristic recommendations based on detected regime
+    if "Risk-Off" in regime:
+        settings = {
+            "enable_hedge": True,
+            "hedge_size": 0.15,
+            "stickiness_days": 10,
+            "name_cap": 0.20,
+            "sector_cap": 0.25,
+            "vix_ts_threshold": VIX_TS_THRESHOLD_DEFAULT,
+            "hy_oas_threshold": HY_OAS_THRESHOLD_DEFAULT,
+        }
+    else:
+        settings = {
+            "enable_hedge": False,
+            "hedge_size": 0.0,
+            "stickiness_days": 7,
+            "name_cap": 0.25,
+            "sector_cap": 0.30,
+            "vix_ts_threshold": VIX_TS_THRESHOLD_DEFAULT,
+            "hy_oas_threshold": HY_OAS_THRESHOLD_DEFAULT,
+        }
+
+    return settings, metrics
+
 # =========================
 # NEW: Strategy Health Monitoring
 # =========================
-def get_strategy_health_metrics(current_returns: pd.Series, 
+def get_strategy_health_metrics(current_returns: pd.Series,
                                benchmark_returns: pd.Series = None) -> Dict[str, float]:
     """Calculate comprehensive strategy health metrics"""
     if current_returns.empty:
