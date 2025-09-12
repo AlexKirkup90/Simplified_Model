@@ -12,7 +12,7 @@ import backend
 
 
 def test_get_strategy_health_metrics():
-    index = pd.date_range("2022-01-31", periods=24, freq="M")
+    index = pd.date_range("2022-01-31", periods=24, freq="ME")
     returns = pd.Series(np.linspace(0.01, 0.24, 24), index=index)
     benchmark = returns * 1.5
 
@@ -44,22 +44,32 @@ def test_get_strategy_health_metrics():
     assert metrics["benchmark_correlation"] == pytest.approx(expected_corr)
 
 
-def test_diagnose_strategy_issues():
-    index = pd.date_range("2022-01-31", periods=12, freq="M")
+def test_diagnose_strategy_issues_flags_expected():
+    index = pd.date_range("2022-01-31", periods=12, freq="ME")
     returns = pd.Series([0.3] * 6 + [-0.3] * 6, index=index)
     turnover = pd.Series(1.2, index=index)
 
     issues = backend.diagnose_strategy_issues(returns, turnover)
 
-    assert any("Poor recent performance" in issue for issue in issues)
-    assert any("Low hit rate" in issue for issue in issues)
-    assert any("Large drawdown" in issue for issue in issues)
-    assert any("Excessive turnover" in issue for issue in issues)
-    assert any("High volatility" in issue for issue in issues)
+    recent_6m = returns.iloc[-6:]
+    hit_rate = (recent_6m > 0).mean()
+    equity_curve = (1 + returns).cumprod()
+    current_dd = (equity_curve / equity_curve.cummax() - 1).iloc[-1]
+    recent_vol = returns.std() * np.sqrt(12)
+
+    expected = [
+        "Poor recent performance (6M average < -2%)",
+        f"Low hit rate ({hit_rate:.1%} positive months)",
+        f"Large drawdown ({current_dd:.1%})",
+        "Excessive turnover (>100% monthly)",
+        f"High volatility ({recent_vol:.1%} annual)",
+    ]
+
+    assert issues == expected
 
 
 def test_diagnose_strategy_issues_none():
-    index = pd.date_range("2022-01-31", periods=12, freq="M")
+    index = pd.date_range("2022-01-31", periods=12, freq="ME")
     returns = pd.Series([0.05] * 12, index=index)
     turnover = pd.Series(0.5, index=index)
 
