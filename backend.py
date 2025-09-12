@@ -1,5 +1,5 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
-import os, io, warnings
+import os, io, warnings, json
 from typing import Optional, Tuple, Dict, List, Any
 import numpy as np
 import pandas as pd
@@ -22,6 +22,7 @@ HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 GIST_PORTF_FILE = "portfolio.json"
 LIVE_PERF_FILE  = "live_perf.csv"
 LOCAL_PORTF_FILE = "last_portfolio.csv"
+ASSESS_LOG_FILE = "assess_log.csv"
 
 ROUNDTRIP_BPS_DEFAULT = 20
 REGIME_MA = 200
@@ -2063,8 +2064,98 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
         "name_cap": float(name_cap),
         "stickiness_days": int(stickiness_days),
     }
+    try:
+        log = load_assess_log()
+        new_row = pd.DataFrame([
+            {
+                "date": asof_ts,
+                "metrics": json.dumps(metrics, default=float),
+                "settings": json.dumps(settings, default=float),
+            }
+        ])
+        log = pd.concat([log, new_row], ignore_index=True)
+        log = log.drop_duplicates(subset=["date"], keep="last")
+        save_assess_log(log)
+    except Exception:
+        pass
 
     return {"metrics": metrics, "settings": settings}
+
+# =========================
+# Assessment Logging
+# =========================
+def load_assess_log() -> pd.DataFrame:
+    if GIST_API_URL and GITHUB_TOKEN:
+        try:
+            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp.raise_for_status()
+            files = resp.json().get("files", {})
+            content = files.get(ASSESS_LOG_FILE, {}).get("content", "")
+            if content:
+                df = pd.read_csv(io.StringIO(content))
+                df["date"] = pd.to_datetime(df["date"])
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["date", "metrics", "settings", "portfolio_ret", "benchmark_ret"])
+
+def save_assess_log(df: pd.DataFrame) -> None:
+    if not GIST_API_URL or not GITHUB_TOKEN:
+        return
+    try:
+        csv_str = df.to_csv(index=False)
+        payload = {"files": {ASSESS_LOG_FILE: {"content": csv_str}}}
+        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp.raise_for_status()
+    except Exception as e:
+        st.sidebar.warning(f"Could not save assessment log: {e}")
+
+def record_assessment_outcome(as_of: date | None = None,
+                              benchmark: str = "QQQ") -> Dict[str, Any]:
+    asof_ts = pd.Timestamp(as_of or date.today()).normalize()
+    end_ts = asof_ts + relativedelta(months=1)
+
+    port_df = load_previous_portfolio()
+    if port_df is None or "Weight" not in port_df.columns:
+        return {"ok": False, "msg": "No portfolio data"}
+
+    weights = port_df["Weight"].astype(float)
+    if weights.sum() > 0:
+        weights = weights / weights.sum()
+    tickers = list(weights.index)
+
+    px = fetch_market_data(tickers + [benchmark],
+                           asof_ts.strftime("%Y-%m-%d"),
+                           end_ts.strftime("%Y-%m-%d"))
+    if px.empty or benchmark not in px.columns or len(px.index) < 2:
+        return {"ok": False, "msg": "Insufficient price data"}
+
+    prices = px[[*tickers, benchmark]].dropna()
+    if prices.empty or len(prices) < 2:
+        return {"ok": False, "msg": "Insufficient price data"}
+
+    port_prices = prices[tickers]
+    port_rets = port_prices.iloc[-1] / port_prices.iloc[0] - 1
+    portfolio_ret = float((port_rets * weights.reindex(port_prices.columns).fillna(0)).sum())
+    benchmark_ret = float(prices[benchmark].iloc[-1] / prices[benchmark].iloc[0] - 1)
+
+    log = load_assess_log()
+    mask = log["date"] == asof_ts
+    if mask.any():
+        log.loc[mask, "portfolio_ret"] = portfolio_ret
+        log.loc[mask, "benchmark_ret"] = benchmark_ret
+    else:
+        new_row = {
+            "date": asof_ts,
+            "metrics": json.dumps({}, default=float),
+            "settings": json.dumps({}, default=float),
+            "portfolio_ret": portfolio_ret,
+            "benchmark_ret": benchmark_ret,
+        }
+        log = pd.concat([log, pd.DataFrame([new_row])], ignore_index=True)
+
+    save_assess_log(log)
+    return {"ok": True, "portfolio_ret": portfolio_ret, "benchmark_ret": benchmark_ret}
 
 # =========================
 # NEW: Strategy Health Monitoring
