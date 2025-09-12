@@ -222,7 +222,9 @@ def generate_td1_targets_asof(
         return pd.Series(dtype=float)
 
     # Your existing (fixed) builder runs full selection + caps
-    weights = _build_isa_weights_fixed(hist, preset, sectors_map)  # returns weights summing to equity exposure
+    weights = _build_isa_weights_fixed(
+        hist, preset, sectors_map, use_enhanced_features=use_enhanced_features
+    )  # returns weights summing to equity exposure
 
     regime_metrics: Dict[str, float] = {}
     # If TD1 applies regime exposure (not the drawdown scaler on *returns*, but the weight scaler), apply it here too
@@ -1516,9 +1518,15 @@ def fundamental_quality_filter(
 def _build_isa_weights_fixed(
     daily_close: pd.DataFrame,
     preset: Dict,
-    sectors_map: Dict[str, str]
+    sectors_map: Dict[str, str],
+    use_enhanced_features: bool = True,
 ) -> pd.Series:
-    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio."""
+    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio.
+
+    When ``use_enhanced_features`` is True, the raw sleeve weights are further
+    adjusted using risk-parity weights and volatility-aware name caps before the
+    standard hierarchical cap enforcement.
+    """
     monthly = daily_close.resample("ME").last()
 
     # --- Momentum Component (NO CAPS YET) ---
@@ -1559,10 +1567,23 @@ def _build_isa_weights_fixed(
     if combined_raw.empty or combined_raw.sum() <= 0:
         return combined_raw
 
-    # Apply risk parity weights before enforcing caps
-    rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
-    combined_raw = combined_raw.mul(rp_weights, fill_value=0.0)
-    combined_raw = combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
+    if use_enhanced_features:
+        # Apply risk parity weighting
+        rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
+        combined_raw = combined_raw.mul(rp_weights, fill_value=0.0)
+        combined_raw = (
+            combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
+        )
+
+        # Volatility-aware name caps prior to hierarchical cap enforcement
+        vol_caps = get_volatility_adjusted_caps(
+            combined_raw, daily_close, base_cap=preset.get("mom_cap", 0.25)
+        )
+        combined_raw = cap_weights(
+            combined_raw, cap=preset.get("mom_cap", 0.25), vol_adjusted_caps=vol_caps
+        )
+    else:
+        combined_raw = combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
 
     # Enhanced sector map (uses your base sectors_map) + hierarchical caps for Software sub-buckets
     enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index), base_map=sectors_map)
@@ -1617,6 +1638,7 @@ def generate_live_portfolio_isa_monthly(
     prev_portfolio: Optional[pd.DataFrame],
     min_dollar_volume: float = 0.0,
     as_of: date | None = None,
+    use_enhanced_features: bool = True,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
@@ -1681,7 +1703,9 @@ def generate_live_portfolio_isa_monthly(
     decision = "Preview only – portfolio not saved" if not is_monthly else ""
 
     # Build candidate weights (enhanced) – overrides applied above
-    new_w = _build_isa_weights_fixed(close, params, sectors_map)
+    new_w = _build_isa_weights_fixed(
+        close, params, sectors_map, use_enhanced_features=use_enhanced_features
+    )
 
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:

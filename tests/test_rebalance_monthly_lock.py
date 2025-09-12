@@ -30,7 +30,7 @@ def _mock_env(monkeypatch):
     def fake_fundamental_quality_filter(df, min_profitability, max_leverage):
         return df.index.tolist()
 
-    def fake_build_weights(close, params, sectors_map):
+    def fake_build_weights(close, params, sectors_map, use_enhanced_features=True):
         return pd.Series({"AAA": 0.6, "BBB": 0.4})
 
     monkeypatch.setattr(backend, "get_universe", fake_get_universe)
