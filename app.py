@@ -49,21 +49,29 @@ st.session_state["debug_caps"] = debug_caps
 # Stickiness & sector cap (overrides)
 stickiness_days = st.sidebar.slider(
     "Stickiness (days in top cohort)",
-    3, 15,
-    preset.get("stability_days", 7),
-    1
+    3,
+    15,
+    int(st.session_state.get("stickiness_days", preset.get("stability_days", 7))),
+    1,
+    help="Auto-filled from latest market assessment; adjust to override."
 )
 
 # --- Caps (UI in %; backend uses fractions) ---
 name_cap_pct = st.sidebar.slider(
     "Single-name cap (%)",
-    min_value=20, max_value=50, value=int(preset.get("mom_cap", 0.25) * 100),
-    step=5
+    min_value=20,
+    max_value=50,
+    value=int(st.session_state.get("name_cap", preset.get("mom_cap", 0.25)) * 100),
+    step=5,
+    help="Auto-filled from latest market assessment; adjust to override."
 )
 sector_cap_pct = st.sidebar.slider(
     "Sector Cap (max % per sector)",
-    min_value=10, max_value=50, value=int(preset.get("sector_cap", 0.30) * 100),
-    step=5
+    min_value=10,
+    max_value=50,
+    value=int(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30)) * 100),
+    step=5,
+    help="Auto-filled from latest market assessment; adjust to override."
 )
 
 # Convert to fractions for backend and stash in session
@@ -81,8 +89,23 @@ st.session_state["stickiness_days"] = int(stickiness_days)
 st.session_state["use_enhanced_features"] = use_enhanced_features
 
 # Trading cost & liquidity
-roundtrip_bps = st.sidebar.slider("Round-trip cost (bps)", 0, 100, backend.ROUNDTRIP_BPS_DEFAULT, 5)
-min_dollar_volume = st.sidebar.number_input("Min 60d median $ volume (optional)", min_value=0, value=0, step=100000)
+roundtrip_bps = st.sidebar.slider(
+    "Round-trip cost (bps)",
+    0,
+    100,
+    int(st.session_state.get("roundtrip_bps", backend.ROUNDTRIP_BPS_DEFAULT)),
+    5,
+    help="Auto-filled from latest market assessment; adjust to override."
+)
+min_dollar_volume = st.sidebar.number_input(
+    "Min 60d median $ volume (optional)",
+    min_value=0,
+    value=int(st.session_state.get("min_dollar_volume", 0)),
+    step=100000,
+    help="Auto-filled from latest market assessment; adjust to override."
+)
+st.session_state["roundtrip_bps"] = int(roundtrip_bps)
+st.session_state["min_dollar_volume"] = int(min_dollar_volume)
 
 # Average trade size for turnover-based trade count
 avg_trade_pct = st.sidebar.slider(
@@ -102,7 +125,12 @@ st.session_state["min_profitability"] = float(min_profitability)
 st.session_state["max_leverage"] = float(max_leverage)
 
 # Net toggle
-show_net = st.sidebar.checkbox("Show net of costs", value=True)
+show_net = st.sidebar.checkbox(
+    "Show net of costs",
+    value=st.session_state.get("show_net", True),
+    help="Auto-filled from latest market assessment; adjust to override."
+)
+st.session_state["show_net"] = show_net
 
 # Hedge controls
 enable_hedge = st.sidebar.toggle("Enable QQQ Hedge", value=False)
@@ -117,13 +145,19 @@ tol = st.sidebar.slider("Rebalance tolerance (abs Δ weight)", 0.005, 0.05, 0.01
 # Regime metric thresholds
 vix_ts_threshold = st.sidebar.slider(
     "VIX 3M/1M ratio threshold",
-    0.8, 1.4, backend.VIX_TS_THRESHOLD_DEFAULT, 0.05,
-    help="Below this ratio signals volatility stress"
+    0.8,
+    1.4,
+    float(st.session_state.get("vix_ts_threshold", backend.VIX_TS_THRESHOLD_DEFAULT)),
+    0.05,
+    help="Below this ratio signals volatility stress. Auto-filled from latest market assessment; adjust to override.",
 )
 hy_oas_threshold = st.sidebar.slider(
     "HY OAS threshold (%)",
-    2.0, 10.0, backend.HY_OAS_THRESHOLD_DEFAULT, 0.5,
-    help="Above this spread signals credit stress"
+    2.0,
+    10.0,
+    float(st.session_state.get("hy_oas_threshold", backend.HY_OAS_THRESHOLD_DEFAULT)),
+    0.5,
+    help="Above this spread signals credit stress. Auto-filled from latest market assessment; adjust to override.",
 )
 st.session_state["vix_ts_threshold"] = float(vix_ts_threshold)
 st.session_state["hy_oas_threshold"] = float(hy_oas_threshold)
@@ -163,7 +197,7 @@ if go:
             live_disp, live_raw, decision = backend.generate_live_portfolio_isa_monthly(
                 preset=preset,
                 prev_portfolio=prev_portfolio,
-                min_dollar_volume=min_dollar_volume,
+                min_dollar_volume=st.session_state.get("min_dollar_volume", 0),
                 as_of=date.today(),
             )
         except Exception as e:
@@ -173,21 +207,21 @@ if go:
         try:
             # ---- Enhanced ISA Dynamic backtest (Hybrid150 default) from 2017-07-01
             strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
-                roundtrip_bps=roundtrip_bps,
-                min_dollar_volume=min_dollar_volume,
-                show_net=show_net,
+                roundtrip_bps=st.session_state.get("roundtrip_bps", backend.ROUNDTRIP_BPS_DEFAULT),
+                min_dollar_volume=st.session_state.get("min_dollar_volume", 0),
+                show_net=st.session_state.get("show_net", True),
                 start_date="2017-07-01",
-                universe_choice=universe_choice,
+                universe_choice=st.session_state.get("universe", "Hybrid Top150"),
                 top_n=preset["mom_topn"],
-                name_cap=float(name_cap),
-                sector_cap=sector_cap,
-                stickiness_days=stickiness_days,
+                name_cap=float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25))),
+                sector_cap=float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))),
+                stickiness_days=int(st.session_state.get("stickiness_days", preset.get("stability_days", 7))),
                 mr_topn=preset["mr_topn"],
                 mom_weight=preset["mom_w"],
                 mr_weight=preset["mr_w"],
-                use_enhanced_features=use_enhanced_features,
-                enable_hedge=enable_hedge,
-                hedge_size=hedge_size
+                use_enhanced_features=st.session_state.get("use_enhanced_features", True),
+                enable_hedge=st.session_state.get("enable_hedge", False),
+                hedge_size=float(st.session_state.get("hedge_size", 0.0))
             )
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
