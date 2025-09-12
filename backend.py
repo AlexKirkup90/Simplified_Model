@@ -8,6 +8,8 @@ import requests
 import streamlit as st
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
+import optimizer
+from strategy_core import HybridConfig
 
 warnings.filterwarnings("ignore")
 
@@ -1849,6 +1851,61 @@ def generate_live_portfolio_isa_monthly(
     disp, raw = _format_display(new_w)
     return disp, raw, decision
 
+
+def optimize_hybrid_strategy(prices: Optional[pd.DataFrame] = None,
+                             start_date: str = "2017-07-01",
+                             end_date: Optional[str] = None,
+                             universe: str = "Hybrid Top150") -> Tuple[HybridConfig, float]:
+    """Autonomously search for a Sharpe-maximizing ``HybridConfig``.
+
+    Parameters
+    ----------
+    prices : DataFrame, optional
+        Pre-fetched daily price data.  If ``None`` the universe is fetched
+        using :func:`_prepare_universe_for_backtest`.
+    start_date, end_date : str
+        Date range used when ``prices`` is ``None``.
+    universe : str
+        Universe name passed to ``_prepare_universe_for_backtest`` when
+        fetching data internally.
+
+    Returns
+    -------
+    cfg : HybridConfig
+        Configuration found by :func:`optimizer.grid_search_hybrid`.
+    sector_cap : float
+        Currently selected sector cap value.  This parameter is not part of
+        ``HybridConfig`` so it is returned separately.
+    """
+    if prices is None or prices.empty:
+        if end_date is None:
+            end_date = date.today().strftime("%Y-%m-%d")
+        close, _, _, _ = _prepare_universe_for_backtest(universe, start_date, end_date)
+        if close.empty:
+            return HybridConfig(), 0.30
+        prices = close.drop(columns=["QQQ"], errors="ignore")
+
+    param_grid = {
+        "top_n": [5, 8, 12],
+        "name_cap": [0.20, 0.25, 0.30],
+        "sector_cap": [0.25, 0.30],
+        "mom_weight": [0.7, 0.8, 0.9],
+        "mr_weight": [0.1, 0.2, 0.3],
+    }
+
+    search_grid = {
+        "momentum_top_n": param_grid["top_n"],
+        "momentum_cap": param_grid["name_cap"],
+        "mom_weight": param_grid["mom_weight"],
+        "mr_weight": param_grid["mr_weight"],
+    }
+
+    best_cfg, _ = optimizer.grid_search_hybrid(prices, search_grid)
+    # ``sector_cap`` is not part of ``HybridConfig``; we simply choose the
+    # first value in the grid (callers may override as needed).
+    sector_cap = param_grid["sector_cap"][0]
+    return best_cfg, sector_cap
+
 def run_backtest_isa_dynamic(
     roundtrip_bps: float = 0.0,
     min_dollar_volume: float = 0.0,
@@ -1856,13 +1913,13 @@ def run_backtest_isa_dynamic(
     start_date: str = "2017-07-01",
     end_date: Optional[str] = None,
     universe_choice: Optional[str] = "Hybrid Top150",
-    top_n: int = 8,
-    name_cap: float = 0.25,
-    sector_cap: float = 0.30,
+    top_n: Optional[int] = None,
+    name_cap: Optional[float] = None,
+    sector_cap: Optional[float] = None,
     stickiness_days: int = 7,
     mr_topn: int = 3,
-    mom_weight: float = 0.85,
-    mr_weight: float = 0.15,
+    mom_weight: Optional[float] = None,
+    mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
@@ -1901,6 +1958,14 @@ def run_backtest_isa_dynamic(
         return None, None, None, None
     daily = daily[keep]
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
+
+    if any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
+        cfg, opt_sector_cap = optimize_hybrid_strategy(daily)
+        top_n = top_n or cfg.momentum_top_n
+        name_cap = name_cap or cfg.momentum_cap
+        mom_weight = mom_weight or cfg.mom_weight
+        mr_weight = mr_weight or cfg.mr_weight
+        sector_cap = sector_cap or opt_sector_cap
 
     # Sleeves (enhanced)
     mom_rets, mom_tno = run_momentum_composite_param(
