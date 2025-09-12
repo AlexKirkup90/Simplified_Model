@@ -1748,6 +1748,29 @@ def generate_live_portfolio_isa_monthly(
         except Exception:
             pass
 
+    # Validate and re-enforce caps if scaling introduced violations
+    if len(new_w) > 0:
+        violations = check_constraint_violations(
+            new_w, sectors_map, params["mom_cap"], params.get("sector_cap", 0.30)
+        )
+        if violations:
+            enhanced_sectors = get_enhanced_sector_map(list(new_w.index), base_map=sectors_map)
+            group_caps = build_group_caps(enhanced_sectors)
+            new_w = enforce_caps_iteratively(
+                new_w.astype(float),
+                enhanced_sectors,
+                name_cap=params["mom_cap"],
+                sector_cap=params.get("sector_cap", 0.30),
+                group_caps=group_caps,
+            )
+            violations = check_constraint_violations(
+                new_w, sectors_map, params["mom_cap"], params.get("sector_cap", 0.30)
+            )
+            if violations:
+                raise ValueError(
+                    f"Constraint violations after re-enforcing caps: {violations}"
+                )
+
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("ME").last()
