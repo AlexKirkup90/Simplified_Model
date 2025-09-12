@@ -9,6 +9,7 @@ import streamlit as st
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 import optimizer
+import strategy_core
 from strategy_core import HybridConfig
 
 warnings.filterwarnings("ignore")
@@ -1485,61 +1486,6 @@ def run_momentum_composite_param(
 
     return rets.fillna(0.0), tno.fillna(0.0)
 
-def run_backtest_mean_reversion(daily_prices: pd.DataFrame,
-                                lookback_period_mr: int = 21,
-                                top_n_mr: int = 3,
-                                long_ma_days: int = 200) -> Tuple[pd.Series, pd.Series]:
-    monthly = daily_prices.resample("ME").last()
-    fwd = monthly.pct_change().shift(-1)
-    st = daily_prices.pct_change(lookback_period_mr).resample("ME").last()
-    lt = daily_prices.rolling(long_ma_days).mean().resample("ME").last()
-    rets = pd.Series(index=monthly.index, dtype=float)
-    tno  = pd.Series(index=monthly.index, dtype=float)
-    prev_w = pd.Series(dtype=float)
-    for m in monthly.index:
-        if m not in st.index or m not in lt.index:
-            rets.loc[m]=0.0; tno.loc[m]=0.0; continue
-        quality = monthly.loc[m] > lt.loc[m]
-        pool = quality[quality].index
-        cand = st.loc[m, [t for t in pool if t in st.columns]].dropna()
-        dips = cand.nsmallest(top_n_mr)
-        if dips.empty: rets.loc[m]=0.0; tno.loc[m]=0.0; continue
-        w = pd.Series(1/len(dips), index=dips.index)
-        valid = [t for t in w.index if t in fwd.columns]
-        rets.loc[m] = float((fwd.loc[m, valid] * w.reindex(valid)).sum())
-        tno.loc[m]  = 0.5 * float((w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0)).abs().sum())
-        prev_w = w
-    return rets.fillna(0.0), tno.fillna(0.0)
-
-def combine_hybrid(mom_rets: pd.Series, mr_rets: pd.Series,
-                   mom_tno: Optional[pd.Series] = None,
-                   mr_tno: Optional[pd.Series] = None,
-                   mw: float = 0.9, rw: float = 0.1,
-                   mom_w: Optional[float] = None,
-                   mr_w: Optional[float] = None) -> Tuple[pd.Series, Optional[pd.Series]]:
-    """
-    Combine momentum & mean-reversion sleeves. Supports both (mw, rw) and (mom_w, mr_w).
-    Returns (combined_returns, combined_turnover or None).
-    """
-    # Backward/forward compatibility for arg names
-    if mom_w is not None:
-        mw = mom_w
-    if mr_w is not None:
-        rw = mr_w
-
-    mom = pd.Series(mom_rets).copy()
-    mr  = pd.Series(mr_rets).reindex(mom.index, fill_value=0.0)
-    mom = mom.reindex(mr.index, fill_value=0.0)
-
-    combo = (mom * mw) + (mr * rw)
-
-    if mom_tno is None and mr_tno is None:
-        return combo, None
-
-    mtn = pd.Series(mom_tno).reindex(combo.index, fill_value=0.0) if mom_tno is not None else pd.Series(0.0, index=combo.index)
-    rtn = pd.Series(mr_tno ).reindex(combo.index, fill_value=0.0) if mr_tno  is not None else pd.Series(0.0, index=combo.index)
-    tno = (mtn * mw) + (rtn * rw)
-    return combo, tno
 
 def apply_costs(gross, turnover, roundtrip_bps):
     return gross - turnover*(roundtrip_bps/10000.0)
@@ -1967,23 +1913,21 @@ def run_backtest_isa_dynamic(
         mr_weight = mr_weight or cfg.mr_weight
         sector_cap = sector_cap or opt_sector_cap
 
-    # Sleeves (enhanced)
-    mom_rets, mom_tno = run_momentum_composite_param(
-        daily,
-        sectors_map,
-        top_n=top_n,
-        name_cap=name_cap,
-        sector_cap=sector_cap,
-        stickiness_days=stickiness_days,
-        use_enhanced_features=use_enhanced_features
-    )
-    mr_rets, mr_tno = run_backtest_mean_reversion(
-        daily, lookback_period_mr=21, top_n_mr=mr_topn, long_ma_days=200
+    cfg = HybridConfig(
+        momentum_top_n=top_n,
+        momentum_cap=name_cap,
+        mr_top_n=mr_topn,
+        mom_weight=mom_weight,
+        mr_weight=mr_weight,
+        mr_lookback_days=21,
+        mr_long_ma_days=200,
     )
 
-    # Combine + costs
-    hybrid_gross, hybrid_tno = combine_hybrid(
-        mom_rets, mr_rets, mom_tno, mr_tno, mom_w=mom_weight, mr_w=mr_weight
+    res = strategy_core.run_hybrid_backtest(daily, cfg)
+    hybrid_gross = res["hybrid_rets"]
+    hybrid_tno = (
+        cfg.mom_weight * res["mom_turnover"].reindex(hybrid_gross.index).fillna(0)
+        + cfg.mr_weight * res["mr_turnover"].reindex(hybrid_gross.index).fillna(0)
     )
 
     # Apply drawdown-based exposure adjustment (walk-forward)
