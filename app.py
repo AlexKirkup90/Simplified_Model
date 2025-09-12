@@ -162,6 +162,7 @@ if go:
                 prev_portfolio=prev_portfolio,
                 min_dollar_volume=st.session_state.get("min_dollar_volume", 0),
                 as_of=date.today(),
+                use_enhanced_features=st.session_state.get("use_enhanced_features", True),
             )
         except Exception as e:
             st.error(f"Portfolio generation failed: {e}")
