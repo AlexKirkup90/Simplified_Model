@@ -44,6 +44,22 @@ STRATEGY_PRESETS = {
     }
 }
 
+# Default mapping from regime metrics to strategy parameters.  These
+# values are recalibrated periodically by ``update_parameter_mapping``.
+PARAM_MAP_DEFAULTS = {
+    "low_vol": 0.02,
+    "high_vol": 0.04,
+    "top_n_low": 10,
+    "top_n_mid": 8,
+    "top_n_high": 5,
+    "name_cap_low": 0.30,
+    "name_cap_mid": 0.25,
+    "name_cap_high": 0.20,
+    "sector_cap_low": 0.35,
+    "sector_cap_mid": 0.30,
+    "sector_cap_high": 0.25,
+}
+
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
 # =========================
@@ -527,11 +543,100 @@ def get_regime_adjusted_exposure(regime_metrics: Dict[str, float]) -> float:
 
     return np.clip(exposure, 0.3, 1.2)  # Keep between 30% and 120%
 
+######################################################################
+# Parameter mapping updater
+######################################################################
+def update_parameter_mapping(log: pd.DataFrame | None = None) -> None:
+    """Recalibrate the mapping from metrics to parameter defaults.
+
+    The function ingests historical assessment/outcome pairs and uses a
+    simple grid-search (gradient-free optimisation) to determine
+    volatility breakpoints and recommended caps.  Results are stored in
+    ``st.session_state['param_map_defaults']``.
+
+    Parameters
+    ----------
+    log : pd.DataFrame, optional
+        Assessment log with at least the columns ``metrics``,
+        ``portfolio_ret`` and ``benchmark_ret``.  If ``None`` the log is
+        loaded via :func:`load_assess_log`.
+    """
+
+    if log is None:
+        log = load_assess_log()
+
+    required = {"metrics", "portfolio_ret", "benchmark_ret"}
+    if log.empty or not required.issubset(log.columns):
+        return
+
+    # Extract volatility metric and compute portfolio alpha as outcome
+    def _extract_vol(x: Any) -> float:
+        try:
+            return float(json.loads(x).get("qqq_vol_10d", np.nan))
+        except Exception:
+            return np.nan
+
+    vols = log["metrics"].apply(_extract_vol).astype(float)
+    outcomes = log["portfolio_ret"].astype(float) - log["benchmark_ret"].astype(float)
+    mask = vols.notna() & outcomes.notna()
+    vols, outcomes = vols[mask], outcomes[mask]
+
+    if len(vols) < 5:
+        # Not enough data to recalibrate
+        return
+
+    # Candidate thresholds for grid search
+    candidates = np.linspace(vols.quantile(0.1), vols.quantile(0.9), 8)
+    best_low = PARAM_MAP_DEFAULTS["low_vol"]
+    best_high = PARAM_MAP_DEFAULTS["high_vol"]
+    best_score = -np.inf
+
+    for low in candidates:
+        for high in candidates:
+            if high <= low:
+                continue
+            low_mask = vols < low
+            high_mask = vols > high
+            if low_mask.sum() < 1 or high_mask.sum() < 1:
+                continue
+            score = outcomes[low_mask].mean() - outcomes[high_mask].mean()
+            if score > best_score:
+                best_score = score
+                best_low, best_high = float(low), float(high)
+
+    # Adjust caps proportional to regime separation strength
+    delta = float(np.tanh(best_score))  # bounded adjustment factor
+    name_cap_low = np.clip(PARAM_MAP_DEFAULTS["name_cap_low"] + 0.05 * delta, 0.15, 0.35)
+    name_cap_high = np.clip(PARAM_MAP_DEFAULTS["name_cap_high"] - 0.05 * delta, 0.15, 0.35)
+    sector_cap_low = np.clip(PARAM_MAP_DEFAULTS["sector_cap_low"] + 0.05 * delta, 0.20, 0.40)
+    sector_cap_high = np.clip(PARAM_MAP_DEFAULTS["sector_cap_high"] - 0.05 * delta, 0.20, 0.40)
+    top_n_low = int(np.clip(PARAM_MAP_DEFAULTS["top_n_low"] + 2 * delta, 5, 12))
+    top_n_high = int(np.clip(PARAM_MAP_DEFAULTS["top_n_high"] - 2 * delta, 3, 10))
+
+    st.session_state["param_map_defaults"] = {
+        "low_vol": best_low,
+        "high_vol": best_high,
+        "top_n_low": top_n_low,
+        "top_n_mid": PARAM_MAP_DEFAULTS["top_n_mid"],
+        "top_n_high": top_n_high,
+        "name_cap_low": float(name_cap_low),
+        "name_cap_mid": PARAM_MAP_DEFAULTS["name_cap_mid"],
+        "name_cap_high": float(name_cap_high),
+        "sector_cap_low": float(sector_cap_low),
+        "sector_cap_mid": PARAM_MAP_DEFAULTS["sector_cap_mid"],
+        "sector_cap_high": float(sector_cap_high),
+    }
+
+
 # =========================
 # NEW: Regime-Based Parameter Mapping
 # =========================
 def map_metrics_to_settings(metrics: Dict[str, float]) -> Dict[str, float]:
     """Map regime metrics to strategy parameter settings.
+
+    This function also triggers a periodic update of the parameter
+    mapping on the first day of each month using
+    :func:`update_parameter_mapping`.
 
     Parameters
     ----------
@@ -544,22 +649,30 @@ def map_metrics_to_settings(metrics: Dict[str, float]) -> Dict[str, float]:
         Dictionary with keys ``top_n``, ``name_cap``, and ``sector_cap``.
     """
 
+    today = date.today()
+    if today.day == 1 and st.session_state.get("_param_map_last_update") != today:
+        try:
+            update_parameter_mapping()
+        except Exception as exc:  # pragma: no cover - best effort only
+            st.warning(f"Parameter update failed: {exc}")
+        st.session_state["_param_map_last_update"] = today
+
+    mapping = st.session_state.get("param_map_defaults", PARAM_MAP_DEFAULTS)
     vol = metrics.get("qqq_vol_10d", np.nan)
 
-    # Baseline settings
-    top_n = 8
-    name_cap = 0.25
-    sector_cap = 0.30
+    top_n = mapping["top_n_mid"]
+    name_cap = mapping["name_cap_mid"]
+    sector_cap = mapping["sector_cap_mid"]
 
     if pd.notna(vol):
-        if vol > 0.04:  # High volatility -> be more defensive
-            top_n = 5
-            name_cap = 0.20
-            sector_cap = 0.25
-        elif vol < 0.02:  # Low volatility -> allow broader exposure
-            top_n = 10
-            name_cap = 0.30
-            sector_cap = 0.35
+        if vol > mapping["high_vol"]:  # High volatility -> be more defensive
+            top_n = mapping["top_n_high"]
+            name_cap = mapping["name_cap_high"]
+            sector_cap = mapping["sector_cap_high"]
+        elif vol < mapping["low_vol"]:  # Low volatility -> allow broader exposure
+            top_n = mapping["top_n_low"]
+            name_cap = mapping["name_cap_low"]
+            sector_cap = mapping["sector_cap_low"]
 
     return {"top_n": top_n, "name_cap": name_cap, "sector_cap": sector_cap}
 
