@@ -1605,15 +1605,9 @@ def generate_live_portfolio_isa_monthly(
     close = close[keep]
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
-    # Monthly lock check — hold previous if not first trading day
+    # Monthly lock check – always compute new weights
     is_monthly = is_rebalance_today(today, close.index)
-    decision = "Not the monthly rebalance day — holding previous portfolio."
-    if not is_monthly:
-        if prev_portfolio is not None and not prev_portfolio.empty:
-            disp, raw = _format_display(prev_portfolio["Weight"].astype(float))
-            return disp, raw, decision
-        else:
-            decision = "No saved portfolio; proposing initial allocation (monthly lock applies from next month)."
+    decision = "Preview only – portfolio not saved" if not is_monthly else ""
 
     # Build candidate weights (enhanced) – keep UI overrides!
     params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
@@ -1624,7 +1618,7 @@ def generate_live_portfolio_isa_monthly(
     new_w = _build_isa_weights_fixed(close, params, sectors_map)
 
     # Trigger vs previous portfolio (health of current)
-    if prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
+    if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("ME").last()
         mom_scores = blended_momentum_z(monthly)
         if not mom_scores.empty and len(new_w) > 0:
