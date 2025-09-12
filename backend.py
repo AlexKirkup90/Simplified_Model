@@ -820,6 +820,13 @@ def _safe_series(obj):
 def to_yahoo_symbol(sym: str) -> str:
     return str(sym).strip().upper().replace(".", "-")
 
+_YF_BATCH_SIZE = 200
+
+
+def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
+    for i in range(0, len(tickers), size):
+        yield tickers[i : i + size]
+
 # =========================
 # Universe builders & sectors (Enhanced with validation)
 # =========================
@@ -1037,25 +1044,35 @@ def _prepare_universe_for_backtest(
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
-        data = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)["Close"]
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-        
+        frames: List[pd.DataFrame] = []
+        for batch in _chunk_tickers(tickers):
+            df = yf.download(batch, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[
+                "Close"
+            ]
+            if isinstance(df, pd.Series):
+                df = df.to_frame()
+                df.columns = [batch[0]]
+            frames.append(df)
+
+        if not frames:
+            return pd.DataFrame()
+
+        data = pd.concat(frames, axis=1)
         result = data.dropna(axis=1, how="all")
-        
+
         # Enhanced data cleaning pipeline
         if not result.empty:
             cleaned_result, cleaning_alerts = validate_and_clean_market_data(result)
-            
+
             # Show cleaning summary
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
                     st.info(f"🧹 Data cleaning: {alert}")
-            
+
             return cleaned_result
-        
+
         return result
-        
+
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
         return pd.DataFrame()
@@ -1064,48 +1081,56 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
-        df = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[["Close","Volume"]]
-        if isinstance(df, pd.Series):
-            df = df.to_frame()
-        if isinstance(df.columns, pd.MultiIndex):
-            close = df["Close"]
-            vol   = df["Volume"]
-        else:
-            if "Close" in df.columns and "Volume" in df.columns:
-                close = df[["Close"]].copy()
-                vol   = df[["Volume"]].copy()
-                if len(tickers) == 1:
-                    close.columns = [tickers[0]]
-                    vol.columns   = [tickers[0]]
+        close_frames: List[pd.DataFrame] = []
+        vol_frames: List[pd.DataFrame] = []
+        for batch in _chunk_tickers(tickers):
+            df = yf.download(batch, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[
+                ["Close", "Volume"]
+            ]
+            if isinstance(df, pd.Series):
+                df = df.to_frame()
+            if isinstance(df.columns, pd.MultiIndex):
+                close_part = df["Close"]
+                vol_part = df["Volume"]
             else:
-                return pd.DataFrame(), pd.DataFrame()
-        
-        close = close.dropna(axis=1, how="all")
-        vol   = vol.reindex_like(close).fillna(0)
-        
+                if "Close" in df.columns and "Volume" in df.columns:
+                    close_part = df[["Close"]].copy()
+                    vol_part = df[["Volume"]].copy()
+                    if len(batch) == 1:
+                        close_part.columns = [batch[0]]
+                        vol_part.columns = [batch[0]]
+                else:
+                    continue
+            close_frames.append(close_part)
+            vol_frames.append(vol_part)
+
+        if not close_frames:
+            return pd.DataFrame(), pd.DataFrame()
+
+        close = pd.concat(close_frames, axis=1).dropna(axis=1, how="all")
+        vol = pd.concat(vol_frames, axis=1)
+        vol = vol.reindex_like(close).fillna(0)
+
         # Enhanced data cleaning for prices
         if not close.empty:
             cleaned_close, close_alerts = validate_and_clean_market_data(close)
-            
+
             # Clean volume data (less aggressive)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
-            # Replace any negative or extreme volumes with more robust method
             for col in vol_aligned.columns:
                 col_data = vol_aligned[col]
                 if len(col_data.dropna()) > 0:
-                    # Clip extreme volumes per column
                     q99 = col_data.quantile(0.99)
                     vol_aligned[col] = col_data.clip(lower=0, upper=q99)
-            
-            # Show cleaning summary
+
             if close_alerts:
                 for alert in close_alerts[:1]:  # Show top cleaning action
                     st.info(f"🧹 Price/Volume cleaning: {alert}")
-            
+
             return cleaned_close, vol_aligned
-        
+
         return close, vol
-        
+
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()

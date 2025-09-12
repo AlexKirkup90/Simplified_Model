@@ -32,6 +32,14 @@ from io import StringIO
 # 1) Universe & Data
 # ------------------------------
 
+_YF_BATCH_SIZE = 200
+
+
+def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
+    tickers = list(tickers)
+    for i in range(0, len(tickers), size):
+        yield tickers[i : i + size]
+
 def get_nasdaq_100_plus_tickers(
     extras: Optional[Iterable[str]] = None,
     wikipedia_url: str = "https://en.wikipedia.org/wiki/Nasdaq-100",
@@ -82,23 +90,24 @@ def fetch_market_data(tickers: Iterable[str],
     -----
     Prices are adjusted for splits and dividends via ``auto_adjust=True``.
     """
+    tickers = list(tickers)
     if not tickers:
         return pd.DataFrame()
-    data = yf.download(list(tickers), start=start_date, end=end_date, auto_adjust=True, progress=False)
-    if isinstance(data, pd.DataFrame) and "Close" in data:
-        df = data["Close"]
-    else:
+
+    frames: List[pd.DataFrame] = []
+    for batch in _chunk_tickers(tickers):
+        data = yf.download(batch, start=start_date, end=end_date, auto_adjust=True, progress=False)["Close"]
         if isinstance(data, pd.Series):
-            df = data.to_frame(name="Close")
-        else:
-            try:
-                df = data.xs("Close", axis=1, level=0)
-            except Exception:
-                return pd.DataFrame()
-    if isinstance(df, pd.Series):
-        df = df.to_frame()
-    if df.shape[1] == 1 and len(list(tickers)) == 1:
-        df.columns = [list(tickers)[0]]
+            data = data.to_frame()
+            data.columns = [batch[0]]
+        frames.append(data)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=1)
+    if df.shape[1] == 1 and len(tickers) == 1:
+        df.columns = [tickers[0]]
     return df.dropna(how="all", axis=1)
 
 
