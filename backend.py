@@ -1532,11 +1532,6 @@ def _build_isa_weights_fixed(
     sectors_map: Dict[str, str]
 ) -> pd.Series:
     """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio."""
-    debug_caps = bool(st.session_state.get("debug_caps", False))
-
-    if debug_caps:
-        st.info(f"🔧 _build_isa_weights_fixed(): frame has {len(daily_close.columns)} stocks")
-
     monthly = daily_close.resample("ME").last()
 
     # --- Momentum Component (NO CAPS YET) ---
@@ -1575,12 +1570,7 @@ def _build_isa_weights_fixed(
     # --- Combine Components BEFORE Applying Caps ---
     combined_raw = mom_raw.add(mr_raw, fill_value=0.0)
     if combined_raw.empty or combined_raw.sum() <= 0:
-        if debug_caps:
-            st.warning("⚠️ combined_raw is empty; returning early.")
         return combined_raw
-
-    if debug_caps:
-        st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
 
     # Apply risk parity weights before enforcing caps
     rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
@@ -1591,13 +1581,6 @@ def _build_isa_weights_fixed(
     enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index), base_map=sectors_map)
     group_caps = build_group_caps(enhanced_sectors)  # <- adds Software parent (30%) + sub-caps (e.g., 18%)
 
-    if debug_caps:
-        sector_breakdown: Dict[str, float] = {}
-        for ticker, weight in combined_raw.items():
-            sec = enhanced_sectors.get(ticker, "Other")
-            sector_breakdown[sec] = sector_breakdown.get(sec, 0.0) + float(weight)
-        st.info("📊 Pre-caps sectors: " + str(dict(sorted(sector_breakdown.items(), key=lambda x: x[1], reverse=True))))
-
     # --- Enforce caps on the COMPLETE portfolio ---
     final_weights = enforce_caps_iteratively(
         combined_raw.astype(float),
@@ -1605,23 +1588,10 @@ def _build_isa_weights_fixed(
         name_cap=preset["mom_cap"],
         sector_cap=preset.get("sector_cap", 0.30),
         group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
-        debug=debug_caps
     )
 
     if final_weights.empty or final_weights.sum() <= 0:
-        if debug_caps:
-            st.warning("⚠️ enforce_caps_iteratively returned empty weights; returning empty.")
         return final_weights
-
-    # Optional: sanity check (logs only)
-    if debug_caps:
-        violations = check_constraint_violations(
-            final_weights, enhanced_sectors, preset["mom_cap"], preset.get("sector_cap", 0.30)
-        )
-        if violations:
-            st.warning("⚠️ Post-enforcement violations (unexpected): " + "; ".join(violations))
-        else:
-            st.success("✅ Post-enforcement: no constraint violations detected.")
 
     # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
     return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
