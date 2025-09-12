@@ -207,8 +207,6 @@ def generate_td1_targets_asof(
     preset: dict,
     asof: Optional[pd.Timestamp] = None,
     use_enhanced_features: bool = True,
-    enable_hedge: bool = False,
-    hedge_size: float = 0.0,
 ) -> pd.Series:
     """
     Build targets exactly as on Trading Day 1:
@@ -235,17 +233,6 @@ def generate_td1_targets_asof(
             weights = weights * float(regime_exposure)   # leaves implied cash = 1 - sum(weights)
         except Exception:
             regime_metrics = {}
-
-    # Optional QQQ hedge
-    if enable_hedge and hedge_size > 0 and len(hist) > 0 and len(weights) > 0:
-        try:
-            returns = hist.pct_change().dropna()
-            port_rets = (returns[weights.index] * weights).sum(axis=1)
-            hedge_w = build_hedge_weight(port_rets, regime_metrics, hedge_size)
-            if hedge_w > 0:
-                weights.loc["QQQ"] = -hedge_w
-        except Exception:
-            pass
 
     return weights.fillna(0.0)
 
@@ -1735,11 +1722,9 @@ def run_backtest_isa_dynamic(
     mom_weight: float = 0.85,
     mr_weight: float = 0.15,
     use_enhanced_features: bool = True,
-    enable_hedge: bool = False,
-    hedge_size: float = 0.0,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
-    Enhanced ISA-Dynamic hybrid backtest with new features and optional QQQ hedge.
+    Enhanced ISA-Dynamic hybrid backtest with new features.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -1800,20 +1785,6 @@ def run_backtest_isa_dynamic(
         hybrid_gross = apply_dynamic_drawdown_scaling(
             hybrid_gross, qqq_monthly, threshold_fraction=0.8
         )
-
-    # Optional QQQ hedge taken from cash
-    if enable_hedge and hedge_size > 0:
-        qqq_monthly = qqq.resample("ME").last().pct_change().reindex(hybrid_gross.index)
-        hedged = hybrid_gross.copy()
-        for dt in hedged.index:
-            # Use history up to previous month for correlation
-            past_rets = hedged.loc[:dt].iloc[:-1]
-            hist_daily = daily.loc[:dt]
-            regime_metrics = compute_regime_metrics(hist_daily)
-            hedge_w = build_hedge_weight(past_rets, regime_metrics, hedge_size)
-            if hedge_w > 0 and pd.notna(qqq_monthly.loc[dt]):
-                hedged.loc[dt] = hedged.loc[dt] - qqq_monthly.loc[dt] * hedge_w
-        hybrid_gross = hedged
 
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
