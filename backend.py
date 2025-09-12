@@ -1327,7 +1327,7 @@ def trend_z(daily: pd.DataFrame) -> pd.Series:
     return z.reindex(daily.columns).fillna(0.0)
 
 def composite_score(daily: pd.DataFrame) -> pd.Series:
-    monthly = daily.resample("ME").last()
+    monthly = daily.resample("M").last()
     momz = blended_momentum_z(monthly)
     lvz  = lowvol_z(daily)
     tz   = trend_z(daily)
@@ -1363,7 +1363,7 @@ def run_momentum_composite_param(
     simultaneous sector+name (and group) enforcement using the enhanced taxonomy."""
     debug_caps = bool(st.session_state.get("debug_caps", False))
 
-    monthly = daily.resample("ME").last()
+    monthly = daily.resample("M").last()
     fwd = monthly.pct_change().shift(-1)  # next-month returns
     rets = pd.Series(index=monthly.index, dtype=float)
     tno  = pd.Series(index=monthly.index, dtype=float)
@@ -1387,7 +1387,7 @@ def run_momentum_composite_param(
             continue
 
         # Restrict to positive blended momentum universe
-        momz = blended_momentum_z(hist.resample("ME").last())
+        momz = blended_momentum_z(hist.resample("M").last())
         comp = comp.reindex(momz.index).dropna()
         sel  = comp[momz > 0].dropna()
         if sel.empty:
@@ -1557,7 +1557,7 @@ def _build_isa_weights_fixed(
     adjusted using risk-parity weights and volatility-aware name caps before the
     standard hierarchical cap enforcement.
     """
-    monthly = daily_close.resample("ME").last()
+    monthly = daily_close.resample("M").last()
 
     # --- Momentum Component (NO CAPS YET) ---
     comp_all = composite_score(daily_close)
@@ -1771,7 +1771,7 @@ def generate_live_portfolio_isa_monthly(
 
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
-        monthly = close.resample("ME").last()
+        monthly = close.resample("M").last()
         mom_scores = blended_momentum_z(monthly)
         if not mom_scores.empty and len(new_w) > 0:
             top_m = mom_scores.nlargest(params["mom_topn"])
@@ -1932,7 +1932,7 @@ def run_backtest_isa_dynamic(
 
     # Apply drawdown-based exposure adjustment (walk-forward)
     if use_enhanced_features:
-        qqq_monthly = qqq.resample('ME').last().pct_change()
+        qqq_monthly = qqq.resample("M").last().pct_change()
         hybrid_gross = apply_dynamic_drawdown_scaling(
             hybrid_gross, qqq_monthly, threshold_fraction=0.8
         )
@@ -1942,7 +1942,7 @@ def run_backtest_isa_dynamic(
     # Cum curves
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
     strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
-    qqq_cum = (1 + qqq.resample("ME").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
+    qqq_cum = (1 + qqq.resample("M").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
 
     return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
     
@@ -1981,7 +1981,7 @@ def diff_portfolios(prev_df: Optional[pd.DataFrame],
 def _signal_snapshot_for_explain(daily_prices: pd.DataFrame, params: Dict) -> pd.DataFrame:
     if daily_prices.empty:
         return pd.DataFrame()
-    monthly = daily_prices.resample("ME").last()
+    monthly = daily_prices.resample("M").last()
     if monthly.shape[0] < 13:
         return pd.DataFrame()
 
@@ -2141,7 +2141,7 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
     qqq_vol_10d = qqq.pct_change().rolling(10).std().iloc[-1]
     qqq_slope_50 = (qqq.rolling(50).mean().iloc[-1] / qqq.rolling(50).mean().iloc[-10] - 1) if len(qqq) > 60 else np.nan
 
-    monthly = universe_prices_daily.resample("ME").last()
+    monthly = universe_prices_daily.resample("M").last()
     pos_6m = (monthly.pct_change(6).iloc[-1] > 0).mean()
 
     return {
