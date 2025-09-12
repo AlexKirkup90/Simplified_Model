@@ -693,18 +693,27 @@ def fetch_sp500_constituents() -> List[str]:
             "CMI", "WELL", "CHTR", "ALL", "GD", "F", "GM", "STZ", "HCA", "AIG"
         ]
 
+_SECTOR_CACHE: Dict[str, str] = {}
+
 @st.cache_data(ttl=86400)
 def get_sector_map(tickers: List[str]) -> Dict[str, str]:
-    """Best-effort sector map via yfinance. Returns 'Unknown' when missing."""
-    out = {}
-    for t in tickers:
+    """Return a mapping from ticker to sector name.
+
+    The function queries :mod:`yfinance` only for tickers not seen before and
+    stores results in a module-level cache. Streamlit's ``st.cache_data`` also
+    caches the overall mapping for identical ticker lists, minimizing network
+    requests across repeated executions. Tickers lacking sector information are
+    stored as ``"Unknown"``.
+    """
+    new_tickers = [t for t in tickers if t not in _SECTOR_CACHE]
+    for t in new_tickers:
         try:
             info = yf.Ticker(t).info or {}
             sector = info.get("sector") or "Unknown"
         except Exception:
             sector = "Unknown"
-        out[t] = sector
-    return out
+        _SECTOR_CACHE[t] = sector
+    return {t: _SECTOR_CACHE.get(t, "Unknown") for t in tickers}
 
 def get_nasdaq_100_plus_tickers() -> List[str]:
     """Get NASDAQ 100+ tickers with fallback list"""
