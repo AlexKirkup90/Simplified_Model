@@ -11,9 +11,6 @@ st.secrets = types.SimpleNamespace(get=lambda *args, **kwargs: None)
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 import backend
 
-def setup_module(module):
-    st.session_state.clear()
-
 def _base_patch(monkeypatch, metrics, regime_label="Risk-On"):
     def fake_get_universe(choice):
         return ["AAA", "BBB"], {"AAA": "Tech", "BBB": "Tech"}, "label"
