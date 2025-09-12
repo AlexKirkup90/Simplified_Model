@@ -38,6 +38,8 @@ def _mock_env(monkeypatch):
     monkeypatch.setattr(backend, "fetch_fundamental_metrics", fake_fetch_fundamental_metrics)
     monkeypatch.setattr(backend, "fundamental_quality_filter", fake_fundamental_quality_filter)
     monkeypatch.setattr(backend, "_build_isa_weights_fixed", fake_build_weights)
+    monkeypatch.setattr(backend, "compute_regime_metrics", lambda hist: {})
+    monkeypatch.setattr(backend, "get_regime_adjusted_exposure", lambda metrics: 1.0)
 
 
 def test_first_trading_day_saves(monkeypatch):
