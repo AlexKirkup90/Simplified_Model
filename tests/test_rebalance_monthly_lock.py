@@ -31,7 +31,9 @@ def _mock_env(monkeypatch):
         return df.index.tolist()
 
     def fake_build_weights(close, params, sectors_map):
-        return pd.Series({"AAA": 0.6, "BBB": 0.4})
+        final = pd.Series({"AAA": 0.6, "BBB": 0.4})
+        empty = pd.Series(dtype=float)
+        return backend.IsaWeights(empty, empty, final, empty, final)
 
     monkeypatch.setattr(backend, "get_universe", fake_get_universe)
     monkeypatch.setattr(backend, "fetch_price_volume", fake_fetch_price_volume)

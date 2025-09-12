@@ -8,6 +8,7 @@ import requests
 import streamlit as st
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
+from dataclasses import dataclass
 
 warnings.filterwarnings("ignore")
 
@@ -222,7 +223,8 @@ def generate_td1_targets_asof(
         return pd.Series(dtype=float)
 
     # Your existing (fixed) builder runs full selection + caps
-    weights = _build_isa_weights_fixed(hist, preset, sectors_map)  # returns weights summing to equity exposure
+    weights_struct = _build_isa_weights_fixed(hist, preset, sectors_map)
+    weights = weights_struct.final_weights  # returns weights summing to equity exposure
 
     regime_metrics: Dict[str, float] = {}
     # If TD1 applies regime exposure (not the drawdown scaler on *returns*, but the weight scaler), apply it here too
@@ -1513,11 +1515,20 @@ def fundamental_quality_filter(
 # =========================
 # Live portfolio builders (ISA MONTHLY LOCK + stickiness + sector caps) - MODIFIED
 # =========================
+@dataclass
+class IsaWeights:
+    mom_raw: pd.Series
+    mr_raw: pd.Series
+    combined_raw: pd.Series
+    rp_weights: pd.Series
+    final_weights: pd.Series
+
+
 def _build_isa_weights_fixed(
     daily_close: pd.DataFrame,
     preset: Dict,
     sectors_map: Dict[str, str]
-) -> pd.Series:
+) -> IsaWeights:
     """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio."""
     monthly = daily_close.resample("ME").last()
 
@@ -1557,7 +1568,8 @@ def _build_isa_weights_fixed(
     # --- Combine Components BEFORE Applying Caps ---
     combined_raw = mom_raw.add(mr_raw, fill_value=0.0)
     if combined_raw.empty or combined_raw.sum() <= 0:
-        return combined_raw
+        empty = pd.Series(dtype=float)
+        return IsaWeights(mom_raw, mr_raw, combined_raw, empty, combined_raw)
 
     # Apply risk parity weights before enforcing caps
     rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
@@ -1578,10 +1590,11 @@ def _build_isa_weights_fixed(
     )
 
     if final_weights.empty or final_weights.sum() <= 0:
-        return final_weights
+        return IsaWeights(mom_raw, mr_raw, combined_raw, rp_weights, final_weights)
 
     # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
-    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+    final_weights = final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+    return IsaWeights(mom_raw, mr_raw, combined_raw, rp_weights, final_weights)
 
 def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str], 
                               name_cap: float, sector_cap: float) -> List[str]:
@@ -1685,7 +1698,8 @@ def generate_live_portfolio_isa_monthly(
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
 
-    new_w = _build_isa_weights_fixed(close, params, sectors_map)
+    isa_weights = _build_isa_weights_fixed(close, params, sectors_map)
+    new_w = isa_weights.final_weights
 
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
