@@ -1739,6 +1739,15 @@ def generate_live_portfolio_isa_monthly(
         close, params, sectors_map, use_enhanced_features=use_enhanced_features
     )
 
+    # Apply regime-based exposure scaling to final weights
+    if use_enhanced_features and len(close) > 0 and len(new_w) > 0:
+        try:
+            regime_metrics = compute_regime_metrics(close)
+            regime_exposure = get_regime_adjusted_exposure(regime_metrics)
+            new_w = new_w * float(regime_exposure)
+        except Exception:
+            pass
+
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("ME").last()
