@@ -59,8 +59,6 @@ st.session_state.setdefault("min_dollar_volume", 0)
 st.session_state.setdefault("min_profitability", 0.0)
 st.session_state.setdefault("max_leverage", 2.0)
 st.session_state.setdefault("show_net", True)
-st.session_state.setdefault("enable_hedge", False)
-st.session_state.setdefault("hedge_size", 0.0)
 st.session_state.setdefault("vix_ts_threshold", backend.VIX_TS_THRESHOLD_DEFAULT)
 st.session_state.setdefault("hy_oas_threshold", backend.HY_OAS_THRESHOLD_DEFAULT)
 st.session_state["use_enhanced_features"] = use_enhanced_features
@@ -186,9 +184,7 @@ if go:
                 mr_topn=preset["mr_topn"],
                 mom_weight=preset["mom_w"],
                 mr_weight=preset["mr_w"],
-                use_enhanced_features=st.session_state.get("use_enhanced_features", True),
-                enable_hedge=st.session_state.get("enable_hedge", False),
-                hedge_size=float(st.session_state.get("hedge_size", 0.0))
+                use_enhanced_features=st.session_state.get("use_enhanced_features", True)
             )
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
