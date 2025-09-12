@@ -47,6 +47,16 @@ use_enhanced_features = st.sidebar.checkbox(
     help="Enables volatility-adjusted caps, regime awareness, and signal decay"
 )
 
+# Optional parameter optimization
+auto_optimize = st.sidebar.checkbox(
+    "📈 Auto-optimize parameters",
+    value=False,
+    help="Skip presets and search for Sharpe-maximizing parameters when checked",
+)
+st.sidebar.caption(
+    "Presets use fixed parameters and skip optimization unless 'Auto-optimize parameters' is enabled."
+)
+
 # Initialize parameters from presets or prior assessment
 st.session_state.setdefault("stickiness_days", preset.get("stability_days", 7))
 st.session_state.setdefault("name_cap", preset.get("mom_cap", 0.25))
@@ -59,6 +69,7 @@ st.session_state.setdefault("show_net", True)
 st.session_state.setdefault("vix_ts_threshold", backend.VIX_TS_THRESHOLD_DEFAULT)
 st.session_state.setdefault("hy_oas_threshold", backend.HY_OAS_THRESHOLD_DEFAULT)
 st.session_state["use_enhanced_features"] = use_enhanced_features
+st.session_state["auto_optimize"] = auto_optimize
 
 # Derived constants
 AVG_TRADE_SIZE = AVG_TRADE_SIZE_DEFAULT
@@ -180,14 +191,18 @@ if go:
                 show_net=st.session_state.get("show_net", True),
                 start_date="2017-07-01",
                 universe_choice=st.session_state.get("universe", "Hybrid Top150"),
-                top_n=preset["mom_topn"],
-                name_cap=float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25))),
-                sector_cap=float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))),
+                top_n=None if auto_optimize else preset["mom_topn"],
+                name_cap=None if auto_optimize else float(
+                    st.session_state.get("name_cap", preset.get("mom_cap", 0.25))
+                ),
+                sector_cap=None if auto_optimize else float(
+                    st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
+                ),
                 stickiness_days=int(st.session_state.get("stickiness_days", preset.get("stability_days", 7))),
                 mr_topn=preset["mr_topn"],
-                mom_weight=preset["mom_w"],
-                mr_weight=preset["mr_w"],
-                use_enhanced_features=st.session_state.get("use_enhanced_features", True)
+                mom_weight=None if auto_optimize else preset["mom_w"],
+                mr_weight=None if auto_optimize else preset["mr_w"],
+                use_enhanced_features=st.session_state.get("use_enhanced_features", True),
             )
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
