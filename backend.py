@@ -972,6 +972,24 @@ def save_current_portfolio(df: pd.DataFrame) -> None:
     except Exception as e:
         st.sidebar.warning(f"Could not save local portfolio: {e}")
 
+
+def save_portfolio_if_rebalance(
+    df: pd.DataFrame, price_index: Optional[pd.DatetimeIndex]
+) -> bool:
+    """Save portfolio only on rebalance days.
+
+    Returns True if the save routines executed, otherwise False.
+    """
+    if not is_rebalance_today(date.today(), price_index):
+        # Provide user feedback via sidebar but do not save
+        st.sidebar.info("Not a rebalance day – skipping save")
+        return False
+
+    # Proceed with standard save routines
+    save_current_portfolio(df)
+    save_portfolio_to_gist(df)
+    return True
+
 # =========================
 # Calendar helpers (Monthly Lock) - Unchanged
 # =========================
@@ -1604,6 +1622,9 @@ def generate_live_portfolio_isa_monthly(
         return None, None, "No tickers pass quality filter."
     close = close[keep]
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
+
+    # Expose the price index for downstream processes (e.g. save gating)
+    st.session_state["latest_price_index"] = close.index
 
     # Monthly lock check – always compute new weights
     is_monthly = is_rebalance_today(today, close.index)
