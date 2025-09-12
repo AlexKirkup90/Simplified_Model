@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import streamlit as st
-import sys, pathlib, types
+import sys, pathlib, types, json
 from datetime import date
 
 # Provide empty secrets so backend import does not fail
@@ -66,3 +66,72 @@ def test_assess_market_conditions_risk_off(monkeypatch):
     assert settings["sector_cap"] == pytest.approx(0.20)
     assert settings["name_cap"] == pytest.approx(0.20)
     assert settings["stickiness_days"] == 14
+
+
+def test_assess_market_conditions_logs(monkeypatch):
+    metrics = {
+        "breadth_pos_6m": 0.7,
+        "qqq_vol_10d": 0.02,
+        "vix_term_structure": 1.1,
+        "hy_oas": 4.0,
+        "qqq_above_200dma": 1.0,
+    }
+    _base_patch(monkeypatch, metrics, "Risk-On")
+
+    def fake_load():
+        return pd.DataFrame(columns=["date", "metrics", "settings", "portfolio_ret", "benchmark_ret"])
+
+    captured = {}
+
+    def fake_save(df):
+        captured["df"] = df
+
+    monkeypatch.setattr(backend, "load_assess_log", fake_load)
+    monkeypatch.setattr(backend, "save_assess_log", fake_save)
+
+    backend.assess_market_conditions(date(2024, 1, 5))
+
+    assert "df" in captured
+    row = captured["df"].iloc[0]
+    assert row["date"] == pd.Timestamp("2024-01-05")
+    m = json.loads(row["metrics"])
+    s = json.loads(row["settings"])
+    assert "breadth_pos_6m" in m
+    assert "sector_cap" in s
+
+
+def test_record_assessment_outcome(monkeypatch):
+    log_df = pd.DataFrame([
+        {
+            "date": pd.Timestamp("2024-01-05"),
+            "metrics": "{}",
+            "settings": "{}",
+            "portfolio_ret": np.nan,
+            "benchmark_ret": np.nan,
+        }
+    ])
+
+    monkeypatch.setattr(backend, "load_assess_log", lambda: log_df.copy())
+    saved = {}
+    monkeypatch.setattr(backend, "save_assess_log", lambda df: saved.setdefault("df", df))
+
+    port_df = pd.DataFrame({"Weight": [0.5, 0.5]}, index=["AAA", "BBB"])
+    monkeypatch.setattr(backend, "load_previous_portfolio", lambda: port_df)
+
+    dates = pd.to_datetime(["2024-01-05", "2024-02-05"])
+    prices = pd.DataFrame({
+        "AAA": [100, 110],
+        "BBB": [100, 90],
+        "QQQ": [100, 105],
+    }, index=dates)
+
+    monkeypatch.setattr(
+        backend,
+        "fetch_market_data",
+        lambda tickers, start, end: prices.reindex(columns=tickers),
+    )
+
+    result = backend.record_assessment_outcome(date(2024, 1, 5))
+    assert result["ok"]
+    assert saved["df"].loc[0, "portfolio_ret"] == pytest.approx(0.0)
+    assert saved["df"].loc[0, "benchmark_ret"] == pytest.approx(0.05)
