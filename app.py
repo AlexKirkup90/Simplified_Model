@@ -3,6 +3,7 @@ import traceback
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -181,6 +182,51 @@ if assess:
     st.json(assessment["settings"])
     for k, v in assessment["settings"].items():
         st.session_state[k] = v
+
+    # -------------------------
+    # Assessment log & accuracy
+    # -------------------------
+    with st.expander("📄 Assessment History & Accuracy"):
+        log = backend.load_assess_log()
+        summary = backend.evaluate_assessment_accuracy(log)
+
+        hist = summary.get("history", pd.DataFrame())
+        if not hist.empty:
+            # merge regime label from metrics
+            hist = hist.merge(log[["date", "metrics"]], on="date", how="left")
+
+            def _regime(x):
+                try:
+                    return json.loads(x).get("regime", "n/a")
+                except Exception:
+                    return "n/a"
+
+            hist["regime"] = hist["metrics"].apply(_regime)
+            hist = hist.drop(columns=["metrics"])
+            st.write("#### Log")
+            st.dataframe(hist.sort_values("date", ascending=False), use_container_width=True)
+        else:
+            st.write("No assessment history yet.")
+
+        st.write("#### Summary Statistics")
+        c1, c2 = st.columns(2)
+        hit_rate = summary.get("hit_rate", np.nan)
+        avg_alpha = summary.get("avg_alpha", np.nan)
+        c1.metric("Hit Rate", f"{hit_rate:.1%}" if pd.notna(hit_rate) else "n/a")
+        c2.metric("Avg Alpha", f"{avg_alpha:.2%}" if pd.notna(avg_alpha) else "n/a")
+        confusion = summary.get("confusion_matrix", pd.DataFrame())
+        if not confusion.empty:
+            st.write("Confusion Matrix")
+            st.dataframe(confusion, use_container_width=True)
+
+        # Highlight parameter adjustments from recalibration
+        prev_map = st.session_state.get("param_map_defaults", backend.PARAM_MAP_DEFAULTS)
+        backend.update_parameter_mapping(log)
+        new_map = st.session_state.get("param_map_defaults", prev_map)
+        adjustments = {k: new_map[k] for k in new_map if prev_map.get(k) != new_map.get(k)}
+        if adjustments:
+            st.write("#### Parameter Adjustments")
+            st.json(adjustments)
 
 # ---------------------------
 # Go button
