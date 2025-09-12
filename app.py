@@ -310,6 +310,10 @@ with tab2:
         else:
             st.info("📊 Using standard features only")
 
+        # Non-rebalance day notice
+        if not is_rebalance_day:
+            st.info("Preview only – portfolio not saved")
+
         st.dataframe(live_disp, use_container_width=True)
 
         # Extract current weights safely
@@ -323,8 +327,8 @@ with tab2:
         except Exception:
             weights = None
 
-        # Gated save action – only enabled on rebalance days
-        if st.button("💾 Save Portfolio", disabled=not is_rebalance_day):
+        # Gated save action – only visible on rebalance days
+        if is_rebalance_day and st.button("💾 Save Portfolio"):
             backend.save_portfolio_if_rebalance(live_raw, price_index)
 
     # -------------------------
