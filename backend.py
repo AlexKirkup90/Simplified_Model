@@ -264,8 +264,8 @@ def enforce_caps_iteratively(
     - sector_cap: default cap for any sector not explicitly listed in group_caps
     - group_caps: optional dict like {"Software": 0.30, "Software:Security": 0.18, ...}
                   Parent groups are labels with no ":" (e.g., "Software").
-    We *do not* force re-distribution; trimmed weight becomes cash (i.e., sum <= 1),
-    which matches your existing preview behavior.
+    We *do not* force re-distribution; trimmed weight becomes cash (i.e., sum <= 1).
+    This residual cash persists until any later exposure scaling step.
     """
 
     if weights.empty:
@@ -1628,7 +1628,9 @@ def _build_isa_weights_fixed(
 
     When ``use_enhanced_features`` is True, the raw sleeve weights are further
     adjusted using risk-parity weights and volatility-aware name caps before the
-    standard hierarchical cap enforcement.
+    standard hierarchical cap enforcement. Cap trimming doesn't redistribute
+    weight, so any residual cash is scaled back to full exposure at the end of
+    this function.
     """
     monthly = daily_close.resample("M").last()
 
@@ -1746,6 +1748,8 @@ def generate_live_portfolio_isa_monthly(
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
     Now includes regime awareness, volatility adjustments, and an optional `as_of` date.
+    Cap trimming leaves residual cash until the final exposure scaling performed
+    within this routine.
     """
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
