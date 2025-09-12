@@ -1158,28 +1158,6 @@ def cap_weights(weights: pd.Series, cap: float = 0.25,
             w += excess / len(w)
     return w
 
-def apply_sector_caps(w: pd.Series, sectors_map: Dict[str,str], cap: float = 0.30, max_iter: int = 50) -> pd.Series:
-    if w.empty: return w
-    w = w.copy().astype(float)
-    sectors = pd.Series({t: sectors_map.get(t, "Unknown") for t in w.index})
-    for _ in range(max_iter):
-        sums = w.groupby(sectors).sum()
-        over = sums[sums > cap]
-        if over.empty: break
-        total_excess = 0.0
-        for sec, sec_sum in over.items():
-            idx = w.index[sectors == sec]
-            scale = cap / sec_sum if sec_sum > 0 else 1.0
-            new_sec = w.loc[idx] * scale
-            total_excess += (w.loc[idx].sum() - new_sec.sum())
-            w.loc[idx] = new_sec
-        under_idx = w.index[~sectors.isin(over.index)]
-        if len(under_idx) == 0 or w.loc[under_idx].sum() <= 0:
-            w += total_excess / len(w)
-        else:
-            w.loc[under_idx] += (w.loc[under_idx] / w.loc[under_idx].sum()) * total_excess
-    return w / w.sum() if w.sum() > 0 else w
-
 def equity_curve(returns: pd.Series) -> pd.Series:
     r = pd.Series(returns).fillna(0.0)
     return (1 + r).cumprod()
