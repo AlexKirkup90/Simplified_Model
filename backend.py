@@ -1912,6 +1912,26 @@ def _signal_snapshot_for_explain(daily_prices: pd.DataFrame, params: Dict) -> pd
     })
     return snap.sort_index()
 
+def _build_change_reason(action: str, delta_bps: int, mom_rank: float,
+                         mom_score: float, st_ret: float,
+                         above_ma: float) -> str:
+    """Generate a short natural language explanation for a portfolio change."""
+    verb = {"Buy": "Buying", "Sell": "Selling", "Rebalance": "Rebalancing"}.get(action, action)
+    parts: List[str] = []
+    if pd.notna(mom_rank):
+        parts.append(f"momentum rank {int(mom_rank)}")
+    if pd.notna(mom_score):
+        parts.append(f"score {mom_score:.2f}")
+    if pd.notna(st_ret):
+        parts.append(f"{st_ret:+.1%} short-term return")
+    if pd.notna(above_ma):
+        parts.append("above 200DMA" if above_ma else "below 200DMA")
+    metrics = ", ".join(parts)
+    prefix = f"{verb} {delta_bps:+d} bps" if delta_bps else verb
+    if metrics:
+        return f"{prefix} due to {metrics}"
+    return prefix
+
 def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
                               curr_df: Optional[pd.DataFrame],
                               daily_prices: pd.DataFrame,
@@ -1925,7 +1945,8 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
     if not all_tickers:
         return pd.DataFrame(columns=[
             "Ticker","Action","Old Wt","New Wt","Δ Wt (bps)",
-            "Mom Rank","Mom Score",f"ST Return ({params['mr_lb']}d)",f"Above {params['mr_ma']}DMA"
+            "Mom Rank","Mom Score",f"ST Return ({params['mr_lb']}d)",
+            f"Above {params['mr_ma']}DMA","Why"
         ])
 
     prices = daily_prices[all_tickers].dropna(axis=1, how="all")
@@ -1954,17 +1975,18 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
         stv = snap.at[t, st_key] if t in snap.index else np.nan
         above_key = f"above_{params['mr_ma']}dma"
         ab = snap.at[t, above_key] if t in snap.index else np.nan
-
+        delta_bps = int(round((new_w - old_w) * 10000))
         rows.append({
             "Ticker": t,
             "Action": action,
             "Old Wt": old_w,
             "New Wt": new_w,
-            "Δ Wt (bps)": int(round((new_w - old_w) * 10000)),
+            "Δ Wt (bps)": delta_bps,
             "Mom Rank": int(mom_rank) if pd.notna(mom_rank) else np.nan,
             "Mom Score": mom_score,
             f"ST Return ({params['mr_lb']}d)": stv,
-            f"Above {params['mr_ma']}DMA": bool(ab) if pd.notna(ab) else None
+            f"Above {params['mr_ma']}DMA": bool(ab) if pd.notna(ab) else None,
+            "Why": _build_change_reason(action, delta_bps, mom_rank, mom_score, stv, ab)
         })
 
     out = pd.DataFrame(rows)
