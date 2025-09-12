@@ -169,6 +169,20 @@ st.session_state["hy_oas_threshold"] = float(hy_oas_threshold)
 prev_portfolio = backend.load_previous_portfolio()
 
 # ---------------------------
+# Market assessment
+# ---------------------------
+assess = st.button("Assess Market Conditions", key="assess_market")
+if assess:
+    with st.spinner("Assessing market conditions…"):
+        assessment = backend.assess_market_conditions()
+    st.write("### Market Metrics")
+    st.json(assessment["metrics"])
+    st.write("### Recommended Settings")
+    st.json(assessment["settings"])
+    for k, v in assessment["settings"].items():
+        st.session_state[k] = v
+
+# ---------------------------
 # Go button
 # ---------------------------
 go = st.button("Generate Portfolio & Backtest", type="primary", use_container_width=True)
