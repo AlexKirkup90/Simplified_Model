@@ -1,0 +1,3 @@
+__pycache__/
+.pytest_cache/
+.parquet_cache/
