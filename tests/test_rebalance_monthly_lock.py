@@ -12,10 +12,6 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 import backend
 
 
-def setup_module(module):
-    st.session_state.clear()
-
-
 def _mock_env(monkeypatch):
     def fake_get_universe(choice):
         tickers = ["AAA", "BBB"]
@@ -51,8 +47,12 @@ def test_first_trading_day_saves(monkeypatch):
 
     with patch.object(backend, "save_portfolio_to_gist") as spg, \
          patch.object(backend, "save_current_portfolio") as scp:
-        disp, raw, decision = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 3))
-        price_index = st.session_state.get("latest_price_index")
+        result = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 3))
+        if len(result) == 4:
+            disp, raw, price_index, decision = result
+        else:
+            disp, raw, decision = result
+            price_index = st.session_state.get("latest_price_index")
         assert raw is not None and not raw.empty
         saved = backend.save_portfolio_if_rebalance(raw, price_index)
         assert saved is True
@@ -67,8 +67,12 @@ def test_mid_month_no_save(monkeypatch):
 
     with patch.object(backend, "save_portfolio_to_gist") as spg, \
          patch.object(backend, "save_current_portfolio") as scp:
-        disp, raw, decision = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 17))
-        price_index = st.session_state.get("latest_price_index")
+        result = backend.generate_live_portfolio_isa_monthly(preset, None, as_of=date(2024, 6, 17))
+        if len(result) == 4:
+            disp, raw, price_index, decision = result
+        else:
+            disp, raw, decision = result
+            price_index = st.session_state.get("latest_price_index")
         assert raw is not None and not raw.empty
         saved = backend.save_portfolio_if_rebalance(raw, price_index)
         assert saved is False

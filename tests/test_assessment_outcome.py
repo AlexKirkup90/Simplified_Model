@@ -11,7 +11,6 @@ import backend
 
 
 def test_record_assessment_outcome_two_months(monkeypatch):
-    st.session_state.clear()
 
     log_store = {"df": pd.DataFrame(columns=["date", "metrics", "settings", "portfolio_ret", "benchmark_ret"])}
 
