@@ -522,8 +522,44 @@ def get_regime_adjusted_exposure(regime_metrics: Dict[str, float]) -> float:
     # Adjust for trend
     if qqq_above_ma < 1.0:  # Below 200DMA
         exposure *= 0.9
-    
+
     return np.clip(exposure, 0.3, 1.2)  # Keep between 30% and 120%
+
+# =========================
+# NEW: Regime-Based Parameter Mapping
+# =========================
+def map_metrics_to_settings(metrics: Dict[str, float]) -> Dict[str, float]:
+    """Map regime metrics to strategy parameter settings.
+
+    Parameters
+    ----------
+    metrics : dict
+        Dictionary containing regime metrics such as ``qqq_vol_10d``.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys ``top_n``, ``name_cap``, and ``sector_cap``.
+    """
+
+    vol = metrics.get("qqq_vol_10d", np.nan)
+
+    # Baseline settings
+    top_n = 8
+    name_cap = 0.25
+    sector_cap = 0.30
+
+    if pd.notna(vol):
+        if vol > 0.04:  # High volatility -> be more defensive
+            top_n = 5
+            name_cap = 0.20
+            sector_cap = 0.25
+        elif vol < 0.02:  # Low volatility -> allow broader exposure
+            top_n = 10
+            name_cap = 0.30
+            sector_cap = 0.35
+
+    return {"top_n": top_n, "name_cap": name_cap, "sector_cap": sector_cap}
 
 # =========================
 # NEW: Enhanced Drawdown Controls
