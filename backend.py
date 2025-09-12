@@ -874,7 +874,6 @@ def fetch_sp500_constituents() -> List[str]:
             "CMI", "WELL", "CHTR", "ALL", "GD", "F", "GM", "STZ", "HCA", "AIG"
         ]
 
-_SECTOR_CACHE_TTL = 86400
 _SECTOR_CACHE: Dict[str, str] = {}
 
 _SECTOR_OVERRIDE_PATH = Path(__file__).with_name("sector_overrides.csv")
@@ -908,8 +907,11 @@ def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
         except Exception:
             return {}
 
-@st.cache_data(ttl=_SECTOR_CACHE_TTL)
-def get_sector_map(tickers: List[str]) -> Dict[str, str]:
+@st.cache_data(ttl=86400)
+def get_sector_map(
+    tickers: List[str],
+    _cache_key: Tuple[str, ...] | None = None,
+) -> Dict[str, str]:
     """Return a mapping from ticker to sector name.
 
     Each ticker is fetched from :mod:`yfinance` at most once. Results are cached
@@ -918,6 +920,14 @@ def get_sector_map(tickers: List[str]) -> Dict[str, str]:
     ``Ticker.fast_info`` is used when possible, and any remaining calls to
     ``ticker.info`` are wrapped with a timeout to avoid hangs. Tickers with
     missing sector information are stored as ``"Unknown"``.
+
+    Parameters
+    ----------
+    tickers : List[str]
+        The tickers to map.
+    _cache_key : Tuple[str, ...], optional
+        A hashable cache key derived from ``tickers`` to stabilise Streamlit
+        caching. The argument is unused within the function body.
     """
 
     new_tickers = [t for t in tickers if t not in _SECTOR_CACHE]
@@ -983,17 +993,17 @@ def get_universe(choice: str) -> Tuple[List[str], Dict[str, str], str]:
     choice = (choice or "").strip()
     if choice.lower().startswith("nasdaq"):
         tickers = get_nasdaq_100_plus_tickers()
-        sectors = get_sector_map(tickers)
+        sectors = get_sector_map(tickers, _cache_key=tuple(sorted(tickers)))
         return tickers, sectors, "NASDAQ100+"
 
     if choice.lower().startswith("s&p500"):
         tickers = fetch_sp500_constituents()
-        sectors = get_sector_map(tickers)
+        sectors = get_sector_map(tickers, _cache_key=tuple(sorted(tickers)))
         return tickers, sectors, "S&P500 (All)"
 
     # Default to Hybrid Top150
     tickers = fetch_sp500_constituents()
-    sectors = get_sector_map(tickers)
+    sectors = get_sector_map(tickers, _cache_key=tuple(sorted(tickers)))
     return tickers, sectors, "Hybrid Top150"
 
 # =========================
@@ -1179,7 +1189,8 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
 
         # Constraint check if sector map available
         try:
-            sectors_map = get_enhanced_sector_map(list(df.index))
+            base_map = get_sector_map(list(df.index), _cache_key=tuple(sorted(df.index)))
+            sectors_map = get_enhanced_sector_map(list(df.index), base_map=base_map)
             if sectors_map:
                 preset = STRATEGY_PRESETS.get("ISA Dynamic (0.75)", {})
                 name_cap = float(preset.get("mom_cap", 0.25))

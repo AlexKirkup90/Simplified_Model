@@ -306,11 +306,18 @@ with tab2:
         except Exception:
             weights = None
 
+        base_map = {}
         # -------------------------
         # Constraints & concentration metrics
         # -------------------------
         if weights is not None and len(weights) > 0:
-            sectors_map = backend.get_enhanced_sector_map(list(weights.index))
+            base_map = backend.get_sector_map(
+                list(weights.index),
+                _cache_key=tuple(sorted(weights.index)),
+            )
+            sectors_map = backend.get_enhanced_sector_map(
+                list(weights.index), base_map=base_map
+            )
             violations = backend.check_constraint_violations(
                 weights,
                 sectors_map,
@@ -344,7 +351,12 @@ with tab2:
     try:
         if weights is not None and len(weights) > 0:
             # Enhanced sector map with safe fallback to "Other"
-            enh_map = backend.get_enhanced_sector_map(list(weights.index))
+            base_map = base_map or backend.get_sector_map(
+                list(weights.index), _cache_key=tuple(sorted(weights.index))
+            )
+            enh_map = backend.get_enhanced_sector_map(
+                list(weights.index), base_map=base_map
+            )
             enh_map = {t: enh_map.get(t, "Other") for t in weights.index}
 
             sector_series = pd.Series(enh_map).reindex(weights.index)
