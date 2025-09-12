@@ -47,9 +47,6 @@ use_enhanced_features = st.sidebar.checkbox(
     help="Enables volatility-adjusted caps, regime awareness, and signal decay"
 )
 
-debug_caps = st.sidebar.checkbox("Show sector-cap debug", value=False)
-st.session_state["debug_caps"] = debug_caps
-
 # Initialize parameters from presets or prior assessment
 st.session_state.setdefault("stickiness_days", preset.get("stability_days", 7))
 st.session_state.setdefault("name_cap", preset.get("mom_cap", 0.25))
@@ -304,89 +301,6 @@ with tab2:
     except Exception:
         pass
 
-    # -------------------------
-# Preview: apply name/sector caps to TODAY'S holdings (no trading)
-# -------------------------
-with st.expander("🔍 Preview today (apply caps now) — no trade, just a look"):
-    preview_now = st.checkbox("Apply caps to carried weights (preview only)")
-    if preview_now:
-        try:
-            if weights is None or len(weights) == 0:
-                st.warning("No equity positions to preview.")
-            else:
-                # Equity-only slice (keeps cash constant)
-                w_eq = pd.Series(weights, dtype=float)
-                w_eq = w_eq[w_eq > 0].copy()
-
-                eq_total = float(w_eq.sum())
-                if eq_total <= 0:
-                    st.warning("No equity positions to preview.")
-                else:
-                    # Normalize equities to 100%, cap them there, then scale back to current equity total
-                    w_norm = (w_eq / eq_total).astype(float)
-
-                    # Caps from UI or defaults
-                    name_cap   = float(st.session_state.get("name_cap", 0.25))
-                    sector_cap = float(st.session_state.get("sector_cap", 0.30))
-                    debug_caps = bool(st.session_state.get("debug_caps", False))
-
-                    # Enhanced taxonomy with fallback -> "Other"
-                    enh_map = backend.get_enhanced_sector_map(list(w_norm.index))
-                    enh_map = {t: enh_map.get(t, "Other") for t in w_norm.index}
-
-                    w_capped_norm = backend.enforce_caps_iteratively(
-                        w_norm,
-                        enh_map,
-                        name_cap=name_cap,
-                        sector_cap=sector_cap,
-                        debug=debug_caps,
-                    )
-
-                    if w_capped_norm is None or len(w_capped_norm) == 0:
-                        st.warning("Preview produced no valid weights after caps.")
-                    else:
-                        # Scale back to current equity share (cash unchanged)
-                        w_capped = (w_capped_norm * eq_total).rename("Preview")
-
-                        # Comparison table
-                        current = w_eq.rename("Current")
-                        both = pd.concat([current, w_capped], axis=1).fillna(0.0)
-                        both["Δ (pp)"] = (both["Preview"] - both["Current"]) * 100.0
-
-                        st.markdown("**Current vs Preview (caps now, no trade):**")
-
-                        def _fmt_cell(val, col_name):
-                            if col_name in ("Current", "Preview"):
-                                return f"{float(val):.2%}"
-                            if col_name == "Δ (pp)":
-                                return f"{float(val):.2f}"
-                            return val
-
-                        df_show = both.sort_values("Preview", ascending=False).copy()
-                        for col in df_show.columns:
-                            df_show[col] = df_show[col].map(lambda v, c=col: _fmt_cell(v, c))
-
-                        st.dataframe(df_show, use_container_width=True)
-
-                        # Sector totals for the preview
-                        sec_preview = pd.Series(enh_map)
-                        sec_preview = sec_preview.reindex(w_capped.index)
-                        sector_totals_preview = (
-                            w_capped.groupby(sec_preview).sum().sort_values(ascending=False)
-                        )
-
-                        st.markdown("**Sector totals (preview with caps):**")
-                        st.dataframe(
-                            sector_totals_preview.map(lambda x: f"{x:.2%}"),
-                            use_container_width=True,
-                        )
-
-                        st.caption(
-                            "Preview keeps cash constant and redistributes **equities only** under name/sector caps."
-                        )
-        except Exception as e:
-            st.warning(f"Preview failed: {e}")
-                
 # ---------------------------
 # Tab 3: Enhanced Performance
 # ---------------------------
