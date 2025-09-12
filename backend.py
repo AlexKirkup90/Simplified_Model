@@ -475,14 +475,33 @@ def risk_parity_weights(prices: pd.DataFrame, tickers: List[str], lookback: int 
 # =========================
 # NEW: Signal Decay Modeling
 # =========================
-def apply_signal_decay(momentum_scores: pd.Series, signal_age_days: int = 0,
+def apply_signal_decay(momentum_scores: pd.Series, signal_age_days: Any = 0,
                       half_life: int = 45) -> pd.Series:
-    """Apply exponential decay to momentum signals based on age"""
-    if signal_age_days <= 0:
+    """Apply exponential decay to momentum signals based on age
+
+    Parameters
+    ----------
+    momentum_scores : pd.Series
+        Series of momentum scores indexed by ticker.
+    signal_age_days : Union[int, pd.Series, Dict]
+        Age of each signal in days.  Can be a scalar applied to all
+        tickers or a Series/Dict providing ages per ticker.
+    half_life : int, default 45
+        Half-life in days for the exponential decay.
+    """
+
+    if isinstance(signal_age_days, (int, float)):
+        if signal_age_days <= 0:
+            return momentum_scores
+        decay_factor = 0.5 ** (signal_age_days / half_life)
+        return momentum_scores * decay_factor
+
+    ages = pd.Series(signal_age_days).reindex(momentum_scores.index).fillna(0)
+    if (ages <= 0).all():
         return momentum_scores
-    
-    decay_factor = 0.5 ** (signal_age_days / half_life)
-    return momentum_scores * decay_factor
+
+    decay_factors = 0.5 ** (ages / half_life)
+    return momentum_scores * decay_factors
 
 # =========================
 # NEW: Regime-Adjusted Position Sizing
@@ -1296,6 +1315,7 @@ def run_momentum_composite_param(
     rets = pd.Series(index=monthly.index, dtype=float)
     tno  = pd.Series(index=monthly.index, dtype=float)
     prev_w = pd.Series(dtype=float)
+    signal_start_dates: Dict[str, pd.Timestamp] = {}
 
     for m in monthly.index:
         hist = daily.loc[:m]
@@ -1326,11 +1346,6 @@ def run_momentum_composite_param(
         # Pick top-N by score
         picks = sel.nlargest(top_n)
 
-        # Optional: signal decay shaping
-        if use_enhanced_features:
-            days_since_signal = 0  # TODO: wire up true signal age if you track it
-            picks = apply_signal_decay(picks, days_since_signal)
-
         # Stickiness filter (prefer persistent names)
         stable = set(momentum_stable_names(hist, top_n=top_n, days=stickiness_days))
         if stable:
@@ -1339,6 +1354,23 @@ def run_momentum_composite_param(
                 picks = filtered
             else:
                 picks = sel.nlargest(top_n)  # fallback if stickiness empties set
+
+        # Optional: signal decay shaping
+        if use_enhanced_features:
+            signal_ages: Dict[str, int] = {}
+            for t in picks.index:
+                if t not in signal_start_dates:
+                    signal_start_dates[t] = m
+                    signal_ages[t] = 0
+                else:
+                    signal_ages[t] = (m - signal_start_dates[t]).days
+
+            # Remove tickers no longer selected to reset their age if re-enter later
+            for t in list(signal_start_dates.keys()):
+                if t not in picks.index:
+                    del signal_start_dates[t]
+
+            picks = apply_signal_decay(picks, pd.Series(signal_ages))
 
         # Raw weights ~ proportional to scores
         if picks.empty or np.isclose(picks.sum(), 0.0):
