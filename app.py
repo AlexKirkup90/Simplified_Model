@@ -290,13 +290,9 @@ with tab1:
 with tab2:
     st.subheader("✅ Current Portfolio (Monthly-Locked)")
 
-    # Rebalance-day flag (use either key, prefer explicitly set one)
-    is_rebalance_day = bool(
-        st.session_state.get(
-            "is_rebalance_day",
-            st.session_state.get("is_monthly_rebalance_day", False),
-        )
-    )
+    # Determine if today is a rebalance day using the latest price index
+    price_index = st.session_state.get("latest_price_index")
+    is_rebalance_day = backend.is_rebalance_today(date.today(), price_index) if price_index is not None else False
 
     # -------------------------
     # Top panel: decision + table
@@ -326,6 +322,10 @@ with tab2:
                 weights = live_disp[col_name[0]].astype(float) if col_name else None
         except Exception:
             weights = None
+
+        # Gated save action – only enabled on rebalance days
+        if st.button("💾 Save Portfolio", disabled=not is_rebalance_day):
+            backend.save_portfolio_if_rebalance(live_raw, price_index)
 
     # -------------------------
     # Sector totals (current holdings)
