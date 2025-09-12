@@ -286,6 +286,30 @@ with tab2:
         except Exception:
             weights = None
 
+        # -------------------------
+        # Constraints & concentration metrics
+        # -------------------------
+        if weights is not None and len(weights) > 0:
+            sectors_map = backend.get_enhanced_sector_map(list(weights.index))
+            violations = backend.check_constraint_violations(
+                weights,
+                sectors_map,
+                name_cap=float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25))),
+                sector_cap=float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))),
+            )
+
+            max_w = weights.max()
+            total_exp = weights.sum()
+            c1, c2 = st.columns(2)
+            c1.metric("Max Weight", f"{max_w:.2%}")
+            c2.metric("Total Equity Exposure", f"{total_exp:.2%}")
+
+            if violations:
+                st.markdown("**Constraint Violations**")
+                st.table(pd.DataFrame({"Issue": violations}))
+            else:
+                st.success("No constraint violations")
+
         # Gated save action – only visible on rebalance days
         if is_rebalance_day and st.button("💾 Save Portfolio"):
             backend.save_portfolio_if_rebalance(live_raw, price_index)
