@@ -1759,9 +1759,17 @@ def generate_live_portfolio_isa_monthly(
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
-                decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
-                disp, raw = _format_display(prev_w)
-                return disp, raw, decision
+                prev_w = enforce_caps_iteratively(prev_w, sectors_map, mom_cap, sector_cap)
+                prev_w = prev_w / prev_w.sum()
+                violations = check_constraint_violations(prev_w, sectors_map, mom_cap, sector_cap)
+                if not violations:
+                    decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
+                    disp, raw = _format_display(prev_w)
+                    return disp, raw, decision
+                decision = (
+                    f"Health {health:.2f} ≥ trigger {params['trigger']:.2f}"
+                    " — constraints violated, rebalancing to new targets."
+                )
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
