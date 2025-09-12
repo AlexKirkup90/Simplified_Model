@@ -2815,12 +2815,30 @@ def get_live_equity() -> pd.DataFrame:
 # =========================
 # NEW: Monte Carlo Forward Projections
 # =========================
-def run_monte_carlo_projections(historical_returns: pd.Series, 
+def run_monte_carlo_projections(historical_returns: pd.Series,
                                n_scenarios: int = 5000,
                                horizon_months: int = 12,
                                confidence_levels: List[int] = [10, 50, 90],
-                               block_size: int = 3) -> Dict:
-    """Enhanced Monte Carlo projections with regime awareness"""
+                               block_size: int = 3,
+                               seed: int | None = 42) -> Dict:
+    """Enhanced Monte Carlo projections with regime awareness.
+
+    Parameters
+    ----------
+    historical_returns : pd.Series
+        Series of historical monthly returns.
+    n_scenarios : int, optional
+        Number of Monte Carlo scenarios to generate.
+    horizon_months : int, optional
+        Projection horizon in months.
+    confidence_levels : List[int], optional
+        Percentiles to compute from the simulated distribution.
+    block_size : int, optional
+        Size of blocks used in block bootstrap.
+    seed : int | None, optional
+        Seed for the random number generator. If ``None``, the generator is
+        initialized without a seed for non-deterministic results.
+    """
     
     if len(historical_returns) < 12:
         return {"error": "Insufficient historical data for Monte Carlo"}
@@ -2831,7 +2849,7 @@ def run_monte_carlo_projections(historical_returns: pd.Series,
         return {"error": "Insufficient clean returns data"}
     
     # Block bootstrap to preserve short-term correlation
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
     scenarios = []
     
     for _ in range(n_scenarios):

@@ -57,6 +57,15 @@ st.sidebar.caption(
     "Presets use fixed parameters and skip optimization unless 'Auto-optimize parameters' is enabled."
 )
 
+# Monte Carlo seed input
+st.session_state.setdefault("mc_seed", 42)
+mc_seed_input = st.sidebar.text_input(
+    "Monte Carlo seed (blank for random)",
+    value=str(st.session_state["mc_seed"]),
+    help="Controls the random seed for Monte Carlo projections",
+)
+st.session_state["mc_seed"] = int(mc_seed_input) if mc_seed_input.strip() else None
+
 # Initialize parameters from presets or prior assessment
 st.session_state.setdefault("stickiness_days", preset.get("stability_days", 7))
 st.session_state.setdefault("name_cap", preset.get("mom_cap", 0.25))
@@ -219,7 +228,8 @@ if go:
                 mc_returns = base_cum.pct_change().dropna()
                 st.session_state.mc_results = backend.run_monte_carlo_projections(
                     mc_returns,
-                    confidence_levels=[5, 25, 50, 75, 95]
+                    confidence_levels=[5, 25, 50, 75, 95],
+                    seed=st.session_state.get("mc_seed")
                 )
             else:
                 st.session_state.mc_results = None
