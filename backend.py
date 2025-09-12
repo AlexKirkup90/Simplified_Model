@@ -2071,6 +2071,50 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
         return "Neutral", {}
 
 
+def select_optimal_universe(as_of: date | None = None) -> str:
+    """Automatically choose the trading universe based on recent index momentum.
+
+    Uses 3-month returns of ``SPY`` and ``QQQ`` as proxies for S&P 500 and
+    NASDAQ 100 respectively.  When NASDAQ outperforms the S&P by more than 2%,
+    the function selects ``"NASDAQ100+"``.  When the S&P is positive but not
+    meaningfully lagging, ``"S&P500 (All)"`` is chosen.  Otherwise the more
+    defensive ``"Hybrid Top150"`` subset is returned.
+    """
+
+    asof_ts = pd.Timestamp(as_of or date.today())
+    start = (asof_ts - relativedelta(months=3)).strftime("%Y-%m-%d")
+    end = asof_ts.strftime("%Y-%m-%d")
+
+    # Proxy ETFs for each universe
+    etfs = {"NASDAQ100+": "QQQ", "S&P500 (All)": "SPY", "Hybrid Top150": "SPY"}
+    try:
+        data = yf.download(list(set(etfs.values())), start=start, end=end,
+                            auto_adjust=True, progress=False)["Close"]
+        if isinstance(data, pd.Series):
+            data = data.to_frame()
+    except Exception:
+        return "Hybrid Top150"
+
+    returns: Dict[str, float] = {}
+    for label, ticker in etfs.items():
+        if ticker in data.columns:
+            try:
+                ret = float(data[ticker].iloc[-1] / data[ticker].iloc[0] - 1)
+                returns[label] = ret
+            except Exception:
+                continue
+
+    qqq_ret = returns.get("NASDAQ100+", -np.inf)
+    spy_ret = returns.get("S&P500 (All)", -np.inf)
+
+    if qqq_ret > 0 and (qqq_ret - spy_ret) > 0.02:
+        return "NASDAQ100+"
+    elif spy_ret > 0:
+        return "S&P500 (All)"
+    else:
+        return "Hybrid Top150"
+
+
 def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     """Assess market conditions and derive configuration settings.
 
@@ -2106,6 +2150,10 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     # Add regime label (uses existing helper which internally recomputes metrics)
     regime_label, _ = get_market_regime()
     metrics["regime"] = regime_label
+
+    # Automatically determine optimal universe for the upcoming period
+    chosen_universe = select_optimal_universe(asof_ts)
+    st.session_state["universe"] = chosen_universe
 
     # Derive settings based on key thresholds
     breadth = metrics.get("breadth_pos_6m", 0.5)
@@ -2163,7 +2211,7 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return {"metrics": metrics, "settings": settings}
+    return {"metrics": metrics, "settings": settings, "universe": chosen_universe}
 
 # =========================
 # Assessment Logging
