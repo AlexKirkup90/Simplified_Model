@@ -224,7 +224,9 @@ def generate_td1_targets_asof(
         return pd.Series(dtype=float)
 
     # Your existing (fixed) builder runs full selection + caps
-    weights = _build_isa_weights_fixed(hist, preset, sectors_map)  # returns weights summing to equity exposure
+    weights = _build_isa_weights_fixed(hist, preset, sectors_map)
+    if isinstance(weights, pd.DataFrame) and "Weight" in weights.columns:
+        weights = weights["Weight"].astype(float)
 
     regime_metrics: Dict[str, float] = {}
     # If TD1 applies regime exposure (not the drawdown scaler on *returns*, but the weight scaler), apply it here too
@@ -1530,8 +1532,20 @@ def _build_isa_weights_fixed(
     daily_close: pd.DataFrame,
     preset: Dict,
     sectors_map: Dict[str, str]
-) -> pd.Series:
-    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio."""
+) -> pd.DataFrame:
+    """Apply position sizing + hierarchical caps and retain intermediate metrics.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame indexed by ticker with the following columns:
+        - ``Weight``: final post-cap weight
+        - ``Momentum``: composite momentum score used for ranking
+        - ``MeanReversion``: short-term return used for the dip-buy sleeve
+        - ``RiskParity``: risk-parity adjustment applied prior to caps
+        - ``Sector``: sector or group label after enhancement
+        - ``CapNote``: note indicating if a cap constrained the weight
+    """
     debug_caps = bool(st.session_state.get("debug_caps", False))
 
     if debug_caps:
@@ -1547,6 +1561,7 @@ def _build_isa_weights_fixed(
     pos_idx = momz[momz > 0].index
     comp_vec = comp_vec.reindex(pos_idx).dropna()
     top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
+    mom_scores = top_m.copy()
 
     # Stickiness filter (keep names that have persisted in the top set)
     stable_names = set(
@@ -1571,13 +1586,14 @@ def _build_isa_weights_fixed(
     pool    = [t for t, ok in quality.items() if ok]
     dips    = st_ret.reindex(pool).dropna().nsmallest(preset["mr_topn"])
     mr_raw  = (pd.Series(1 / len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
+    mr_scores = dips.copy()
 
     # --- Combine Components BEFORE Applying Caps ---
     combined_raw = mom_raw.add(mr_raw, fill_value=0.0)
     if combined_raw.empty or combined_raw.sum() <= 0:
         if debug_caps:
             st.warning("⚠️ combined_raw is empty; returning early.")
-        return combined_raw
+        return pd.DataFrame()
 
     if debug_caps:
         st.info(f"🔧 Pre-caps portfolio: {len(combined_raw)} positions totaling {combined_raw.sum():.1%}")
@@ -1586,6 +1602,7 @@ def _build_isa_weights_fixed(
     rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
     combined_raw = combined_raw.mul(rp_weights, fill_value=0.0)
     combined_raw = combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
+    rp_adj = rp_weights.copy()
 
     # Enhanced sector map (uses your base sectors_map) + hierarchical caps for Software sub-buckets
     enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index), base_map=sectors_map)
@@ -1611,7 +1628,7 @@ def _build_isa_weights_fixed(
     if final_weights.empty or final_weights.sum() <= 0:
         if debug_caps:
             st.warning("⚠️ enforce_caps_iteratively returned empty weights; returning empty.")
-        return final_weights
+        return pd.DataFrame()
 
     # Optional: sanity check (logs only)
     if debug_caps:
@@ -1623,8 +1640,40 @@ def _build_isa_weights_fixed(
         else:
             st.success("✅ Post-enforcement: no constraint violations detected.")
 
-    # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
-    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+    # Build detail dataframe
+    final_weights = final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+
+    # Notes on cap enforcement
+    cap_notes: Dict[str, str] = {}
+    post_sector = final_weights.groupby(pd.Series(enhanced_sectors)).sum()
+    for t in final_weights.index:
+        note = ""
+        pre = float(combined_raw.get(t, 0.0))
+        post = float(final_weights.get(t, 0.0))
+        if post < pre - 1e-9:
+            if pre > preset["mom_cap"] + 1e-9:
+                note = "name cap"
+            else:
+                sec = enhanced_sectors.get(t, "Unknown")
+                gcap = group_caps.get(sec) if group_caps else None
+                if gcap is not None and post_sector.get(sec, 0) >= gcap - 1e-9:
+                    note = "group cap"
+                elif post_sector.get(sec, 0) >= preset.get("sector_cap", 0.30) - 1e-9:
+                    note = "sector cap"
+                else:
+                    note = "cap adjustment"
+        cap_notes[t] = note
+
+    details = pd.DataFrame({
+        "Weight": final_weights,
+        "Momentum": mom_scores.reindex(final_weights.index),
+        "MeanReversion": mr_scores.reindex(final_weights.index),
+        "RiskParity": rp_adj.reindex(final_weights.index),
+        "Sector": pd.Series({t: enhanced_sectors.get(t, "Unknown") for t in final_weights.index}),
+        "CapNote": pd.Series({t: cap_notes.get(t, "") for t in final_weights.index})
+    })
+
+    return details
 
 def check_constraint_violations(weights: pd.Series, sectors_map: Dict[str, str], 
                               name_cap: float, sector_cap: float) -> List[str]:
@@ -1663,7 +1712,7 @@ def generate_live_portfolio_isa_monthly(
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
-    Now includes regime awareness, volatility adjustments, and an optional `as_of` date.
+    Now returns a detail dataframe containing intermediate metrics for each ticker.
     """
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
@@ -1728,7 +1777,12 @@ def generate_live_portfolio_isa_monthly(
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
 
-    new_w = _build_isa_weights_fixed(close, params, sectors_map)
+    details = _build_isa_weights_fixed(close, params, sectors_map)
+    if isinstance(details, pd.DataFrame) and "Weight" in details.columns:
+        new_w = details["Weight"].astype(float)
+    else:
+        new_w = details.astype(float) if isinstance(details, pd.Series) else pd.Series(dtype=float)
+        details = pd.DataFrame({"Weight": new_w})
 
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
@@ -1743,12 +1797,12 @@ def generate_live_portfolio_isa_monthly(
             if health >= params["trigger"]:
                 decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
                 disp, raw = _format_display(prev_w)
-                return disp, raw, decision
+                return disp, prev_portfolio, decision
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
-    disp, raw = _format_display(new_w)
-    return disp, raw, decision
+    disp, _ = _format_display(new_w)
+    return disp, details, decision
 
 def run_backtest_isa_dynamic(
     roundtrip_bps: float = 0.0,
