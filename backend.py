@@ -1625,12 +1625,13 @@ def generate_live_portfolio_isa_monthly(
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
     sector_cap      = st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
+    mom_cap         = st.session_state.get("name_cap", preset.get("mom_cap", 0.25))
 
     # build params from preset, then override with UI/session values
     params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
     params["stability_days"] = int(stickiness_days)
     params["sector_cap"]     = float(sector_cap)
-    params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
+    params["mom_cap"]        = float(mom_cap)
     
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
@@ -1679,12 +1680,7 @@ def generate_live_portfolio_isa_monthly(
     is_monthly = is_rebalance_today(today, close.index)
     decision = "Preview only – portfolio not saved" if not is_monthly else ""
 
-    # Build candidate weights (enhanced) – keep UI overrides!
-    params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
-    params["stability_days"] = int(stickiness_days)
-    params["sector_cap"]     = float(sector_cap)
-    params["mom_cap"]        = float(st.session_state.get("name_cap", params.get("mom_cap", 0.25)))
-
+    # Build candidate weights (enhanced) – overrides applied above
     new_w = _build_isa_weights_fixed(close, params, sectors_map)
 
     # Trigger vs previous portfolio (health of current)
