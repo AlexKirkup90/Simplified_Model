@@ -1064,6 +1064,50 @@ def save_portfolio_to_gist(portfolio_df: pd.DataFrame) -> None:
         st.sidebar.error(f"Gist save failed: {e}")
 
 def load_previous_portfolio() -> Optional[pd.DataFrame]:
+    def _process(df: pd.DataFrame, source: str) -> Optional[pd.DataFrame]:
+        """Normalize weights and check constraints. Return None if invalid."""
+        if "Weight" not in df.columns:
+            st.sidebar.warning(f"Discarded {source} portfolio: missing 'Weight' column")
+            return None
+
+        try:
+            weights = pd.to_numeric(df["Weight"], errors="coerce")
+        except Exception:
+            st.sidebar.warning(f"Discarded {source} portfolio: non-numeric weights")
+            return None
+
+        if weights.isna().any():
+            st.sidebar.warning(f"Discarded {source} portfolio: non-numeric weights")
+            return None
+
+        total = weights.sum()
+        if not np.isfinite(total) or total <= 0:
+            st.sidebar.warning(f"Discarded {source} portfolio: normalization failed")
+            return None
+
+        weights = weights / total
+        df = df.copy()
+        df["Weight"] = weights
+
+        # Constraint check if sector map available
+        try:
+            sectors_map = get_enhanced_sector_map(list(df.index))
+            if sectors_map:
+                preset = STRATEGY_PRESETS.get("ISA Dynamic (0.75)", {})
+                name_cap = float(preset.get("mom_cap", 0.25))
+                sector_cap = float(preset.get("sector_cap", 0.30))
+                violations = check_constraint_violations(weights, sectors_map, name_cap, sector_cap)
+                if violations:
+                    st.sidebar.warning(
+                        f"Discarded {source} portfolio: constraint violations {violations}"
+                    )
+                    return None
+        except Exception:
+            # If anything goes wrong, just proceed without constraint check
+            pass
+
+        return df
+
     # Gist first
     if GIST_API_URL and GITHUB_TOKEN:
         try:
@@ -1072,17 +1116,23 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
             files = resp.json().get("files", {})
             content = files.get(GIST_PORTF_FILE, {}).get("content", "")
             if content and content != "{}":
-                return pd.read_json(io.StringIO(content), orient="index")
+                df = pd.read_json(io.StringIO(content), orient="index")
+                processed = _process(df, "Gist")
+                if processed is not None:
+                    return processed
         except Exception:
             pass
+
     # Local fallback
     if os.path.exists(LOCAL_PORTF_FILE):
         try:
             df = pd.read_csv(LOCAL_PORTF_FILE)
             if "Weight" in df.columns and "Ticker" in df.columns:
-                return df.set_index("Ticker")
+                df = df.set_index("Ticker")
+                return _process(df, "local")
         except Exception:
             return None
+
     return None
 
 def save_current_portfolio(df: pd.DataFrame) -> None:
