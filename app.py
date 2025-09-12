@@ -853,5 +853,3 @@ with tab6:
             st.info("🔬 **Enhanced Features Active:** Strategy using volatility-adjusted caps and regime awareness.")
         else:
             st.info("📊 **Standard Mode:** Consider enabling enhanced features for improved risk management.")
-
-print("\n✅ Enhanced app.py created with Strategy Health monitoring!")
