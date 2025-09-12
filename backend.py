@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
+from io import StringIO
 import streamlit as st
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
@@ -822,16 +823,23 @@ def to_yahoo_symbol(sym: str) -> str:
 def fetch_sp500_constituents() -> List[str]:
     """Get current S&P 500 tickers with fallback to static list."""
     try:
-        # Try with headers to avoid 403 blocking
-        import requests
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url, attrs={'class': 'wikitable sortable'})
-        df = tables[0]
-        tickers = df["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
-        return sorted(list(set(tickers)))
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        tables = pd.read_html(StringIO(resp.text))
+        df = next(
+            t for t in tables
+            if any(col.lower() in {"symbol", "ticker"} for col in map(str, t.columns))
+        )
+        col = "Symbol" if "Symbol" in df.columns else "Ticker"
+        tickers = (
+            df[col]
+            .astype(str)
+            .str.replace(".", "-", regex=False)
+            .str.upper()
+            .str.strip()
+            .tolist()
+        )
+        return sorted(set(tickers))
     except Exception as e:
         st.warning(f"Failed to fetch S&P 500 list: {e}. Using fallback list.")
         # Static fallback list of major S&P 500 stocks (updated Aug 2025)
@@ -882,12 +890,19 @@ def get_sector_map(tickers: List[str]) -> Dict[str, str]:
 def get_nasdaq_100_plus_tickers() -> List[str]:
     """Get NASDAQ 100+ tickers with fallback list"""
     try:
-        # Try with headers to avoid blocking
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        tables = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100', attrs={'class': 'wikitable'})
-        nasdaq_100 = tables[4]['Ticker'].astype(str).str.upper().tolist()
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/Nasdaq-100",
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        tables = pd.read_html(StringIO(resp.text))
+        df = next(
+            t for t in tables
+            if any(col.lower() in {"ticker", "symbol"} for col in map(str, t.columns))
+        )
+        col = "Ticker" if "Ticker" in df.columns else "Symbol"
+        nasdaq_100 = (
+            df[col].astype(str).str.upper().str.strip().tolist()
+        )
         extras = ['TSLA', 'SHOP', 'SNOW', 'PLTR', 'ETSY', 'RIVN', 'COIN']
         return sorted(set(nasdaq_100 + extras))
     except Exception:
