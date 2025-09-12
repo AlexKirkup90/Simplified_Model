@@ -7,6 +7,7 @@ import yfinance as yf
 import requests
 from io import StringIO
 import streamlit as st
+import logging
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -1260,9 +1261,9 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
                         f"Discarded {source} portfolio: constraint violations {violations}"
                     )
                     return None
-        except Exception:
+        except Exception as e:
             # If anything goes wrong, just proceed without constraint check
-            pass
+            logging.warning("P01 constraint check failed", exc_info=True)
 
         return df
 
@@ -1278,8 +1279,8 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
                 processed = _process(df, "Gist")
                 if processed is not None:
                     return processed
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("P02 failed to fetch portfolio from gist", exc_info=True)
 
     # Local fallback
     if os.path.exists(LOCAL_PORTF_FILE):
@@ -1632,8 +1633,8 @@ def run_momentum_composite_param(
                 regime_metrics  = compute_regime_metrics(hist)
                 regime_exposure = get_regime_adjusted_exposure(regime_metrics)
                 w = w * regime_exposure
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning("R01 regime exposure scaling failed in simulation", exc_info=True)
 
         if w is None or len(w) == 0 or np.isclose(w.sum(), 0.0) or m not in fwd.index:
             rets.loc[m] = 0.0
@@ -1693,8 +1694,8 @@ def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
             if leverage is not None and leverage > 10:
                 # many providers return percentage values
                 leverage = leverage / 100.0
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("E01 fundamental data fetch failed", exc_info=True)
         rows.append({"Ticker": t, "profitability": profitability, "leverage": leverage})
     return pd.DataFrame(rows).set_index("Ticker")
 
@@ -1941,8 +1942,8 @@ def generate_live_portfolio_isa_monthly(
             regime_metrics = compute_regime_metrics(close)
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
             new_w = new_w * float(regime_exposure)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
     # Validate and re-enforce caps if scaling introduced violations
     if len(new_w) > 0:
@@ -2550,8 +2551,8 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
         log = pd.concat([log, new_row], ignore_index=True)
         log = log.drop_duplicates(subset=["date"], keep="last")
         save_assess_log(log)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning("P03 failed to save assessment log", exc_info=True)
 
     return {"metrics": metrics, "settings": settings, "universe": chosen_universe}
 
@@ -2569,8 +2570,8 @@ def load_assess_log() -> pd.DataFrame:
                 df = pd.read_csv(io.StringIO(content))
                 df["date"] = pd.to_datetime(df["date"])
                 return df
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("P04 failed to load assessment log", exc_info=True)
     return pd.DataFrame(columns=["date", "metrics", "settings", "portfolio_ret", "benchmark_ret"])
 
 def save_assess_log(df: pd.DataFrame) -> None:
@@ -2800,8 +2801,8 @@ def load_live_perf() -> pd.DataFrame:
             df = pd.read_csv(io.StringIO(content))
             df["date"] = pd.to_datetime(df["date"])
             return df
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("P05 failed to load live performance", exc_info=True)
     return pd.DataFrame(columns=["date","strat_ret","qqq_ret","note"])
 
 def save_live_perf(df: pd.DataFrame) -> None:
