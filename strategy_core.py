@@ -151,7 +151,7 @@ def apply_tc(returns: pd.Series, turnover: pd.Series, tc_bps: float = 10.0) -> p
 # ------------------------------
 
 def _resample_month_end(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.resample('ME').last()
+    return prices.resample("M").last()
 
 
 def momentum_signals(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Series:
@@ -336,8 +336,8 @@ def run_backtest_mean_reversion(daily_prices: pd.DataFrame, lookback_days: int =
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
 
-    short = daily_prices.pct_change(lookback_days).resample('ME').last()
-    trend = daily_prices.rolling(long_ma_days).mean().resample('ME').last()
+    short = daily_prices.pct_change(lookback_days).resample("M").last()
+    trend = daily_prices.rolling(long_ma_days).mean().resample("M").last()
 
     rets = pd.Series(index=mp.index, dtype=float)
     tno = pd.Series(index=mp.index, dtype=float)
