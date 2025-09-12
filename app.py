@@ -84,6 +84,13 @@ st.session_state["use_enhanced_features"] = use_enhanced_features
 roundtrip_bps = st.sidebar.slider("Round-trip cost (bps)", 0, 100, backend.ROUNDTRIP_BPS_DEFAULT, 5)
 min_dollar_volume = st.sidebar.number_input("Min 60d median $ volume (optional)", min_value=0, value=0, step=100000)
 
+# Average trade size for turnover-based trade count
+avg_trade_pct = st.sidebar.slider(
+    "Avg single-leg trade size (%)", 0.5, 5.0, 2.0, 0.5,
+    help="Used to estimate trades/year from turnover"
+)
+AVG_TRADE_SIZE = avg_trade_pct / 100.0
+
 # Fundamental quality thresholds
 min_profitability = st.sidebar.slider(
     "Min profitability (ROA)", -0.5, 0.5, 0.0, 0.01
@@ -385,8 +392,6 @@ with tab3:
     else:
         st.markdown("#### Key Performance (monthly series inferred)")
 
-        AVG_TRADE_SIZE = 0.02  # estimate trades/yr from turnover
-
         # --- KPI table ---
         rows = []
         rows.append(
@@ -469,7 +474,9 @@ with tab3:
         plt.tight_layout()
         st.pyplot(fig)
 
-        st.caption("Trades/yr estimated from turnover assuming ~2% average single-leg trade (adjust in code with AVG_TRADE_SIZE).")
+        st.caption(
+            f"Trades/yr estimated from turnover assuming ~{avg_trade_pct:.1f}% average single-leg trade (adjust in sidebar)."
+        )
 
         # ========= Monthly Net Returns =========
         st.subheader("📅 Monthly Net Returns (%)")
