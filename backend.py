@@ -1185,38 +1185,46 @@ def is_rebalance_today(today: date, price_index: Optional[pd.DatetimeIndex]) -> 
 # =========================
 # Math utils & KPIs (Enhanced)
 # =========================
-def cap_weights(weights: pd.Series, cap: float = 0.25, 
-                vol_adjusted_caps: Optional[Dict[str, float]] = None) -> pd.Series:
+def cap_weights(weights: pd.Series, cap: float = 0.25,
+                vol_adjusted_caps: Optional[Dict[str, float]] = None,
+                max_iter: int = 100, tol: float = 1e-12) -> pd.Series:
     """Enhanced cap_weights with optional volatility adjustments"""
     if weights.empty:
         return weights
     w = weights.copy().astype(float)
-    
+    if (w < 0).any():
+        raise ValueError("Weights must be non-negative.")
+    if w.sum() == 0:
+        return w
+    w = w / w.sum()
+
     # Use volatility-adjusted caps if provided
     caps_to_use = vol_adjusted_caps if vol_adjusted_caps is not None else {ticker: cap for ticker in w.index}
-    
-    for _ in range(100):
+
+    for _ in range(max_iter):
         over_cap = pd.Series(False, index=w.index)
         for ticker in w.index:
             ticker_cap = caps_to_use.get(ticker, cap)
             if w[ticker] > ticker_cap:
                 over_cap[ticker] = True
-        
+
         if not over_cap.any():
             break
-            
+
         excess = 0.0
         for ticker in w.index:
             if over_cap[ticker]:
                 ticker_cap = caps_to_use.get(ticker, cap)
                 excess += w[ticker] - ticker_cap
                 w[ticker] = ticker_cap
-        
+
         under = ~over_cap
         if w[under].sum() > 0:
             w[under] += (w[under] / w[under].sum()) * excess
         else:
             w += excess / len(w)
+    if abs(w.sum() - 1.0) > tol:
+        w = w / w.sum()
     return w
 
 def equity_curve(returns: pd.Series) -> pd.Series:
