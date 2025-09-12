@@ -884,10 +884,14 @@ def _load_sector_overrides() -> Dict[str, str]:
     if _SECTOR_OVERRIDE_PATH.exists():
         try:
             df = pd.read_csv(_SECTOR_OVERRIDE_PATH)
-            return {
-                str(row["Ticker"]).upper(): str(row["Sector"])
-                for _, row in df.iterrows()
-            }
+            df["Ticker"] = (
+                df["Ticker"]
+                .astype(str)
+                .str.upper()
+                .str.replace(".", "-", regex=False)
+                .str.strip()
+            )
+            return {row["Ticker"]: str(row["Sector"]) for _, row in df.iterrows()}
         except Exception:
             return {}
     return {}
