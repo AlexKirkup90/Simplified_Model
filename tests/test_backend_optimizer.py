@@ -34,25 +34,18 @@ def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
 
     captured = {}
 
-    def fake_momentum(daily, sectors_map, top_n, name_cap, sector_cap, stickiness_days, use_enhanced_features):
-        captured["top_n"] = top_n
-        captured["name_cap"] = name_cap
-        captured["sector_cap"] = sector_cap
-        series = pd.Series(0.0, index=pd.date_range("2020-01-31", "2020-03-31", freq="M"))
-        return series, series
+    import strategy_core
 
-    def fake_mr(daily, lookback_period_mr, top_n_mr, long_ma_days):
-        series = pd.Series(0.0, index=pd.date_range("2020-01-31", "2020-03-31", freq="M"))
-        return series, series
+    def fake_run_hybrid_backtest(daily_prices, cfg):
+        captured["cfg"] = cfg
+        idx = pd.date_range("2020-01-31", "2020-03-31", freq="M")
+        return {
+            "hybrid_rets": pd.Series(0.0, index=idx),
+            "mom_turnover": pd.Series(0.0, index=idx),
+            "mr_turnover": pd.Series(0.0, index=idx),
+        }
 
-    def fake_combine(mom_rets, mr_rets, mom_tno, mr_tno, mom_w, mr_w):
-        captured["mom_weight"] = mom_w
-        captured["mr_weight"] = mr_w
-        return pd.Series(0.0, index=mom_rets.index), pd.Series(0.0, index=mom_rets.index)
-
-    monkeypatch.setattr(backend, "run_momentum_composite_param", fake_momentum)
-    monkeypatch.setattr(backend, "run_backtest_mean_reversion", fake_mr)
-    monkeypatch.setattr(backend, "combine_hybrid", fake_combine)
+    monkeypatch.setattr(strategy_core, "run_hybrid_backtest", fake_run_hybrid_backtest)
 
     class DummyCfg:
         momentum_top_n = 2
@@ -67,8 +60,9 @@ def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
 
     backend.run_backtest_isa_dynamic()
 
-    assert captured["top_n"] == 2
-    assert captured["name_cap"] == 0.4
-    assert captured["sector_cap"] == 0.33
-    assert captured["mom_weight"] == 0.6
-    assert captured["mr_weight"] == 0.4
+    cfg = captured["cfg"]
+    assert cfg.momentum_top_n == 2
+    assert cfg.momentum_cap == 0.4
+    assert cfg.mr_top_n == 3
+    assert cfg.mom_weight == 0.6
+    assert cfg.mr_weight == 0.4

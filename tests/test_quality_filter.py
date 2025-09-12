@@ -48,18 +48,18 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
 
     captured = {}
 
-    def fake_momentum(daily, sectors_map, top_n, name_cap, sector_cap, stickiness_days, use_enhanced_features):
-        captured["mom_cols"] = list(daily.columns)
-        series = pd.Series(0.01, index=pd.date_range("2020-01-31", "2020-03-31", freq="M"))
-        return series, series * 0
+    import strategy_core
 
-    def fake_mr(daily, lookback_period_mr, top_n_mr, long_ma_days):
-        captured["mr_cols"] = list(daily.columns)
-        series = pd.Series(0.0, index=pd.date_range("2020-01-31", "2020-03-31", freq="M"))
-        return series, series * 0
+    def fake_run_hybrid_backtest(daily_prices, cfg):
+        captured["cols"] = list(daily_prices.columns)
+        idx = pd.date_range("2020-01-31", "2020-03-31", freq="M")
+        return {
+            "hybrid_rets": pd.Series(0.0, index=idx),
+            "mom_turnover": pd.Series(0.0, index=idx),
+            "mr_turnover": pd.Series(0.0, index=idx),
+        }
 
-    monkeypatch.setattr(backend, "run_momentum_composite_param", fake_momentum)
-    monkeypatch.setattr(backend, "run_backtest_mean_reversion", fake_mr)
+    monkeypatch.setattr(strategy_core, "run_hybrid_backtest", fake_run_hybrid_backtest)
 
     kwargs = dict(
         min_dollar_volume=0,
@@ -80,5 +80,4 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
         st.session_state["max_leverage"] = 1.0
     backend.run_backtest_isa_dynamic(**kwargs)
 
-    assert captured.get("mom_cols") == ["AAA"]
-    assert captured.get("mr_cols") == ["AAA"]
+    assert captured.get("cols") == ["AAA"]
