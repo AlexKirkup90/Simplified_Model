@@ -25,6 +25,59 @@ from typing import Iterable, List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import time
+
+
+def download_in_batches(
+    tickers: Iterable[str],
+    start: str,
+    end: Optional[str] = None,
+    batch_size: int = 200,
+    retries: int = 2,
+    **kwargs,
+) -> pd.DataFrame:
+    """Download ticker data in manageable batches with simple retry/backoff.
+
+    Parameters
+    ----------
+    tickers : iterable of str
+        Symbols to fetch.
+    start, end : str
+        Date range passed to ``yf.download``.
+    batch_size : int, default 200
+        Number of tickers per request.
+    retries : int, default 2
+        Number of retry attempts on failure.
+    kwargs : dict
+        Additional ``yf.download`` arguments.
+    """
+
+    tickers = list(tickers)
+    if not tickers:
+        return pd.DataFrame()
+
+    kwargs.setdefault("auto_adjust", True)
+    kwargs.setdefault("progress", False)
+
+    frames: List[pd.DataFrame] = []
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i : i + batch_size]
+        for attempt in range(retries + 1):
+            try:
+                df = yf.download(batch, start=start, end=end, **kwargs)
+                if isinstance(df, pd.Series):
+                    df = df.to_frame()
+                if not isinstance(df.columns, pd.MultiIndex):
+                    df.columns = pd.MultiIndex.from_product([batch, df.columns])
+                frames.append(df)
+                break
+            except Exception:
+                if attempt < retries:
+                    time.sleep(1 * (attempt + 1))
+                else:
+                    raise
+
+    return pd.concat(frames, axis=1) if frames else pd.DataFrame()
 
 # ------------------------------
 # 1) Universe & Data
@@ -74,19 +127,16 @@ def fetch_market_data(tickers: Iterable[str],
     """
     if not tickers:
         return pd.DataFrame()
-    data = yf.download(list(tickers), start=start_date, end=end_date, auto_adjust=True, progress=False)
-    if isinstance(data, pd.DataFrame) and price_field in data:
-        df = data[price_field]
-    else:
-        # When yfinance returns a single column (single ticker), coerce to 2D
-        if isinstance(data, pd.Series):
-            df = data.to_frame(name=price_field)
-        else:
-            # Fallback: try to select the last level assuming wide columns
-            try:
-                df = data.xs(price_field, axis=1, level=0)
-            except Exception:
-                return pd.DataFrame()
+
+    data = download_in_batches(list(tickers), start=start_date, end=end_date)
+    if data.empty:
+        return pd.DataFrame()
+
+    try:
+        df = data.xs(price_field, axis=1, level=1)
+    except Exception:
+        return pd.DataFrame()
+
     return df.dropna(how="all", axis=1)
 
 

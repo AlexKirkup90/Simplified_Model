@@ -10,7 +10,7 @@ from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 import optimizer
 import strategy_core
-from strategy_core import HybridConfig
+from strategy_core import HybridConfig, download_in_batches
 
 warnings.filterwarnings("ignore")
 
@@ -977,10 +977,13 @@ def _prepare_universe_for_backtest(
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
-        data = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)["Close"]
+        raw = download_in_batches(tickers, fetch_start, end_date)
+        if raw.empty:
+            return pd.DataFrame()
+        data = raw.xs("Close", axis=1, level=1)
         if isinstance(data, pd.Series):
             data = data.to_frame()
-        
+
         result = data.dropna(axis=1, how="all")
         
         # Enhanced data cleaning pipeline
@@ -1004,22 +1007,13 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
-        df = yf.download(tickers, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[["Close","Volume"]]
-        if isinstance(df, pd.Series):
-            df = df.to_frame()
-        if isinstance(df.columns, pd.MultiIndex):
-            close = df["Close"]
-            vol   = df["Volume"]
-        else:
-            if "Close" in df.columns and "Volume" in df.columns:
-                close = df[["Close"]].copy()
-                vol   = df[["Volume"]].copy()
-                if len(tickers) == 1:
-                    close.columns = [tickers[0]]
-                    vol.columns   = [tickers[0]]
-            else:
-                return pd.DataFrame(), pd.DataFrame()
-        
+        raw = download_in_batches(tickers, fetch_start, end_date)
+        if raw.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        close = raw.xs("Close", axis=1, level=1)
+        vol   = raw.xs("Volume", axis=1, level=1)
+
         close = close.dropna(axis=1, how="all")
         vol   = vol.reindex_like(close).fillna(0)
         
