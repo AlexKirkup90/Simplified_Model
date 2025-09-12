@@ -106,11 +106,13 @@ def fetch_market_data(tickers: Iterable[str],
 # 2) Portfolio Utilities
 # ------------------------------
 
-def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100) -> pd.Series:
+def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
+                tol: float = 1e-12) -> pd.Series:
     """Iterative waterfall cap. Preserves proportionality below cap.
 
     If all names are at cap and excess remains, distributes evenly to avoid
-    infinite loops.
+    infinite loops. After capping, weights are renormalized if their sum
+    deviates from 1 by more than ``tol``.
     """
     w = weights.copy().astype(float)
     if (w < 0).any():
@@ -121,7 +123,7 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100) -> p
     for _ in range(max_iter):
         over = w > cap
         if not over.any():
-            return w
+            break
         excess = (w[over] - cap).sum()
         w[over] = cap
         under = ~over
@@ -130,6 +132,8 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100) -> p
         else:
             # All names at cap; spread excess uniformly
             w += excess / len(w)
+    if abs(w.sum() - 1.0) > tol:
+        w = w / w.sum()
     return w
 
 
