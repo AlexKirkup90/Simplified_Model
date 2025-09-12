@@ -77,10 +77,14 @@ if assess:
         assessment = backend.assess_market_conditions()
     st.write("### Market Metrics")
     st.json(assessment["metrics"])
+    st.write("### Recommended Universe")
+    st.write(assessment.get("universe", st.session_state.get("universe")))
     st.write("### Recommended Settings")
     st.json(assessment["settings"])
     for k, v in assessment["settings"].items():
         st.session_state[k] = v
+    # ensure selected universe persists
+    st.session_state["universe"] = assessment.get("universe", st.session_state.get("universe"))
 
     # -------------------------
     # Assessment log & accuracy

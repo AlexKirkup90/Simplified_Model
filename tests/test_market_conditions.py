@@ -29,6 +29,7 @@ def _base_patch(monkeypatch, metrics, regime_label="Risk-On"):
     monkeypatch.setattr(backend, "fetch_market_data", fake_fetch_market_data)
     monkeypatch.setattr(backend, "compute_regime_metrics", fake_compute_regime_metrics)
     monkeypatch.setattr(backend, "get_market_regime", fake_get_market_regime)
+    monkeypatch.setattr(backend, "select_optimal_universe", lambda as_of=None: "S&P500 (All)")
 
 
 def test_assess_market_conditions_risk_on(monkeypatch):
@@ -42,6 +43,7 @@ def test_assess_market_conditions_risk_on(monkeypatch):
     _base_patch(monkeypatch, metrics, "Risk-On")
     result = backend.assess_market_conditions(date(2024, 1, 5))
     settings = result["settings"]
+    assert result["universe"] == "S&P500 (All)"
     assert result["metrics"]["regime"] == "Risk-On"
     assert settings["sector_cap"] == pytest.approx(0.35)
     assert settings["name_cap"] == pytest.approx(0.30)
@@ -59,6 +61,7 @@ def test_assess_market_conditions_risk_off(monkeypatch):
     _base_patch(monkeypatch, metrics, "Risk-Off")
     result = backend.assess_market_conditions(date(2024, 1, 5))
     settings = result["settings"]
+    assert result["universe"] == "S&P500 (All)"
     assert result["metrics"]["regime"] == "Risk-Off"
     assert settings["sector_cap"] == pytest.approx(0.20)
     assert settings["name_cap"] == pytest.approx(0.20)
