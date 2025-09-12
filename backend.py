@@ -2101,15 +2101,26 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
 # =========================
 # Regime & Live paper tracking (Enhanced)
 # =========================
+@st.cache_data(ttl=43200)
 def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
-    data = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    """Fetch a benchmark price series with caching.
+
+    Streamlit will cache both successful results and raised exceptions by
+    default. If the download fails, clear the cache entry so the error is not
+    persisted across reruns.
+    """
     try:
-        px = data["Close"]
-    except Exception:
-        # Fallback: take first column if "Close" not present (e.g., FRED series)
-        px = data.iloc[:, 0] if hasattr(data, "iloc") else data
-    px = _safe_series(px)
-    return pd.Series(px).dropna()
+        data = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+        try:
+            px = data["Close"]
+        except Exception:
+            # Fallback: take first column if "Close" not present (e.g., FRED series)
+            px = data.iloc[:, 0] if hasattr(data, "iloc") else data
+        px = _safe_series(px)
+        return pd.Series(px).dropna()
+    except Exception as e:
+        get_benchmark_series.clear()
+        raise e
 
 def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
     """Enhanced regime metrics calculation"""
