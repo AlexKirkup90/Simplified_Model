@@ -1235,6 +1235,7 @@ def kpi_row(name: str,
     KPI row with robust turnover:
       - Turnover/yr = mean of calendar-year sums of monthly turnover
       - Trades/yr   ≈ Turnover/yr ÷ avg_trade_size (default 2% per single-leg trade)
+      - Turnover uses 0.5 × L1 weight change per rebalance
     """
     r = pd.Series(rets).dropna().astype(float)
     if r.empty:

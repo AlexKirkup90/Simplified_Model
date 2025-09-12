@@ -380,7 +380,7 @@ with tab3:
 
         kdf = pd.DataFrame(
             rows,
-            columns=["Model", "Freq", "CAGR", "Sharpe", "Sortino", "Calmar", "MaxDD", "Trades/yr", "Turnover/yr", "Equity x"]
+            columns=["Model", "Freq", "CAGR", "Sharpe", "Sortino", "Calmar", "MaxDD", "Trades/yr", "Turnover/yr (0.5×L1)", "Equity x"]
         )
         st.dataframe(kdf, use_container_width=True)
 
@@ -427,7 +427,7 @@ with tab3:
         # Turnover analysis
         if hybrid_tno is not None and not hybrid_tno.empty:
             axes[1,1].plot(hybrid_tno.index, hybrid_tno.values, color='brown', alpha=0.7)
-            axes[1,1].set_ylabel("Monthly Turnover")
+            axes[1,1].set_ylabel("Monthly Turnover (0.5×L1)")
             axes[1,1].set_title("Trading Activity")
             axes[1,1].grid(True, alpha=0.3)
         
@@ -435,7 +435,7 @@ with tab3:
         st.pyplot(fig)
 
         st.caption(
-            f"Trades/yr estimated from turnover assuming ~{AVG_TRADE_SIZE*100:.1f}% average single-leg trade."
+            f"Trades/yr estimated from turnover (0.5×L1) assuming ~{AVG_TRADE_SIZE*100:.1f}% average single-leg trade."
         )
 
         # ========= Monthly Net Returns =========
