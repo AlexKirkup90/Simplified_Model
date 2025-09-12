@@ -1,5 +1,5 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
-import os, io, warnings, json
+import os, io, warnings, json, hashlib, time
 from typing import Optional, Tuple, Dict, List, Any
 import numpy as np
 import pandas as pd
@@ -18,13 +18,63 @@ from strategy_core import HybridConfig
 
 warnings.filterwarnings("ignore")
 
+if not st.runtime.exists():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
+
 # =========================
 # Config & Secrets
 # =========================
 GIST_ID = st.secrets.get("GIST_ID")
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
 GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}" if GIST_ID else None
-HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+HEADERS: Dict[str, str] = {
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+if GITHUB_TOKEN:
+    HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+
+def _safe_get(
+    url: str,
+    *,
+    headers: Dict[str, str] | None = None,
+    timeout: int = 10,
+    retries: int = 1,
+    **kwargs,
+) -> requests.Response:
+    """GET with default headers, timeout and simple retry."""
+    hdrs = {"User-Agent": "Mozilla/5.0"}
+    if headers:
+        hdrs.update(headers)
+    for attempt in range(retries + 1):
+        try:
+            return requests.get(url, headers=hdrs, timeout=timeout, **kwargs)
+        except requests.RequestException:
+            if attempt >= retries:
+                raise
+            time.sleep(0.5)
+
+
+def _safe_patch(
+    url: str,
+    *,
+    headers: Dict[str, str] | None = None,
+    timeout: int = 10,
+    retries: int = 1,
+    **kwargs,
+) -> requests.Response:
+    """PATCH with default headers, timeout and simple retry."""
+    hdrs = {"User-Agent": "Mozilla/5.0"}
+    if headers:
+        hdrs.update(headers)
+    for attempt in range(retries + 1):
+        try:
+            return requests.patch(url, headers=hdrs, timeout=timeout, **kwargs)
+        except requests.RequestException:
+            if attempt >= retries:
+                raise
+            time.sleep(0.5)
 
 GIST_PORTF_FILE = "portfolio.json"
 LIVE_PERF_FILE  = "live_perf.csv"
@@ -318,7 +368,7 @@ def enforce_caps_iteratively(
     - group_caps: optional dict like {"Software": 0.30, "Software:Security": 0.18, ...}
                   Parent groups are labels with no ":" (e.g., "Software").
     We *do not* force re-distribution; trimmed weight becomes cash (i.e., sum <= 1).
-    This residual cash persists until any later exposure scaling step.
+    Callers typically re-normalize before applying any exposure scaling.
     """
 
     if weights.empty:
@@ -404,7 +454,7 @@ def get_enhanced_sector_map(tickers: list[str], base_map: dict[str, str] | None 
         "CRWD","ZS","FTNT","PANW","OKTA","S","TENB","NET"
     }
     sec_data_ai = {
-        "PLTR","SNOW","MDB","DDOG","NRTX","AI"  # keep PLTR here
+        "PLTR","SNOW","MDB","DDOG","AI"  # keep PLTR here
     }
     sec_adtech = {"APP","TTD"}
     sec_collab = {"ZM","TEAM"}
@@ -895,7 +945,8 @@ def fetch_sp500_constituents() -> List[str]:
     """Get current S&P 500 tickers with fallback to static list."""
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        resp = _safe_get(url)
+        time.sleep(0.5)
         tables = pd.read_html(StringIO(resp.text))
         df = next(
             t for t in tables
@@ -939,6 +990,9 @@ _SECTOR_CACHE: Dict[str, str] = {}
 
 _SECTOR_OVERRIDE_PATH = Path(__file__).with_name("sector_overrides.csv")
 
+# Directory for parquet-based caching of downloaded price data
+PARQUET_CACHE_DIR = Path(".parquet_cache")
+
 
 def _load_sector_overrides() -> Dict[str, str]:
     if _SECTOR_OVERRIDE_PATH.exists():
@@ -958,6 +1012,27 @@ def _load_sector_overrides() -> Dict[str, str]:
 
 
 _SECTOR_OVERRIDES = _load_sector_overrides()
+
+
+def _parquet_cache_path(prefix: str, tickers: List[str], start_date: str, end_date: str) -> Path:
+    """Return a filesystem path for caching data as parquet.
+
+    A short hash based on the prefix, tickers and date range is used so the
+    filenames remain manageable regardless of the number of tickers provided.
+    The cache directory is created on demand so tests can monkeypatch
+    ``PARQUET_CACHE_DIR`` to a temporary location.
+    """
+
+    PARQUET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key_obj = {
+        "p": prefix,
+        "t": sorted(tickers),
+        "s": start_date,
+        "e": end_date,
+    }
+    key = json.dumps(key_obj, sort_keys=True)
+    fname = hashlib.sha256(key.encode("utf-8")).hexdigest() + ".parquet"
+    return PARQUET_CACHE_DIR / fname
 
 
 def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
@@ -1006,10 +1081,8 @@ def get_sector_map(tickers: List[str]) -> Dict[str, str]:
 def get_nasdaq_100_plus_tickers() -> List[str]:
     """Get NASDAQ 100+ tickers with fallback list"""
     try:
-        resp = requests.get(
-            "https://en.wikipedia.org/wiki/Nasdaq-100",
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
+        resp = _safe_get("https://en.wikipedia.org/wiki/Nasdaq-100")
+        time.sleep(0.5)
         tables = pd.read_html(StringIO(resp.text))
         df = next(
             t for t in tables
@@ -1106,6 +1179,13 @@ def _prepare_universe_for_backtest(
 # =========================
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
+    if cache_path.exists():
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            pass
+
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         frames: List[pd.DataFrame] = []
@@ -1126,15 +1206,23 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
         # Enhanced data cleaning pipeline
         if not result.empty:
-            cleaned_result, cleaning_alerts = validate_and_clean_market_data(result)
+            cleaned_result, cleaning_alerts, _ = validate_and_clean_market_data(result)
 
             # Show cleaning summary
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
                     st.info(f"🧹 Data cleaning: {alert}")
 
+            try:
+                cleaned_result.to_parquet(cache_path)
+            except Exception:
+                pass
             return cleaned_result
 
+        try:
+            result.to_parquet(cache_path)
+        except Exception:
+            pass
         return result
 
     except Exception as e:
@@ -1143,6 +1231,14 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
+    if cache_path.exists():
+        try:
+            combined = pd.read_parquet(cache_path)
+            return combined["Close"], combined["Volume"]
+        except Exception:
+            pass
+
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         close_frames: List[pd.DataFrame] = []
@@ -1177,7 +1273,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
         # Enhanced data cleaning for prices
         if not close.empty:
-            cleaned_close, close_alerts = validate_and_clean_market_data(close)
+            cleaned_close, close_alerts, _ = validate_and_clean_market_data(close)
 
             # Clean volume data (less aggressive)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
@@ -1191,8 +1287,16 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 for alert in close_alerts[:1]:  # Show top cleaning action
                     st.info(f"🧹 Price/Volume cleaning: {alert}")
 
+            try:
+                pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1).to_parquet(cache_path)
+            except Exception:
+                pass
             return cleaned_close, vol_aligned
 
+        try:
+            pd.concat({"Close": close, "Volume": vol}, axis=1).to_parquet(cache_path)
+        except Exception:
+            pass
         return close, vol
 
     except Exception as e:
@@ -1209,7 +1313,7 @@ def save_portfolio_to_gist(portfolio_df: pd.DataFrame) -> None:
     try:
         json_content = portfolio_df.to_json(orient="index")
         payload = {"files": {GIST_PORTF_FILE: {"content": json_content}}}
-        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp = _safe_patch(GIST_API_URL, headers=HEADERS, json=payload)
         resp.raise_for_status()
         st.sidebar.success("✅ Successfully saved portfolio to Gist.")
     except Exception as e:
@@ -1270,7 +1374,7 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
     # Gist first
     if GIST_API_URL and GITHUB_TOKEN:
         try:
-            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp = _safe_get(GIST_API_URL, headers=HEADERS)
             resp.raise_for_status()
             files = resp.json().get("files", {})
             content = files.get(GIST_PORTF_FILE, {}).get("content", "")
@@ -1730,8 +1834,8 @@ def _build_isa_weights_fixed(
     When ``use_enhanced_features`` is True, the raw sleeve weights are further
     adjusted using risk-parity weights and volatility-aware name caps before the
     standard hierarchical cap enforcement. Cap trimming doesn't redistribute
-    weight, so any residual cash is scaled back to full exposure at the end of
-    this function.
+    weight; remaining equities are re-normalized before any regime-based exposure
+    scaling is applied.
     """
     monthly = daily_close.resample("M").last()
 
@@ -1870,8 +1974,8 @@ def generate_live_portfolio_isa_monthly(
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
     Now includes regime awareness, volatility adjustments, and an optional `as_of` date.
-    Cap trimming leaves residual cash until the final exposure scaling performed
-    within this routine.
+    Caps are enforced and remaining equity weights are re-normalized; overall
+    exposure is set later via regime-based scaling within this routine.
     """
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
@@ -2562,7 +2666,7 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
 def load_assess_log() -> pd.DataFrame:
     if GIST_API_URL and GITHUB_TOKEN:
         try:
-            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp = _safe_get(GIST_API_URL, headers=HEADERS)
             resp.raise_for_status()
             files = resp.json().get("files", {})
             content = files.get(ASSESS_LOG_FILE, {}).get("content", "")
@@ -2580,7 +2684,7 @@ def save_assess_log(df: pd.DataFrame) -> None:
     try:
         csv_str = df.to_csv(index=False)
         payload = {"files": {ASSESS_LOG_FILE: {"content": csv_str}}}
-        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp = _safe_patch(GIST_API_URL, headers=HEADERS, json=payload)
         resp.raise_for_status()
     except Exception as e:
         st.sidebar.warning(f"Could not save assessment log: {e}")
@@ -2792,7 +2896,7 @@ def diagnose_strategy_issues(current_returns: pd.Series,
 def load_live_perf() -> pd.DataFrame:
     if GIST_API_URL and GITHUB_TOKEN:
         try:
-            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp = _safe_get(GIST_API_URL, headers=HEADERS)
             resp.raise_for_status()
             files = resp.json().get("files", {})
             content = files.get(LIVE_PERF_FILE, {}).get("content", "")
@@ -2811,7 +2915,7 @@ def save_live_perf(df: pd.DataFrame) -> None:
     try:
         csv_str = df.to_csv(index=False)
         payload = {"files": {LIVE_PERF_FILE: {"content": csv_str}}}
-        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp = _safe_patch(GIST_API_URL, headers=HEADERS, json=payload)
         resp.raise_for_status()
     except Exception as e:
         st.sidebar.warning(f"Could not save live perf: {e}")

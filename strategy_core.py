@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
+import time
 from io import StringIO
 
 # ------------------------------
@@ -54,7 +55,12 @@ def get_nasdaq_100_plus_tickers(
     """
     extras = list(extras) if extras else []
     try:
-        resp = requests.get(wikipedia_url, headers={'User-Agent': 'Mozilla/5.0'})
+        resp = requests.get(
+            wikipedia_url,
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10,
+        )
+        time.sleep(0.5)
         tables = pd.read_html(StringIO(resp.text))
         df = next(
             t for t in tables

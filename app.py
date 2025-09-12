@@ -64,7 +64,11 @@ mc_seed_input = st.sidebar.text_input(
     value=str(st.session_state["mc_seed"]),
     help="Controls the random seed for Monte Carlo projections",
 )
-st.session_state["mc_seed"] = int(mc_seed_input) if mc_seed_input.strip() else None
+try:
+    st.session_state["mc_seed"] = int(mc_seed_input) if mc_seed_input.strip() else None
+except ValueError:
+    st.session_state["mc_seed"] = None
+    st.info("Using random seed")
 
 # Initialize parameters from presets or prior assessment
 st.session_state.setdefault("stickiness_days", preset.get("stability_days", 7))
@@ -352,7 +356,7 @@ with tab2:
             c2.metric(
                 "Total Equity Exposure",
                 f"{total_exp:.2%}",
-                help="Sector/name cap trimming leaves residual cash until final exposure scaling.",
+                help="Caps are enforced and weights re-normalized before final exposure scaling.",
             )
 
             if violations:
