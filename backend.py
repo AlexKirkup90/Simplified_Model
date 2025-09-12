@@ -228,6 +228,8 @@ def generate_td1_targets_asof(
     weights = _build_isa_weights_fixed(
         hist, preset, sectors_map, use_enhanced_features=use_enhanced_features
     )  # returns weights summing to equity exposure
+    weights = weights / weights.sum() if weights.sum() > 0 else weights
+    # normalize → enforce caps → final renorm before exposure scaling
 
     regime_metrics: Dict[str, float] = {}
     # If TD1 applies regime exposure (not the drawdown scaler on *returns*, but the weight scaler), apply it here too
@@ -1458,6 +1460,9 @@ def run_momentum_composite_param(
             group_caps=group_caps,
             debug=debug_caps,
         )
+
+        w = w / w.sum() if w.sum() > 0 else w
+        # normalize → enforce caps → final renorm before exposure scaling
 
         # Regime-based exposure scaling (keeps exposure < 1 when risk-off)
         if use_enhanced_features and len(hist) > 0 and len(w) > 0:
