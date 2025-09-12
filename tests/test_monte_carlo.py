@@ -14,8 +14,8 @@ import backend
 def test_run_monte_carlo_deterministic_reproducibility():
     """Monte Carlo projections should be reproducible and include expected keys."""
     returns = pd.Series([0.01] * 24)
-    result1 = backend.run_monte_carlo_projections(returns, n_scenarios=100, horizon_months=12)
-    result2 = backend.run_monte_carlo_projections(returns, n_scenarios=100, horizon_months=12)
+    result1 = backend.run_monte_carlo_projections(returns, n_scenarios=100, horizon_months=12, seed=42)
+    result2 = backend.run_monte_carlo_projections(returns, n_scenarios=100, horizon_months=12, seed=42)
 
     expected_total = (1 + 0.01) ** 12 - 1
     expected_keys = {
@@ -38,6 +38,14 @@ def test_run_monte_carlo_deterministic_reproducibility():
     assert result1["downside_risk"] == pytest.approx(0)
     assert result1["horizon_months"] == 12
     assert np.array_equal(result1["scenarios"], result2["scenarios"])
+
+
+def test_run_monte_carlo_seed_variation():
+    """Different seeds should produce different Monte Carlo scenarios."""
+    returns = pd.Series(np.random.default_rng(0).normal(0.01, 0.02, 24))
+    result1 = backend.run_monte_carlo_projections(returns, n_scenarios=100, horizon_months=12, seed=1)
+    result2 = backend.run_monte_carlo_projections(returns, n_scenarios=100, horizon_months=12, seed=2)
+    assert not np.array_equal(result1["scenarios"], result2["scenarios"])
 
 
 def test_run_monte_carlo_short_history():
