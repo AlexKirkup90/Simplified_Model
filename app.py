@@ -10,6 +10,9 @@ import streamlit as st
 
 import backend  # all logic lives here
 
+# Default average trade size as a fraction
+AVG_TRADE_SIZE_DEFAULT = backend.AVG_TRADE_SIZE_DEFAULT
+
 # ---------------------------
 # Page config
 # ---------------------------
@@ -109,7 +112,7 @@ st.session_state["min_dollar_volume"] = int(min_dollar_volume)
 
 # Average trade size for turnover-based trade count
 avg_trade_pct = st.sidebar.slider(
-    "Avg single-leg trade size (%)", 0.5, 5.0, 2.0, 0.5,
+    "Avg single-leg trade size (%)", 0.5, 5.0, AVG_TRADE_SIZE_DEFAULT * 100, 0.5,
     help="Used to estimate trades/year from turnover"
 )
 AVG_TRADE_SIZE = avg_trade_pct / 100.0

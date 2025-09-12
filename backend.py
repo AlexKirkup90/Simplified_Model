@@ -25,6 +25,7 @@ LOCAL_PORTF_FILE = "last_portfolio.csv"
 
 ROUNDTRIP_BPS_DEFAULT = 20
 REGIME_MA = 200
+AVG_TRADE_SIZE_DEFAULT = 0.02  # 2% avg single-leg trade size
 
 # Defaults for regime-based exposure adjustments
 VIX_TS_THRESHOLD_DEFAULT = 1.0   # VIX3M / VIX ratio; <1 implies stress
@@ -1056,7 +1057,7 @@ def kpi_row(name: str,
             rets: pd.Series,
             trade_log: Optional[pd.DataFrame] = None,
             turnover_series: Optional[pd.Series] = None,
-            avg_trade_size: float = 0.02) -> List[str]:
+            avg_trade_size: float = AVG_TRADE_SIZE_DEFAULT) -> List[str]:
     """
     KPI row with robust turnover:
       - Turnover/yr = mean of calendar-year sums of monthly turnover
