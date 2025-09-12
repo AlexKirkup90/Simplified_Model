@@ -153,6 +153,7 @@ strategy_cum_gross = None
 strategy_cum_net = None
 qqq_cum = None
 hybrid_tno = None
+mc_results = st.session_state.get("mc_results")
 
 # ===========================
 # Generate
@@ -197,6 +198,21 @@ if go:
         # save to session for Save button / persistence
         if live_raw is not None and not live_raw.empty:
             st.session_state.latest_portfolio = live_raw.copy()
+
+        # Automatically run Monte Carlo projections using historical returns
+        try:
+            base_cum = strategy_cum_net if (strategy_cum_net is not None and show_net) else strategy_cum_gross
+            if base_cum is not None:
+                mc_returns = base_cum.pct_change().dropna()
+                st.session_state.mc_results = backend.run_monte_carlo_projections(
+                    mc_returns,
+                    confidence_levels=[5, 25, 50, 75, 95]
+                )
+            else:
+                st.session_state.mc_results = None
+        except Exception as e:
+            st.warning(f"Monte Carlo simulation failed: {e}")
+            st.session_state.mc_results = {"error": str(e)}
 
 # ---------------------------
 # Tab 1: Rebalancing Plan
@@ -518,110 +534,32 @@ with tab3:
                 f"CAGR: **{ann_cagr:.2%}** • Vol: **{ann_vol:.2%}** • Sharpe: **{sharpe:.2f}** • Hit-rate: **{hit_rate:.1%}**"
             )
 
-        # ========= Enhanced 12-Month Monte Carlo (bootstrap) =========
-        st.subheader("🔮 Enhanced 12-Month Monte Carlo (net returns)")
-        if len(m) < 6:
-            st.info("Not enough monthly history to run the simulation.")
+        # ========= 12-Month Monte Carlo Projection =========
+        st.subheader("🔮 12-Month Monte Carlo Projection")
+        mc_results = st.session_state.get("mc_results")
+        if not mc_results or "error" in mc_results:
+            st.info("Monte Carlo projections unavailable.")
         else:
-            col_a, col_b, col_c, col_d = st.columns(4)
-            with col_a:
-                n_trials = st.slider("Simulations", 1000, 10000, 5000, 500)
-            with col_b:
-                block = st.slider("Block size (months)", 1, 6, 3, 1,
-                                  help="Use 1 for IID bootstrap; >1 keeps short-term clustering.")
-            with col_c:
-                seed = st.number_input("Random seed", value=42, step=1)
-            with col_d:
-                confidence_levels = st.multiselect("Confidence levels", [5, 10, 25, 50, 75, 90, 95], default=[10, 50, 90])
+            percentiles = mc_results["percentiles"]
+            pct_table = pd.DataFrame({
+                "Percentile": [f"{int(k[1:])}th" for k in sorted(percentiles.keys(), key=lambda x: int(x[1:]))],
+                "Return": [f"{percentiles[k]:.1%}" for k in sorted(percentiles.keys(), key=lambda x: int(x[1:]))]
+            })
+            st.table(pct_table)
 
-            # Enhanced Monte Carlo using backend function
-            mc_results = backend.run_monte_carlo_projections(
-                m, n_scenarios=n_trials, horizon_months=12, 
-                confidence_levels=confidence_levels, block_size=block
-            )
-            
-            if "error" not in mc_results:
-                percentiles = mc_results['percentiles']
-                
-                # Display key statistics
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Median Return", f"{percentiles.get('p50', 0):.1%}")
-                with col2:
-                    st.metric("Probability Positive", f"{mc_results['prob_positive']:.1%}")
-                with col3:
-                    st.metric("Probability >10%", f"{mc_results['prob_beat_10pct']:.1%}")
-                
-                # Display confidence intervals
-                st.markdown("**12-month projected returns:**")
-                for level in sorted(confidence_levels):
-                    pct_key = f'p{level}'
-                    if pct_key in percentiles:
-                        st.write(f"• {level}th percentile: **{percentiles[pct_key]:.1%}**")
+            fig2, ax2 = plt.subplots(figsize=(10, 6))
+            scenarios = mc_results["scenarios"]
+            ax2.hist(scenarios * 100.0, bins=50, alpha=0.7, density=True, color='skyblue', edgecolor='black')
+            for level, pct_val in sorted(percentiles.items(), key=lambda x: int(x[0][1:])):
+                ax2.axvline(pct_val * 100, linestyle="--", linewidth=1, label=f"{level[1:]}th: {pct_val:.1%}")
+            ax2.axvline(0, color='red', linestyle='-', alpha=0.5, label='Break-even')
+            ax2.set_xlabel("12-month return (%)")
+            ax2.set_ylabel("Probability Density")
+            ax2.set_title("Monte Carlo Return Distribution")
+            ax2.legend()
+            ax2.grid(True, ls="--", alpha=0.5)
+            st.pyplot(fig2)
 
-                # Enhanced histogram
-                fig2, ax2 = plt.subplots(figsize=(10, 6))
-                scenarios = mc_results['scenarios']
-                ax2.hist(scenarios * 100.0, bins=50, alpha=0.7, density=True, color='skyblue', edgecolor='black')
-                
-                # Add percentile lines
-                for level in confidence_levels:
-                    if level in [10, 50, 90]:  # Show main percentiles
-                        pct_val = percentiles.get(f'p{level}', 0)
-                        ax2.axvline(pct_val*100, linestyle="--", linewidth=2, 
-                                   label=f'{level}th pct: {pct_val:.1%}')
-                
-                ax2.axvline(0, color='red', linestyle='-', alpha=0.5, label='Break-even')
-                ax2.set_xlabel("12-month return (%)")
-                ax2.set_ylabel("Probability Density")
-                ax2.set_title("Monte Carlo Return Distribution")
-                ax2.legend()
-                ax2.grid(True, ls="--", alpha=0.5)
-                st.pyplot(fig2)
-
-                # === Enhanced TL;DR summary ===
-                st.markdown("##### TL;DR for the next 12 months")
-
-                start_amount = st.number_input(
-                    "Show results for a starting amount (£)",
-                    min_value=100, max_value=1_000_000, step=100, value=1000
-                )
-
-                def money(x):
-                    return f"£{x:,.0f}"
-
-                median_ret = mc_results['mean_return']
-                p10_ret = percentiles.get('p10', 0)
-                p90_ret = percentiles.get('p90', 0)
-                p05_ret = percentiles.get('p5', 0) if 'p5' in percentiles else np.percentile(scenarios, 5)
-                downside = mc_results['downside_risk']
-
-                st.markdown(f"""
-**Expected Outcomes for £{start_amount:,}:**
-- **Median outcome:** **{median_ret*100:.1f}%** → **{money(start_amount*(1+median_ret))}**  
-- **Typical range (10th–90th pct):** **{p10_ret*100:.1f}%** to **{p90_ret*100:.1f}%**  
-  → **{money(start_amount*(1+p10_ret))}** to **{money(start_amount*(1+p90_ret))}**  
-- **Downside scenario (5th pct):** **{p05_ret*100:.1f}%** → **{money(start_amount*(1+p05_ret))}**  
-- **Chance of positive year:** **{mc_results['prob_positive']*100:.1f}%**  
-- **Average loss in bad scenarios:** **{downside*100:.1f}%**  
-""")
-
-                # Risk assessment
-                if mc_results['prob_positive'] > 0.7:
-                    risk_color = "🟢"
-                    risk_text = "Favorable risk/reward profile"
-                elif mc_results['prob_positive'] > 0.5:
-                    risk_color = "🟡" 
-                    risk_text = "Balanced risk/reward profile"
-                else:
-                    risk_color = "🔴"
-                    risk_text = "Elevated risk profile"
-                
-                st.info(f"{risk_color} **Risk Assessment:** {risk_text}. "
-                       f"The distribution shows {mc_results['prob_positive']:.0%} chance of gains, "
-                       f"with median upside of {median_ret:.0%}. Size positions accordingly.")
-            else:
-                st.error(f"Monte Carlo simulation failed: {mc_results['error']}")
 
 # ---------------------------
 # Tab 4: Enhanced Regime
