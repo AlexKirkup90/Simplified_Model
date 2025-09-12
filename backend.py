@@ -856,28 +856,26 @@ def fetch_sp500_constituents() -> List[str]:
         ]
 
 _SECTOR_CACHE_TTL = 86400
-_SECTOR_CACHE: Dict[str, str] = {}
 
 @st.cache_data(ttl=_SECTOR_CACHE_TTL)
 def get_sector_map(tickers: List[str]) -> Dict[str, str]:
     """Return a mapping from ticker to sector name.
 
-    Each ticker is fetched from :mod:`yfinance` at most once. Results are
-    cached per ticker in the module-level ``_SECTOR_CACHE`` and the full mapping
-    is cached by Streamlit's ``st.cache_data`` decorator for 24 hours
-    (``_SECTOR_CACHE_TTL``). This minimises repeated network requests across
-    executions. Tickers with missing sector information are stored as
+    Each ticker is fetched from :mod:`yfinance` at most once thanks to
+    Streamlit's ``st.cache_data`` decorator, which caches the mapping for 24
+    hours (``_SECTOR_CACHE_TTL``). This minimises repeated network requests
+    across executions. Tickers with missing sector information are stored as
     ``"Unknown"``.
     """
-    new_tickers = [t for t in tickers if t not in _SECTOR_CACHE]
-    for t in new_tickers:
+    result: Dict[str, str] = {}
+    for t in tickers:
         try:
             info = yf.Ticker(t).info or {}
             sector = info.get("sector") or "Unknown"
         except Exception:
             sector = "Unknown"
-        _SECTOR_CACHE[t] = sector
-    return {t: _SECTOR_CACHE.get(t, "Unknown") for t in tickers}
+        result[t] = sector
+    return result
 
 def get_nasdaq_100_plus_tickers() -> List[str]:
     """Get NASDAQ 100+ tickers with fallback list"""
