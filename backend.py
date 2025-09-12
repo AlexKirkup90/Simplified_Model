@@ -66,6 +66,57 @@ PARAM_MAP_DEFAULTS = {
     "sector_cap_high": 0.25,
 }
 
+# Local parquet cache for price/volume downloads
+CACHE_DIR = Path(".cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _cache_path(ticker: str) -> Path:
+    """Return parquet cache path for ``ticker``."""
+    safe = ticker.replace("/", "_")
+    return CACHE_DIR / f"px_{safe}.parquet"
+
+
+def _read_px_cache(ticker: str) -> pd.DataFrame:
+    """Load cached price/volume data if available."""
+    path = _cache_path(ticker)
+    if path.exists():
+        try:
+            df = pd.read_parquet(path)
+            df.index = pd.to_datetime(df.index)
+            return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _write_px_cache(ticker: str, df: pd.DataFrame) -> None:
+    """Persist price/volume data for ``ticker`` to parquet."""
+    path = _cache_path(ticker)
+    try:
+        df.to_parquet(path)
+    except Exception:
+        pass
+
+
+def purge_px_cache(max_age_days: int = 7) -> int:
+    """Delete cache files older than ``max_age_days``.
+
+    Returns the number of files removed.
+    """
+    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=max_age_days)
+    removed = 0
+    if CACHE_DIR.exists():
+        for f in CACHE_DIR.glob("px_*.parquet"):
+            try:
+                mtime = pd.Timestamp(f.stat().st_mtime, unit="s")
+                if mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except Exception:
+                continue
+    return removed
+
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
 # =========================
@@ -1045,13 +1096,29 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         frames: List[pd.DataFrame] = []
-        for batch in _chunk_tickers(tickers):
+        missing: List[str] = []
+
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date)
+
+        for t in tickers:
+            cached = _read_px_cache(t)
+            if not cached.empty and cached.index.min() <= start_ts and cached.index.max() >= end_ts:
+                frames.append(cached.loc[start_ts:end_ts, ["Close"]].rename(columns={"Close": t}))
+            else:
+                missing.append(t)
+
+        for batch in _chunk_tickers(missing):
             df = yf.download(batch, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[
                 "Close"
             ]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
+            # Persist each ticker
+            for t in batch:
+                if t in df.columns:
+                    _write_px_cache(t, df[[t]].rename(columns={t: "Close"}))
             frames.append(df)
 
         if not frames:
@@ -1083,7 +1150,20 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
-        for batch in _chunk_tickers(tickers):
+        missing: List[str] = []
+
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date)
+
+        for t in tickers:
+            cached = _read_px_cache(t)
+            if not cached.empty and cached.index.min() <= start_ts and cached.index.max() >= end_ts:
+                close_frames.append(cached.loc[start_ts:end_ts, ["Close"]].rename(columns={"Close": t}))
+                vol_frames.append(cached.loc[start_ts:end_ts, ["Volume"]].rename(columns={"Volume": t}))
+            else:
+                missing.append(t)
+
+        for batch in _chunk_tickers(missing):
             df = yf.download(batch, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[
                 ["Close", "Volume"]
             ]
@@ -1101,6 +1181,12 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                         vol_part.columns = [batch[0]]
                 else:
                     continue
+            for t in batch:
+                if t in close_part.columns:
+                    _write_px_cache(
+                        t,
+                        pd.DataFrame({"Close": close_part[t], "Volume": vol_part[t]})
+                    )
             close_frames.append(close_part)
             vol_frames.append(vol_part)
 
@@ -2217,6 +2303,13 @@ def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
     persisted across reruns.
     """
     try:
+        start_ts = pd.to_datetime(start)
+        end_ts = pd.to_datetime(end)
+        cached = _read_px_cache(ticker)
+        if not cached.empty and cached.index.min() <= start_ts and cached.index.max() >= end_ts:
+            px = cached.loc[start_ts:end_ts, "Close"]
+            return pd.Series(px).dropna()
+
         data = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
         try:
             px = data["Close"]
@@ -2224,6 +2317,10 @@ def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
             # Fallback: take first column if "Close" not present (e.g., FRED series)
             px = data.iloc[:, 0] if hasattr(data, "iloc") else data
         px = _safe_series(px)
+        cache_df = pd.DataFrame({"Close": px})
+        if "Volume" in data.columns:
+            cache_df["Volume"] = data["Volume"]
+        _write_px_cache(ticker, cache_df)
         return pd.Series(px).dropna()
     except Exception as e:
         get_benchmark_series.clear()
