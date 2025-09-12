@@ -220,6 +220,111 @@ def run_backtest_momentum(daily_prices: pd.DataFrame, lookback_m: int = 6,
     return rets.fillna(0.0), tno.fillna(0.0)
 
 
+def predictive_signals(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Series:
+    """Predict next-month returns via simple AR(1) on monthly returns.
+
+    For each ticker we estimate ``r_t = a + b * r_{t-1}`` over the
+    ``lookback_m`` most recent returns and use the fitted parameters to
+    forecast the next return.
+
+    Parameters
+    ----------
+    monthly_prices : DataFrame
+        Month-end prices for each ticker.
+    lookback_m : int
+        Number of months of returns to use in the regression.
+
+    Returns
+    -------
+    Series
+        Predicted next-month return for each ticker.  Missing values are
+        omitted from the result.
+    """
+    rets = monthly_prices.pct_change().dropna()
+    preds = {}
+    if rets.empty:
+        return pd.Series(dtype=float)
+    for col in rets.columns:
+        series = rets[col].dropna().iloc[-lookback_m:]
+        if len(series) == 0:
+            continue
+        x = series.shift(1).dropna()
+        y = series.loc[x.index]
+        if len(x) == 0:
+            continue
+        X = np.vstack([np.ones(len(x)), x.values]).T
+        try:
+            a, b = np.linalg.lstsq(X, y.values, rcond=None)[0]
+            preds[col] = a + b * series.iloc[-1]
+        except Exception:
+            continue
+    return pd.Series(preds).dropna()
+
+
+def build_predictive_weights(monthly_prices: pd.DataFrame, lookback_m: int,
+                             top_n: int, cap: float) -> Tuple[pd.Series, pd.Series]:
+    """Compute weights based on predicted returns from :func:`predictive_signals`.
+
+    Returns ``(weights, selected_scores)`` where weights sum to 1.
+    Only tickers with positive predicted returns are considered.
+    """
+    scores = predictive_signals(monthly_prices, lookback_m)
+    scores = scores[scores > 0]
+    if scores.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    top = scores.nlargest(top_n)
+    raw = top / top.sum() if top.sum() != 0 else pd.Series(1.0 / len(top), index=top.index)
+    capped = cap_weights(raw, cap=cap)
+    final_w = capped / capped.sum()
+    return final_w, top
+
+
+def run_backtest_predictive(daily_prices: pd.DataFrame, lookback_m: int = 12,
+                            top_n: int = 10, cap: float = 0.25) -> Tuple[pd.Series, pd.Series]:
+    """Monthly backtest using predictive stock selection.
+
+    At each month-end an AR(1) model is fit for each ticker using the last
+    ``lookback_m`` monthly returns and the top ``top_n`` positive forecasts
+    are selected.  Weights are capped via :func:`cap_weights`.
+
+    Returns
+    -------
+    (monthly_returns, monthly_turnover)
+    """
+    mp = _resample_month_end(daily_prices)
+    future = mp.pct_change().shift(-1)
+
+    rets = pd.Series(index=mp.index, dtype=float)
+    tno = pd.Series(index=mp.index, dtype=float)
+    prev_w = None
+
+    for dt in mp.index:
+        hist = mp.loc[:dt]
+        scores = predictive_signals(hist, lookback_m)
+        scores = scores[scores > 0]
+        if scores.empty:
+            rets.loc[dt] = 0.0
+            tno.loc[dt] = 0.0
+            prev_w = None
+            continue
+        top = scores.nlargest(top_n)
+        raw = top / top.sum()
+        w = cap_weights(raw, cap=cap)
+        w = w / w.sum()
+
+        valid = w.index.intersection(future.columns)
+        rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
+
+        if prev_w is None:
+            tno.loc[dt] = w.abs().sum()
+        else:
+            aligned_prev = prev_w.reindex(w.index).fillna(0)
+            tno.loc[dt] = (w - aligned_prev).abs().sum()
+        prev_w = w
+
+    return rets.fillna(0.0), tno.fillna(0.0)
+
+
 def run_backtest_mean_reversion(daily_prices: pd.DataFrame, lookback_days: int = 21,
                                 top_n: int = 5, long_ma_days: int = 200) -> Tuple[pd.Series, pd.Series]:
     """Monthly backtest for the mean-reversion sleeve with long-term uptrend filter.
