@@ -1,6 +1,6 @@
 # app.py - Enhanced Hybrid Momentum Portfolio (ISA-Dynamic) with Strategy Health Monitoring
 import traceback
-from datetime import datetime
+from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 
 import numpy as np
@@ -156,7 +156,8 @@ if go:
             live_disp, live_raw, decision = backend.generate_live_portfolio_isa_monthly(
                 preset=preset,
                 prev_portfolio=prev_portfolio,
-                min_dollar_volume=min_dollar_volume
+                min_dollar_volume=min_dollar_volume,
+                as_of=date.today(),
             )
         except Exception as e:
             st.error(f"Portfolio generation failed: {e}")
