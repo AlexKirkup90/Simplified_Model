@@ -40,7 +40,7 @@ def test_fill_missing_data(monkeypatch):
 
     filled, mask = backend.fill_missing_data(df, max_gap_days=3)
 
-    expected = pd.DataFrame({"A": [1.0, 1.0, 3.0]}, index=idx)
+    expected = pd.DataFrame({"A": [1.0, 2.0, 3.0]}, index=idx)
     pd.testing.assert_frame_equal(filled, expected)
 
     expected_mask = pd.DataFrame({"A": [False, True, False]}, index=idx)
