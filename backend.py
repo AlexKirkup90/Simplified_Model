@@ -1186,7 +1186,14 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
     if cache_path.exists():
         try:
             combined = pd.read_parquet(cache_path)
-            return combined["Close"], combined["Volume"]
+            if isinstance(combined.columns, pd.MultiIndex):
+                needed = {"Close", "Volume"}
+                have = set(combined.columns.get_level_values(0))
+                if needed.issubset(have):
+                    return combined["Close"], combined["Volume"]
+            else:
+                if {"Close", "Volume"}.issubset(combined.columns):
+                    return combined["Close"], combined["Volume"]
         except Exception:
             pass
 
