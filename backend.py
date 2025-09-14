@@ -147,7 +147,10 @@ def clean_extreme_moves(
 
     if total_corrections > 0:
         msg = f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks"
-        (info or logging.info)(msg)
+        if info:
+            info(msg)
+        else:
+            logging.info(msg)
 
     return cleaned_df, replaced_mask
 
@@ -201,13 +204,19 @@ def fill_missing_data(
 
     if total_filled > 0:
         msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        (info or logging.info)(msg)
+        if info:
+            info(msg)
+        else:
+            logging.info(msg)
 
     return filled_df, imputed_mask
 
 
 def validate_and_clean_market_data(
     prices_df: pd.DataFrame,
+    max_daily_move: float = 0.25,
+    min_price: float = 0.50,
+    max_gap_days: int = 3,
     info: Callable[[str], None] | None = None,
 ) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
     """Comprehensive data validation and cleaning pipeline.
@@ -225,11 +234,13 @@ def validate_and_clean_market_data(
 
     # Step 1: Clean extreme moves
     cleaned_df, replaced_mask = clean_extreme_moves(
-        prices_df, max_daily_move=0.25, min_price=0.50, info=info
+        prices_df, max_daily_move=max_daily_move, min_price=min_price, info=info
     )
 
     # Step 2: Fill missing data gaps
-    filled_df, fill_mask = fill_missing_data(cleaned_df, max_gap_days=3, info=info)
+    filled_df, fill_mask = fill_missing_data(
+        cleaned_df, max_gap_days=max_gap_days, info=info
+    )
 
     imputed_mask = replaced_mask | fill_mask
 

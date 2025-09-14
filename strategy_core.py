@@ -258,13 +258,15 @@ def run_backtest_momentum(
         scores = scores[scores > 0]
         if scores.empty:
             rets.loc[dt] = 0.0
-            tno.loc[dt] = 0.0
+            if prev_w is not None:
+                tno.loc[dt] = 0.5 * prev_w.abs().sum()
+            else:
+                tno.loc[dt] = 0.0
             prev_w = None
             continue
         top = scores.nlargest(top_n)
         raw = top / top.sum()
         w = cap_weights(raw, cap=cap)
-        w = w / w.sum()
 
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
