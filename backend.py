@@ -1305,15 +1305,16 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
 
         # Constraint check if sector map available
         try:
-            sectors_map = get_enhanced_sector_map(list(df.index))
-            if sectors_map:
+            base_map = get_sector_map(list(df.index))
+            enhanced_map = get_enhanced_sector_map(list(df.index), base_map=base_map)
+            if enhanced_map:
                 preset = STRATEGY_PRESETS.get("ISA Dynamic (0.75)", {})
                 name_cap = float(preset.get("mom_cap", 0.25))
                 sector_cap = float(preset.get("sector_cap", 0.30))
-                group_caps = build_group_caps(sectors_map)
+                group_caps = build_group_caps(enhanced_map)
                 violations = check_constraint_violations(
                     weights,
-                    sectors_map,
+                    enhanced_map,
                     name_cap,
                     sector_cap,
                     group_caps=group_caps,
