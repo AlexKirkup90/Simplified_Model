@@ -20,7 +20,7 @@ All functions are deterministic and return pandas objects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Dict, Optional, Tuple
+from typing import Iterable, List, Dict, Optional, Tuple, Callable
 
 import numpy as np
 import pandas as pd
@@ -40,35 +40,49 @@ def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
     for i in range(0, len(tickers), size):
         yield tickers[i : i + size]
 
+_NDX_CONSTITUENT_CACHE: Dict[str, List[str]] = {}
+
+
 def get_nasdaq_100_plus_tickers(
     extras: Optional[Iterable[str]] = None,
-    wikipedia_url: str = "https://en.wikipedia.org/wiki/Nasdaq-100",
+    as_of: Optional[str] = None,
+    api_url: str = "https://data.nasdaq.com/api/v3/datatables/NASDAQ/NDX",
 ) -> List[str]:
-    """Return current NASDAQ-100 tickers plus optional extras.
+    """Return NASDAQ-100 constituents for a given date plus optional extras.
+
+    Parameters
+    ----------
+    extras : iterable of str, optional
+        Additional tickers to include regardless of index membership.
+    as_of : str or pandas-compatible date, optional
+        Date for which constituents are requested (``YYYY-MM-DD``).  Defaults to
+        today's date.
+    api_url : str
+        Endpoint for NASDAQ Data Link's datatable providing historical
+        constituents.
 
     Notes
     -----
-    - Uses Wikipedia by default; this implies survivorship bias if used for history.
-    - For point-in-time accuracy, replace this with a provider that offers
-      historical constituents.
+    Results are cached by date to avoid repeated network calls.
     """
     extras = list(extras) if extras else []
-    try:
-        resp = requests.get(wikipedia_url, headers={'User-Agent': 'Mozilla/5.0'})
-        tables = pd.read_html(StringIO(resp.text))
-        df = next(
-            t for t in tables
-            if any(col.lower() in {"ticker", "symbol"} for col in map(str, t.columns))
-        )
-        col = "Ticker" if "Ticker" in df.columns else "Symbol"
-        tickers = df[col].astype(str).str.upper().str.strip().tolist()
-        if "SQ" in extras:
-            extras = [x for x in extras if x != "SQ"]  # acquired / renamed
-        full = sorted(set(tickers + extras))
-        return full
-    except Exception:
-        # On failure, just return extras (maybe user passes their own universe)
-        return sorted(set(extras))
+    date_str = pd.to_datetime(as_of or pd.Timestamp.today()).strftime("%Y-%m-%d")
+
+    if date_str not in _NDX_CONSTITUENT_CACHE:
+        try:
+            params = {"date": date_str, "download": "true"}
+            resp = requests.get(api_url, params=params)
+            resp.raise_for_status()
+            df = pd.read_csv(StringIO(resp.text))
+            tickers = df["ticker"].astype(str).str.upper().str.strip().tolist()
+        except Exception:
+            tickers = []
+        _NDX_CONSTITUENT_CACHE[date_str] = tickers
+
+    tickers = _NDX_CONSTITUENT_CACHE.get(date_str, [])
+    if "SQ" in extras:
+        extras = [x for x in extras if x != "SQ"]  # acquired / renamed
+    return sorted(set(tickers + extras))
 
 
 def fetch_market_data(tickers: Iterable[str],
@@ -204,8 +218,13 @@ def build_momentum_weights(monthly_prices: pd.DataFrame, lookback_m: int, top_n:
     return final_w, top
 
 
-def run_backtest_momentum(daily_prices: pd.DataFrame, lookback_m: int = 6,
-                          top_n: int = 15, cap: float = 0.25) -> Tuple[pd.Series, pd.Series]:
+def run_backtest_momentum(
+    daily_prices: pd.DataFrame,
+    lookback_m: int = 6,
+    top_n: int = 15,
+    cap: float = 0.25,
+    get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
+) -> Tuple[pd.Series, pd.Series]:
     """Monthly backtest for the momentum sleeve.
 
     Returns
@@ -224,6 +243,9 @@ def run_backtest_momentum(daily_prices: pd.DataFrame, lookback_m: int = 6,
 
     for dt in mp.index:
         scores = mom.loc[dt].dropna()
+        if get_constituents is not None:
+            members = set(get_constituents(dt))
+            scores = scores.loc[scores.index.intersection(members)]
         scores = scores[scores > 0]
         if scores.empty:
             rets.loc[dt] = 0.0
@@ -236,6 +258,8 @@ def run_backtest_momentum(daily_prices: pd.DataFrame, lookback_m: int = 6,
         w = w / w.sum()
 
         valid = w.index.intersection(future.columns)
+        if get_constituents is not None:
+            valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
         # Turnover as 0.5 * L1 weight change (prev_w = 0 if None)
@@ -305,8 +329,13 @@ def build_predictive_weights(monthly_prices: pd.DataFrame, lookback_m: int,
     return final_w, top
 
 
-def run_backtest_predictive(daily_prices: pd.DataFrame, lookback_m: int = 12,
-                            top_n: int = 10, cap: float = 0.25) -> Tuple[pd.Series, pd.Series]:
+def run_backtest_predictive(
+    daily_prices: pd.DataFrame,
+    lookback_m: int = 12,
+    top_n: int = 10,
+    cap: float = 0.25,
+    get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
+) -> Tuple[pd.Series, pd.Series]:
     """Monthly backtest using predictive stock selection.
 
     At each month-end an AR(1) model is fit for each ticker using the last
@@ -329,6 +358,9 @@ def run_backtest_predictive(daily_prices: pd.DataFrame, lookback_m: int = 12,
     for dt in mp.index:
         hist = mp.loc[:dt]
         scores = predictive_signals(hist, lookback_m)
+        if get_constituents is not None:
+            members = set(get_constituents(dt))
+            scores = scores.loc[scores.index.intersection(members)]
         scores = scores[scores > 0]
         if scores.empty:
             rets.loc[dt] = 0.0
@@ -341,6 +373,8 @@ def run_backtest_predictive(daily_prices: pd.DataFrame, lookback_m: int = 12,
         w = w / w.sum()
 
         valid = w.index.intersection(future.columns)
+        if get_constituents is not None:
+            valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
         aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
@@ -350,8 +384,13 @@ def run_backtest_predictive(daily_prices: pd.DataFrame, lookback_m: int = 12,
     return rets.fillna(0.0), tno.fillna(0.0)
 
 
-def run_backtest_mean_reversion(daily_prices: pd.DataFrame, lookback_days: int = 21,
-                                top_n: int = 5, long_ma_days: int = 200) -> Tuple[pd.Series, pd.Series]:
+def run_backtest_mean_reversion(
+    daily_prices: pd.DataFrame,
+    lookback_days: int = 21,
+    top_n: int = 5,
+    long_ma_days: int = 200,
+    get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
+) -> Tuple[pd.Series, pd.Series]:
     """Monthly backtest for the mean-reversion sleeve with long-term uptrend filter.
 
     Returns
@@ -370,6 +409,9 @@ def run_backtest_mean_reversion(daily_prices: pd.DataFrame, lookback_days: int =
 
     for dt in mp.index:
         quality = mp.loc[dt] > trend.loc[dt]
+        if get_constituents is not None:
+            members = set(get_constituents(dt))
+            quality = quality.loc[quality.index.intersection(members)]
         pool = quality[quality].index
         if len(pool) == 0:
             rets.loc[dt] = 0.0
@@ -390,6 +432,8 @@ def run_backtest_mean_reversion(daily_prices: pd.DataFrame, lookback_days: int =
             continue
         w = pd.Series(1.0 / len(picks), index=picks.index)
         valid = w.index.intersection(future.columns)
+        if get_constituents is not None:
+            valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
         if prev_w is None:
@@ -499,8 +543,12 @@ class HybridConfig:
     tc_bps: float = 0.0  # per monthly rebalance; 10 = 10 bps
 
 
-def run_hybrid_backtest(daily_prices: pd.DataFrame, cfg: HybridConfig = HybridConfig(),
-                        apply_vol_target: bool = False) -> Dict[str, pd.Series]:
+def run_hybrid_backtest(
+    daily_prices: pd.DataFrame,
+    cfg: HybridConfig = HybridConfig(),
+    apply_vol_target: bool = False,
+    get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
+) -> Dict[str, pd.Series]:
     """Run both sleeves, combine, and return a dict of useful Series.
 
     Keys: 'mom_rets', 'mom_turnover', 'mr_rets', 'mr_turnover',
@@ -511,6 +559,7 @@ def run_hybrid_backtest(daily_prices: pd.DataFrame, cfg: HybridConfig = HybridCo
         lookback_m=cfg.momentum_lookback_m,
         top_n=cfg.momentum_top_n,
         cap=cfg.momentum_cap,
+        get_constituents=get_constituents,
     )
 
     mr_rets, mr_tno = run_backtest_mean_reversion(
@@ -518,6 +567,7 @@ def run_hybrid_backtest(daily_prices: pd.DataFrame, cfg: HybridConfig = HybridCo
         lookback_days=cfg.mr_lookback_days,
         top_n=cfg.mr_top_n,
         long_ma_days=cfg.mr_long_ma_days,
+        get_constituents=get_constituents,
     )
 
     hybrid = combine_hybrid(mom_rets, mr_rets, cfg.mom_weight, cfg.mr_weight)
