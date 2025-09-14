@@ -147,10 +147,7 @@ def clean_extreme_moves(
 
     if total_corrections > 0:
         msg = f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks"
-        if info:
-            info(msg)
-        else:
-            logging.info(msg)
+        (info or logging.info)(msg)
 
     return cleaned_df, replaced_mask
 
@@ -203,10 +200,7 @@ def fill_missing_data(
 
     if total_filled > 0:
         msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        if info:
-            info(msg)
-        else:
-            logging.info(msg)
+        (info or logging.info)(msg)
 
     return filled_df, imputed_mask
 
