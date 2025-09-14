@@ -133,9 +133,10 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
                 tol: float = 1e-12) -> pd.Series:
     """Iterative waterfall cap. Preserves proportionality below cap.
 
-    If all names are at cap and excess remains, distributes evenly to avoid
-    infinite loops. After capping, weights are renormalized if their sum
-    deviates from 1 by more than ``tol``.
+    If every name breaches the cap (i.e. no "under-cap" names remain), the
+    function stops redistributing and leaves residual cash rather than forcing
+    further violations.  The final series is renormalized to sum to 1 only when
+    doing so will not exceed the available cap capacity.
     """
     w = weights.copy().astype(float)
     if (w < 0).any():
@@ -143,6 +144,7 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
     if w.sum() == 0:
         return w
     w = w / w.sum()
+
     for _ in range(max_iter):
         over = w > cap
         if not over.any():
@@ -151,11 +153,13 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
         w[over] = cap
         under = ~over
         if w[under].sum() > 0:
-            w[under] += w[under] / w[under].sum() * excess
+            w[under] += (w[under] / w[under].sum()) * excess
         else:
-            # All names at cap; spread excess uniformly
-            w += excess / len(w)
-    if abs(w.sum() - 1.0) > tol:
+            # All names at cap -> no feasible redistribution; leave residual cash.
+            break
+
+    total_capacity = min(len(w), (w > 0).sum()) * cap
+    if total_capacity >= 1 - 1e-12 and abs(w.sum() - 1.0) > tol:
         w = w / w.sum()
     return w
 
@@ -437,10 +441,11 @@ def run_backtest_mean_reversion(
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
         if prev_w is None:
-            tno.loc[dt] = w.abs().sum()
+            # first rebalance: 0.5 * ||w - 0||_1 = 0.5 * sum(w)
+            tno.loc[dt] = 0.5 * w.abs().sum()
         else:
             aligned_prev = prev_w.reindex(w.index).fillna(0)
-            tno.loc[dt] = (w - aligned_prev).abs().sum()
+            tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
