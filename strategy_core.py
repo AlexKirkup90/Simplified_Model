@@ -20,7 +20,7 @@ All functions are deterministic and return pandas objects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Dict, Optional, Tuple, Callable
+from typing import Iterable, List, Dict, Optional, Tuple, Callable, Any
 
 import numpy as np
 import pandas as pd
@@ -622,3 +622,80 @@ def run_hybrid_backtest(
         "hybrid_rets": hybrid,
         "hybrid_equity": equity,
     }
+
+
+def walk_forward_backtest(
+    prices: pd.DataFrame,
+    cfg: HybridConfig,
+    train_years: int = 3,
+    val_years: int = 1,
+) -> Dict[str, Any]:
+    """Run a simple walk-forward backtest and return average metrics.
+
+    The data is split into consecutive ``train_years``/``val_years`` windows.
+    For each window, :func:`run_hybrid_backtest` is evaluated on the combined
+    period but only the validation slice is used to compute performance
+    metrics.  Sharpe and Sortino ratios are computed for each validation
+    slice and then averaged across all windows.
+
+    Parameters
+    ----------
+    prices : DataFrame
+        Daily price data for the universe.
+    cfg : HybridConfig
+        Configuration passed to :func:`run_hybrid_backtest`.
+    train_years : int, default ``3``
+        Length of the in-sample training window in years.
+    val_years : int, default ``1``
+        Length of the out-of-sample validation window in years.
+
+    Returns
+    -------
+    dict
+        Dictionary containing the average ``sharpe`` and ``sortino`` along
+        with per-window metrics under ``windows``.
+    """
+
+    def _metrics(returns: pd.Series) -> Tuple[float, float]:
+        if returns.empty:
+            return float("nan"), float("nan")
+        mean = returns.mean()
+        std = returns.std()
+        sharpe = (
+            (mean * 12) / (std * np.sqrt(12) + 1e-9)
+            if pd.notna(std) and std != 0
+            else float("nan")
+        )
+        downside = returns.copy()
+        downside[downside > 0] = 0
+        d_std = downside.std()
+        sortino = (
+            (mean * 12) / (d_std * np.sqrt(12) + 1e-9)
+            if pd.notna(d_std) and d_std != 0
+            else float("nan")
+        )
+        return float(sharpe), float(sortino)
+
+    start = prices.index.min()
+    end = prices.index.max()
+    start_win = start
+    window_metrics: List[Dict[str, float]] = []
+
+    while True:
+        train_end = start_win + pd.DateOffset(years=train_years)
+        val_end = train_end + pd.DateOffset(years=val_years)
+        if val_end > end:
+            break
+
+        win_prices = prices.loc[start_win:val_end]
+        res = run_hybrid_backtest(win_prices, cfg)
+        val_rets = res["hybrid_rets"][res["hybrid_rets"].index >= train_end]
+        sharpe, sortino = _metrics(val_rets)
+        window_metrics.append({"sharpe": sharpe, "sortino": sortino})
+
+        start_win += pd.DateOffset(years=val_years)
+
+    avg_sharpe = float(np.nanmean([w["sharpe"] for w in window_metrics])) if window_metrics else float("nan")
+    avg_sortino = float(np.nanmean([w["sortino"] for w in window_metrics])) if window_metrics else float("nan")
+
+    return {"sharpe": avg_sharpe, "sortino": avg_sortino, "windows": window_metrics}
