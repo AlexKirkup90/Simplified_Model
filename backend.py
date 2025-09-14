@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 import optimizer
 import strategy_core
-from strategy_core import HybridConfig, cap_weights as sc_cap_weights  # alias to avoid shadowing
+from strategy_core import HybridConfig  # keep import minimal to avoid shadowing
 
 warnings.filterwarnings("ignore")
 
@@ -74,6 +74,16 @@ PARAM_MAP_DEFAULTS = {
     "sector_cap_mid": 0.30,
     "sector_cap_high": 0.25,
 }
+
+def _emit_info(msg: str, info: Callable[[str], None] | None = None) -> None:
+    """Prefer provided info callback, then Streamlit, else logging."""
+    if callable(info):
+        info(msg)
+        return
+    try:
+        st.info(msg)
+    except Exception:
+        logging.info(msg)
 
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
@@ -147,9 +157,10 @@ def clean_extreme_moves(
 
     if total_corrections > 0:
         msg = f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks"
-        (info or st.info)(msg)
+        _emit_info(msg, info)
 
     return cleaned_df, replaced_mask
+
 
 def fill_missing_data(
     prices_df: pd.DataFrame,
@@ -200,12 +211,16 @@ def fill_missing_data(
 
     if total_filled > 0:
         msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        (info or st.info)(msg)
+        _emit_info(msg, info)
 
     return filled_df, imputed_mask
 
+
 def validate_and_clean_market_data(
     prices_df: pd.DataFrame,
+    max_daily_move: float = 0.25,
+    min_price: float = 0.50,
+    max_gap_days: int = 3,
     info: Callable[[str], None] | None = None,
 ) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
     """Comprehensive data validation and cleaning pipeline.
@@ -223,11 +238,13 @@ def validate_and_clean_market_data(
 
     # Step 1: Clean extreme moves
     cleaned_df, replaced_mask = clean_extreme_moves(
-        prices_df, max_daily_move=0.25, min_price=0.50, info=info
+        prices_df, max_daily_move=max_daily_move, min_price=min_price, info=info
     )
 
     # Step 2: Fill missing data gaps
-    filled_df, fill_mask = fill_missing_data(cleaned_df, max_gap_days=3, info=info)
+    filled_df, fill_mask = fill_missing_data(
+        cleaned_df, max_gap_days=max_gap_days, info=info
+    )
 
     imputed_mask = replaced_mask | fill_mask
 
@@ -1740,10 +1757,8 @@ def run_momentum_composite_param(
         valid = [t for t in w.index if t in fwd.columns]
         rets.loc[m] = float((fwd.loc[m, valid] * w.reindex(valid).fillna(0.0)).sum())
 
-        # Turnover (0.5 * L1 distance)
-        tno.loc[m] = 0.5 * float(
-            (w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0)).abs().sum()
-        )
+        # Turnover (0.5 * L1 distance over union of tickers)
+        tno.loc[m] = float(l1_turnover(prev_w, w))
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -1775,20 +1790,17 @@ def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
         leverage = np.nan
         try:
             tkr = yf.Ticker(t)
-            fi = tkr.fast_info
-            profitability = fi.get("returnOnAssets") or fi.get("profitMargins")
-            leverage = fi.get("debtToEquity")
-            info = {}
-            if profitability is None or leverage is None:
-                info = _safe_get_info(tkr)
-            if profitability is None:
-                profitability = info.get("returnOnAssets") or info.get("profitMargins")
+            fi = tkr.fast_info or {}
+            info = _safe_get_info(tkr)
+            profitability = info.get("returnOnAssets") or info.get("profitMargins")
+            leverage = info.get("debtToEquity")
             if leverage is None:
-                leverage = info.get("debtToEquity")
+                leverage = fi.get("debtToEquity")
+            if profitability is None:
+                profitability = fi.get("returnOnAssets") or fi.get("profitMargins")
             if leverage is not None and leverage > 10:
-                # many providers return percentage values
                 leverage = leverage / 100.0
-        except Exception as e:
+        except Exception:
             logging.warning("E01 fundamental data fetch failed", exc_info=True)
         rows.append({"Ticker": t, "profitability": profitability, "leverage": leverage})
     return pd.DataFrame(rows).set_index("Ticker")
@@ -1819,13 +1831,13 @@ def _build_isa_weights_fixed(
     sectors_map: Dict[str, str],
     use_enhanced_features: bool = True,
 ) -> pd.Series:
-    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio.
+    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps)
+    to the final combined portfolio.
 
-    When ``use_enhanced_features`` is True, the raw sleeve weights are further
-    adjusted using risk-parity weights and volatility-aware name caps before the
-    standard hierarchical cap enforcement. Cap trimming doesn't redistribute
-    weight, so any residual cash is scaled back to full exposure at the end of
-    this function.
+    When ``use_enhanced_features`` is True, the raw sleeve weights are blended
+    with risk-parity weights and adjusted by volatility-aware name caps before
+    hierarchical cap enforcement. Cap trimming does **not** redistribute weight;
+    any residual cash is returned to the caller to handle separately.
     """
     monthly = daily_close.resample("M").last()
 
@@ -1868,14 +1880,11 @@ def _build_isa_weights_fixed(
         return combined_raw
 
     if use_enhanced_features:
-        # Apply risk parity weighting
-        rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
-        combined_raw = combined_raw.mul(rp_weights, fill_value=0.0)
-        combined_raw = (
-            combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
-        )
+        rp = risk_parity_weights(daily_close, combined_raw.index.tolist())
+        rp = rp / rp.sum() if rp.sum() > 0 else rp
+        lam = 0.4
+        combined_raw = lam * combined_raw + (1 - lam) * (combined_raw.sum() * rp)
 
-        # Volatility-aware name caps prior to hierarchical cap enforcement
         vol_caps = get_volatility_adjusted_caps(
             combined_raw, daily_close, base_cap=preset.get("mom_cap", 0.25)
         )
@@ -1898,11 +1907,7 @@ def _build_isa_weights_fixed(
         group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
     )
 
-    if final_weights.empty or final_weights.sum() <= 0:
-        return final_weights
-
-    # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
-    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+    return final_weights
 
 def check_constraint_violations(
     weights: pd.Series,
@@ -2081,9 +2086,19 @@ def generate_live_portfolio_isa_monthly(
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
-                prev_w = enforce_caps_iteratively(prev_w, sectors_map, mom_cap, sector_cap)
+                enhanced_map = get_enhanced_sector_map(list(prev_w.index), base_map=sectors_map)
+                group_caps = build_group_caps(enhanced_map)
+                prev_w = enforce_caps_iteratively(
+                    prev_w,
+                    enhanced_map,
+                    mom_cap,
+                    sector_cap,
+                    group_caps=group_caps,
+                )
                 prev_w = prev_w / prev_w.sum()
-                violations = check_constraint_violations(prev_w, sectors_map, mom_cap, sector_cap)
+                violations = check_constraint_violations(
+                    prev_w, sectors_map, mom_cap, sector_cap, group_caps=group_caps
+                )
                 if not violations:
                     decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
                     disp, raw = _format_display(prev_w)

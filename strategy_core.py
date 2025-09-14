@@ -71,7 +71,12 @@ def get_nasdaq_100_plus_tickers(
     if date_str not in _NDX_CONSTITUENT_CACHE:
         try:
             params = {"date": date_str, "download": "true"}
-            resp = requests.get(api_url, params=params)
+            resp = requests.get(
+                api_url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
             resp.raise_for_status()
             df = pd.read_csv(StringIO(resp.text))
             tickers = df["ticker"].astype(str).str.upper().str.strip().tolist()
@@ -222,6 +227,19 @@ def build_momentum_weights(monthly_prices: pd.DataFrame, lookback_m: int, top_n:
     return final_w, top
 
 
+def l1_turnover(prev_w: pd.Series | None, w: pd.Series) -> float:
+    """0.5 × L1 distance between consecutive weight vectors.
+
+    Aligns on the union of tickers so both additions and deletions are counted.
+    """
+    if prev_w is None:
+        return 0.5 * w.abs().sum()
+    union = w.index.union(prev_w.index)
+    aligned_w = w.reindex(union, fill_value=0.0)
+    aligned_prev = prev_w.reindex(union, fill_value=0.0)
+    return 0.5 * (aligned_w - aligned_prev).abs().sum()
+
+
 def run_backtest_momentum(
     daily_prices: pd.DataFrame,
     lookback_m: int = 6,
@@ -253,22 +271,21 @@ def run_backtest_momentum(
         scores = scores[scores > 0]
         if scores.empty:
             rets.loc[dt] = 0.0
-            tno.loc[dt] = 0.0
+            if prev_w is not None:
+                tno.loc[dt] = l1_turnover(prev_w, pd.Series(dtype=float))
+            else:
+                tno.loc[dt] = 0.0
             prev_w = None
             continue
         top = scores.nlargest(top_n)
         raw = top / top.sum()
         w = cap_weights(raw, cap=cap)
-        w = w / w.sum()
 
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-
-        # Turnover as 0.5 * L1 weight change (prev_w = 0 if None)
-        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
-        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+        tno.loc[dt] = l1_turnover(prev_w, w)
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -380,9 +397,7 @@ def run_backtest_predictive(
         if get_constituents is not None:
             valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-
-        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
-        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+        tno.loc[dt] = l1_turnover(prev_w, w)
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -409,7 +424,17 @@ def run_backtest_mean_reversion(
 
     rets = pd.Series(index=mp.index, dtype=float)
     tno = pd.Series(index=mp.index, dtype=float)
-    prev_w = None
+    prev_w: Optional[pd.Series] = None
+
+    # Local fallback if a shared helper isn't available
+    def _l1_turnover(prev_w_: Optional[pd.Series], w_: pd.Series) -> float:
+        if prev_w_ is None or prev_w_.empty:
+            # first rebalance: 0.5 * ||w - 0||_1 = 0.5 * sum(|w|)
+            return float(0.5 * w_.abs().sum())
+        union = w_.index.union(prev_w_.index)
+        a = w_.reindex(union, fill_value=0.0)
+        b = prev_w_.reindex(union, fill_value=0.0)
+        return float(0.5 * (a - b).abs().sum())
 
     for dt in mp.index:
         quality = mp.loc[dt] > trend.loc[dt]
@@ -422,34 +447,38 @@ def run_backtest_mean_reversion(
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         candidates = short.loc[dt, pool].dropna()
         if candidates.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         picks = candidates.nsmallest(top_n)
         if picks.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         w = pd.Series(1.0 / len(picks), index=picks.index)
+
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
-        rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
+        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
 
-        if prev_w is None:
-            # first rebalance: 0.5 * ||w - 0||_1 = 0.5 * sum(w)
-            tno.loc[dt] = 0.5 * w.abs().sum()
-        else:
-            aligned_prev = prev_w.reindex(w.index).fillna(0)
-            tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+        # Use shared helper if you have one; otherwise fallback
+        try:
+            # If strategy_core.l1_turnover is imported, prefer it
+            tno.loc[dt] = l1_turnover(prev_w, w)  # type: ignore[name-defined]
+        except Exception:
+            tno.loc[dt] = _l1_turnover(prev_w, w)
+
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
-
 
 # ------------------------------
 # 4) Hybrid & Benchmarks
