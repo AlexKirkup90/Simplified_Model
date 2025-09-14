@@ -64,7 +64,12 @@ mc_seed_input = st.sidebar.text_input(
     value=str(st.session_state["mc_seed"]),
     help="Controls the random seed for Monte Carlo projections",
 )
-st.session_state["mc_seed"] = int(mc_seed_input) if mc_seed_input.strip() else None
+raw = mc_seed_input.strip()
+try:
+    st.session_state["mc_seed"] = int(raw) if raw else None
+except ValueError:
+    st.session_state["mc_seed"] = None
+    st.sidebar.warning("Monte Carlo seed must be an integer (blank for random).")
 
 # Initialize parameters from presets or prior assessment
 st.session_state.setdefault("stickiness_days", preset.get("stability_days", 7))
@@ -338,11 +343,17 @@ with tab2:
             sectors_map = backend.get_enhanced_sector_map(
                 list(weights.index), base_map=base_map
             )
+            group_caps = backend.build_group_caps(sectors_map)
             violations = backend.check_constraint_violations(
                 weights,
                 sectors_map,
-                name_cap=float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25))),
-                sector_cap=float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))),
+                name_cap=float(
+                    st.session_state.get("name_cap", preset.get("mom_cap", 0.25))
+                ),
+                sector_cap=float(
+                    st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
+                ),
+                group_caps=group_caps,
             )
 
             max_w = weights.max()
