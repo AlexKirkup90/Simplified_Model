@@ -539,6 +539,10 @@ class HybridConfig:
     mr_long_ma_days: int = 200
     mom_weight: float = 0.90
     mr_weight: float = 0.10
+    predictive_lookback_m: int = 12
+    predictive_top_n: int = 10
+    predictive_cap: float = 0.25
+    predictive_weight: float = 0.0
     target_vol_annual: Optional[float] = None  # e.g., 0.15 for 15% target
     tc_bps: float = 0.0  # per monthly rebalance; 10 = 10 bps
 
@@ -549,10 +553,11 @@ def run_hybrid_backtest(
     apply_vol_target: bool = False,
     get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
 ) -> Dict[str, pd.Series]:
-    """Run both sleeves, combine, and return a dict of useful Series.
+    """Run sleeves, blend, and return useful Series.
 
-    Keys: 'mom_rets', 'mom_turnover', 'mr_rets', 'mr_turnover',
-          'hybrid_rets', 'hybrid_equity'
+    Always runs momentum and mean-reversion sleeves.  If
+    ``cfg.predictive_weight`` is greater than zero, the predictive sleeve is
+    also evaluated and included in the final blend.
     """
     mom_rets, mom_tno = run_backtest_momentum(
         daily_prices,
@@ -570,13 +575,35 @@ def run_hybrid_backtest(
         get_constituents=get_constituents,
     )
 
-    hybrid = combine_hybrid(mom_rets, mr_rets, cfg.mom_weight, cfg.mr_weight)
+    pred_rets = pd.Series(dtype=float)
+    pred_tno = pd.Series(dtype=float)
+    if cfg.predictive_weight > 0:
+        pred_rets, pred_tno = run_backtest_predictive(
+            daily_prices,
+            lookback_m=cfg.predictive_lookback_m,
+            top_n=cfg.predictive_top_n,
+            cap=cfg.predictive_cap,
+            get_constituents=get_constituents,
+        )
+
+    idx = mom_rets.index
+    idx = idx.union(mr_rets.index)
+    idx = idx.union(pred_rets.index)
+    hybrid = (
+        cfg.mom_weight * mom_rets.reindex(idx).fillna(0)
+        + cfg.mr_weight * mr_rets.reindex(idx).fillna(0)
+    )
+    if cfg.predictive_weight > 0:
+        hybrid += cfg.predictive_weight * pred_rets.reindex(idx).fillna(0)
 
     # Apply TC
     if cfg.tc_bps != 0:
-        # Approximate portfolio turnover as weighted average of sleeves (not perfect but serviceable)
-        turnover = cfg.mom_weight * mom_tno.reindex(hybrid.index).fillna(0) + \
-                   cfg.mr_weight * mr_tno.reindex(hybrid.index).fillna(0)
+        turnover = (
+            cfg.mom_weight * mom_tno.reindex(idx).fillna(0)
+            + cfg.mr_weight * mr_tno.reindex(idx).fillna(0)
+        )
+        if cfg.predictive_weight > 0:
+            turnover += cfg.predictive_weight * pred_tno.reindex(idx).fillna(0)
         hybrid = apply_tc(hybrid, turnover, tc_bps=cfg.tc_bps)
 
     # Optional vol targeting on combined series
@@ -590,6 +617,8 @@ def run_hybrid_backtest(
         "mom_turnover": mom_tno,
         "mr_rets": mr_rets,
         "mr_turnover": mr_tno,
+        "pred_rets": pred_rets,
+        "pred_turnover": pred_tno,
         "hybrid_rets": hybrid,
         "hybrid_equity": equity,
     }
