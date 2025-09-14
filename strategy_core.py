@@ -266,9 +266,14 @@ def run_backtest_momentum(
             valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
-        # Turnover as 0.5 * L1 weight change (prev_w = 0 if None)
-        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
-        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+        # Turnover as 0.5 * L1 change over the union of tickers
+        if prev_w is None:
+            tno.loc[dt] = 0.5 * w.abs().sum()
+        else:
+            union = w.index.union(prev_w.index)
+            aligned_w = w.reindex(union, fill_value=0)
+            aligned_prev = prev_w.reindex(union, fill_value=0)
+            tno.loc[dt] = 0.5 * (aligned_w - aligned_prev).abs().sum()
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -381,8 +386,13 @@ def run_backtest_predictive(
             valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
 
-        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
-        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+        if prev_w is None:
+            tno.loc[dt] = 0.5 * w.abs().sum()
+        else:
+            union = w.index.union(prev_w.index)
+            aligned_w = w.reindex(union, fill_value=0)
+            aligned_prev = prev_w.reindex(union, fill_value=0)
+            tno.loc[dt] = 0.5 * (aligned_w - aligned_prev).abs().sum()
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -444,8 +454,10 @@ def run_backtest_mean_reversion(
             # first rebalance: 0.5 * ||w - 0||_1 = 0.5 * sum(w)
             tno.loc[dt] = 0.5 * w.abs().sum()
         else:
-            aligned_prev = prev_w.reindex(w.index).fillna(0)
-            tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+            union = w.index.union(prev_w.index)
+            aligned_w = w.reindex(union, fill_value=0)
+            aligned_prev = prev_w.reindex(union, fill_value=0)
+            tno.loc[dt] = 0.5 * (aligned_w - aligned_prev).abs().sum()
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
