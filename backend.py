@@ -75,6 +75,18 @@ PARAM_MAP_DEFAULTS = {
     "sector_cap_high": 0.25,
 }
 
+
+def _emit_info(msg: str, info: Callable[[str], None] | None = None) -> None:
+    """Prefer provided info callback, then Streamlit, else logging."""
+    if callable(info):
+        info(msg)
+        return
+    try:
+        import streamlit as st  # type: ignore
+        st.info(msg)
+    except Exception:
+        logging.info(msg)
+
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
 # =========================
@@ -147,10 +159,7 @@ def clean_extreme_moves(
 
     if total_corrections > 0:
         msg = f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks"
-        if info:
-            info(msg)
-        else:
-            logging.info(msg)
+        _emit_info(msg, info)
 
     return cleaned_df, replaced_mask
 
@@ -204,10 +213,7 @@ def fill_missing_data(
 
     if total_filled > 0:
         msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        if info:
-            info(msg)
-        else:
-            logging.info(msg)
+        _emit_info(msg, info)
 
     return filled_df, imputed_mask
 
