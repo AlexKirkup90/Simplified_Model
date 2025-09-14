@@ -71,7 +71,12 @@ def get_nasdaq_100_plus_tickers(
     if date_str not in _NDX_CONSTITUENT_CACHE:
         try:
             params = {"date": date_str, "download": "true"}
-            resp = requests.get(api_url, params=params)
+            resp = requests.get(
+                api_url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
             resp.raise_for_status()
             df = pd.read_csv(StringIO(resp.text))
             tickers = df["ticker"].astype(str).str.upper().str.strip().tolist()
@@ -133,9 +138,10 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
                 tol: float = 1e-12) -> pd.Series:
     """Iterative waterfall cap. Preserves proportionality below cap.
 
-    If all names are at cap and excess remains, distributes evenly to avoid
-    infinite loops. After capping, weights are renormalized if their sum
-    deviates from 1 by more than ``tol``.
+    If every name breaches the cap (i.e. no "under-cap" names remain), the
+    function stops redistributing and leaves residual cash rather than forcing
+    further violations.  The final series is renormalized to sum to 1 only when
+    doing so will not exceed the available cap capacity.
     """
     w = weights.copy().astype(float)
     if (w < 0).any():
@@ -143,6 +149,7 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
     if w.sum() == 0:
         return w
     w = w / w.sum()
+
     for _ in range(max_iter):
         over = w > cap
         if not over.any():
@@ -151,11 +158,13 @@ def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
         w[over] = cap
         under = ~over
         if w[under].sum() > 0:
-            w[under] += w[under] / w[under].sum() * excess
+            w[under] += (w[under] / w[under].sum()) * excess
         else:
-            # All names at cap; spread excess uniformly
-            w += excess / len(w)
-    if abs(w.sum() - 1.0) > tol:
+            # All names at cap -> no feasible redistribution; leave residual cash.
+            break
+
+    total_capacity = min(len(w), (w > 0).sum()) * cap
+    if total_capacity >= 1 - 1e-12 and abs(w.sum() - 1.0) > tol:
         w = w / w.sum()
     return w
 
@@ -218,6 +227,19 @@ def build_momentum_weights(monthly_prices: pd.DataFrame, lookback_m: int, top_n:
     return final_w, top
 
 
+def l1_turnover(prev_w: pd.Series | None, w: pd.Series) -> float:
+    """0.5 × L1 distance between consecutive weight vectors.
+
+    Aligns on the union of tickers so both additions and deletions are counted.
+    """
+    if prev_w is None:
+        return 0.5 * w.abs().sum()
+    union = w.index.union(prev_w.index)
+    aligned_w = w.reindex(union, fill_value=0.0)
+    aligned_prev = prev_w.reindex(union, fill_value=0.0)
+    return 0.5 * (aligned_w - aligned_prev).abs().sum()
+
+
 def run_backtest_momentum(
     daily_prices: pd.DataFrame,
     lookback_m: int = 6,
@@ -249,22 +271,21 @@ def run_backtest_momentum(
         scores = scores[scores > 0]
         if scores.empty:
             rets.loc[dt] = 0.0
-            tno.loc[dt] = 0.0
+            if prev_w is not None:
+                tno.loc[dt] = 0.5 * prev_w.abs().sum()
+            else:
+                tno.loc[dt] = 0.0
             prev_w = None
             continue
         top = scores.nlargest(top_n)
         raw = top / top.sum()
         w = cap_weights(raw, cap=cap)
-        w = w / w.sum()
 
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-
-        # Turnover as 0.5 * L1 weight change (prev_w = 0 if None)
-        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
-        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+        tno.loc[dt] = l1_turnover(prev_w, w)
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -376,9 +397,7 @@ def run_backtest_predictive(
         if get_constituents is not None:
             valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-
-        aligned_prev = prev_w.reindex(w.index).fillna(0) if prev_w is not None else pd.Series(0, index=w.index)
-        tno.loc[dt] = 0.5 * (w - aligned_prev).abs().sum()
+        tno.loc[dt] = l1_turnover(prev_w, w)
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -435,16 +454,10 @@ def run_backtest_mean_reversion(
         if get_constituents is not None:
             valid = valid.intersection(members)
         rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-
-        if prev_w is None:
-            tno.loc[dt] = w.abs().sum()
-        else:
-            aligned_prev = prev_w.reindex(w.index).fillna(0)
-            tno.loc[dt] = (w - aligned_prev).abs().sum()
+        tno.loc[dt] = l1_turnover(prev_w, w)
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
-
 
 # ------------------------------
 # 4) Hybrid & Benchmarks
