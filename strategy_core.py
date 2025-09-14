@@ -71,7 +71,12 @@ def get_nasdaq_100_plus_tickers(
     if date_str not in _NDX_CONSTITUENT_CACHE:
         try:
             params = {"date": date_str, "download": "true"}
-            resp = requests.get(api_url, params=params)
+            resp = requests.get(
+                api_url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
             resp.raise_for_status()
             df = pd.read_csv(StringIO(resp.text))
             tickers = df["ticker"].astype(str).str.upper().str.strip().tolist()

@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 import optimizer
 import strategy_core
-from strategy_core import HybridConfig, cap_weights as sc_cap_weights  # alias to avoid shadowing
+from strategy_core import HybridConfig
 
 warnings.filterwarnings("ignore")
 
