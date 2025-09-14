@@ -151,6 +151,7 @@ def clean_extreme_moves(
 
     return cleaned_df, replaced_mask
 
+
 def fill_missing_data(
     prices_df: pd.DataFrame,
     max_gap_days: int = 5,
@@ -203,6 +204,7 @@ def fill_missing_data(
         (info or logging.info)(msg)
 
     return filled_df, imputed_mask
+
 
 def validate_and_clean_market_data(
     prices_df: pd.DataFrame,

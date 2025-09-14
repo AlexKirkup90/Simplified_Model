@@ -467,7 +467,6 @@ def run_backtest_mean_reversion(
 
     return rets.fillna(0.0), tno.fillna(0.0)
 
-
 # ------------------------------
 # 4) Hybrid & Benchmarks
 # ------------------------------
