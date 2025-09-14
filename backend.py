@@ -213,7 +213,13 @@ def fill_missing_data(
 
     if total_filled > 0:
         msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        _emit_info(msg, info)
+        try:
+            if info:
+                info(msg)
+            else:
+                st.info(msg)
+        except Exception:
+            logging.info(msg)
 
     return filled_df, imputed_mask
 
