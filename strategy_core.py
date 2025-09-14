@@ -424,7 +424,17 @@ def run_backtest_mean_reversion(
 
     rets = pd.Series(index=mp.index, dtype=float)
     tno = pd.Series(index=mp.index, dtype=float)
-    prev_w = None
+    prev_w: Optional[pd.Series] = None
+
+    # Local fallback if a shared helper isn't available
+    def _l1_turnover(prev_w_: Optional[pd.Series], w_: pd.Series) -> float:
+        if prev_w_ is None or prev_w_.empty:
+            # first rebalance: 0.5 * ||w - 0||_1 = 0.5 * sum(|w|)
+            return float(0.5 * w_.abs().sum())
+        union = w_.index.union(prev_w_.index)
+        a = w_.reindex(union, fill_value=0.0)
+        b = prev_w_.reindex(union, fill_value=0.0)
+        return float(0.5 * (a - b).abs().sum())
 
     for dt in mp.index:
         quality = mp.loc[dt] > trend.loc[dt]
@@ -437,24 +447,35 @@ def run_backtest_mean_reversion(
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         candidates = short.loc[dt, pool].dropna()
         if candidates.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         picks = candidates.nsmallest(top_n)
         if picks.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         w = pd.Series(1.0 / len(picks), index=picks.index)
+
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
-        rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-        tno.loc[dt] = l1_turnover(prev_w, w)
+        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
+
+        # Use shared helper if you have one; otherwise fallback
+        try:
+            # If strategy_core.l1_turnover is imported, prefer it
+            tno.loc[dt] = l1_turnover(prev_w, w)  # type: ignore[name-defined]
+        except Exception:
+            tno.loc[dt] = _l1_turnover(prev_w, w)
+
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
