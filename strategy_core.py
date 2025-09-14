@@ -272,7 +272,7 @@ def run_backtest_momentum(
         if scores.empty:
             rets.loc[dt] = 0.0
             if prev_w is not None:
-                tno.loc[dt] = 0.5 * prev_w.abs().sum()
+                tno.loc[dt] = l1_turnover(prev_w, pd.Series(dtype=float))
             else:
                 tno.loc[dt] = 0.0
             prev_w = None
