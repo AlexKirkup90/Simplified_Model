@@ -1,6 +1,6 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
 import os, io, warnings, json, hashlib
-from typing import Optional, Tuple, Dict, List, Any
+from typing import Optional, Tuple, Dict, List, Any, Callable
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 import optimizer
 import strategy_core
-from strategy_core import HybridConfig
+from strategy_core import HybridConfig, l1_turnover
 
 warnings.filterwarnings("ignore")
 
@@ -24,7 +24,15 @@ warnings.filterwarnings("ignore")
 GIST_ID = st.secrets.get("GIST_ID")
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
 GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}" if GIST_ID else None
-HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+HEADERS = (
+    {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "isa-dynamic/1.0",
+    }
+    if GITHUB_TOKEN
+    else {}
+)
 
 GIST_PORTF_FILE = "portfolio.json"
 LIVE_PERF_FILE  = "live_perf.csv"
@@ -67,6 +75,18 @@ PARAM_MAP_DEFAULTS = {
     "sector_cap_high": 0.25,
 }
 
+
+def _emit_info(msg: str, info: Callable[[str], None] | None = None) -> None:
+    """Prefer provided info callback, then Streamlit, else logging."""
+    if callable(info):
+        info(msg)
+        return
+    try:
+        import streamlit as st  # type: ignore
+        st.info(msg)
+    except Exception:
+        logging.info(msg)
+
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
 # =========================
@@ -75,6 +95,7 @@ def clean_extreme_moves(
     max_daily_move: float = 0.30,
     min_price: float = 1.0,
     zscore_threshold: float = 5.0,
+    info: Callable[[str], None] | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Clean extreme price moves that are likely data errors.
 
@@ -98,11 +119,12 @@ def clean_extreme_moves(
         # Remove prices below minimum (likely stock splits not handled)
         low_price_mask = series < min_price
         if low_price_mask.any():
-            series = series.where(~low_price_mask).ffill()
+            series = series.where(~low_price_mask)
+            series = series.ffill().bfill()
             replaced_mask.loc[low_price_mask, column] = True
             total_corrections += int(low_price_mask.sum())
 
-        while True:
+        for _ in range(50):
             daily_returns = series.pct_change().abs()
             log_returns = np.log(series).diff()
             rolling_mean = log_returns.shift(1).rolling(window=20, min_periods=1).mean()
@@ -136,14 +158,16 @@ def clean_extreme_moves(
         cleaned_df[column] = series
 
     if total_corrections > 0:
-        st.info(
-            f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks"
-        )
+        msg = f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks"
+        _emit_info(msg, info)
 
     return cleaned_df, replaced_mask
 
+
 def fill_missing_data(
-    prices_df: pd.DataFrame, max_gap_days: int = 5
+    prices_df: pd.DataFrame,
+    max_gap_days: int = 5,
+    info: Callable[[str], None] | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Fill missing data gaps with interpolation limited to each gap.
 
@@ -178,13 +202,9 @@ def fill_missing_data(
                 start_idx = series.index.get_loc(gap_indices[0])
                 end_idx = series.index.get_loc(gap_indices[-1])
 
-                prev_price = series.iloc[start_idx - 1] if start_idx > 0 else np.nan
-                next_price = series.iloc[end_idx + 1] if end_idx < len(series) - 1 else np.nan
-
-                if pd.notna(prev_price):
-                    series.loc[gap_indices] = prev_price
-                if series.loc[gap_indices].isna().any() and pd.notna(next_price):
-                    series.loc[gap_indices] = next_price
+                seg = series.iloc[max(0, start_idx - 1) : min(len(series), end_idx + 2)]
+                seg = seg.interpolate(method="linear", limit_direction="both")
+                series.loc[gap_indices] = seg.loc[gap_indices]
 
                 imputed_mask.loc[gap_indices, column] = True
                 total_filled += len(gap_indices)
@@ -192,14 +212,24 @@ def fill_missing_data(
         filled_df[column] = series
 
     if total_filled > 0:
-        st.info(
-            f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        )
+        msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
+        try:
+            if info:
+                info(msg)
+            else:
+                st.info(msg)
+        except Exception:
+            logging.info(msg)
 
     return filled_df, imputed_mask
 
+
 def validate_and_clean_market_data(
     prices_df: pd.DataFrame,
+    max_daily_move: float = 0.25,
+    min_price: float = 0.50,
+    max_gap_days: int = 3,
+    info: Callable[[str], None] | None = None,
 ) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
     """Comprehensive data validation and cleaning pipeline.
 
@@ -216,11 +246,13 @@ def validate_and_clean_market_data(
 
     # Step 1: Clean extreme moves
     cleaned_df, replaced_mask = clean_extreme_moves(
-        prices_df, max_daily_move=0.25, min_price=0.50
+        prices_df, max_daily_move=max_daily_move, min_price=min_price, info=info
     )
 
     # Step 2: Fill missing data gaps
-    filled_df, fill_mask = fill_missing_data(cleaned_df, max_gap_days=3)
+    filled_df, fill_mask = fill_missing_data(
+        cleaned_df, max_gap_days=max_gap_days, info=info
+    )
 
     imputed_mask = replaced_mask | fill_mask
 
@@ -386,7 +418,6 @@ def enforce_caps_iteratively(
     return w
 
 # --- Enhanced sector bucketing -----------------------------------------------
-from typing import Dict, List, Optional
 
 def get_enhanced_sector_map(tickers: list[str], base_map: dict[str, str] | None = None) -> dict[str, str]:
     """
@@ -404,7 +435,7 @@ def get_enhanced_sector_map(tickers: list[str], base_map: dict[str, str] | None 
         "CRWD","ZS","FTNT","PANW","OKTA","S","TENB","NET"
     }
     sec_data_ai = {
-        "PLTR","SNOW","MDB","DDOG","NRTX","AI"  # keep PLTR here
+        "PLTR","SNOW","MDB","DDOG","AI"  # keep PLTR here
     }
     sec_adtech = {"APP","TTD"}
     sec_collab = {"ZM","TEAM"}
@@ -534,8 +565,11 @@ def risk_parity_weights(prices: pd.DataFrame, tickers: List[str], lookback: int 
 # =========================
 # NEW: Signal Decay Modeling
 # =========================
-def apply_signal_decay(momentum_scores: pd.Series, signal_age_days: Any = 0,
-                      half_life: int = 45) -> pd.Series:
+def apply_signal_decay(
+    momentum_scores: pd.Series,
+    signal_age_days: int | float | pd.Series | dict[str, int] = 0,
+    half_life: int = 45,
+) -> pd.Series:
     """Apply exponential decay to momentum signals based on age
 
     Parameters
@@ -806,20 +840,26 @@ def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
 # =========================
 # NEW: Portfolio Correlation Monitoring
 # =========================
-def calculate_portfolio_correlation_to_market(portfolio_returns: pd.Series,
-                                            market_returns: pd.Series = None) -> float:
+def calculate_portfolio_correlation_to_market(
+    portfolio_returns: pd.Series,
+    market_returns: pd.Series = None,
+) -> float:
     """Calculate correlation between portfolio and benchmark.
 
-    Both ``portfolio_returns`` and ``market_returns`` should contain daily (or
-    higher frequency) returns. The series are resampled to monthly returns
-    before computing correlation to reduce high‑frequency noise.
+    Both ``portfolio_returns`` and ``market_returns`` may be at any frequency;
+    the series are resampled to monthly returns before computing correlation to
+    reduce high‑frequency noise.
     """
     if market_returns is None:
         # Fetch QQQ data for correlation
         try:
             end_date = datetime.now().strftime('%Y-%m-%d')
             start_date = (datetime.now() - relativedelta(months=6)).strftime('%Y-%m-%d')
-            qqq_data = yf.download('QQQ', start=start_date, end=end_date, auto_adjust=True, progress=False)['Close']
+            qqq_data = _yf_download(
+                'QQQ',
+                start=start_date,
+                end=end_date,
+            )['Close']
             market_returns = qqq_data.pct_change().dropna()
         except:
             return np.nan
@@ -887,6 +927,17 @@ def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
     for i in range(0, len(tickers), size):
         yield tickers[i : i + size]
 
+
+def _yf_download(tickers, **kwargs):
+    params = dict(auto_adjust=True, progress=False, group_by="column", timeout=10)
+    params.update(kwargs)
+    try:
+        return yf.download(tickers, **params)
+    except TypeError:
+        params.pop("group_by", None)
+        params.pop("timeout", None)
+        return yf.download(tickers, **params)
+
 # =========================
 # Universe builders & sectors (Enhanced with validation)
 # =========================
@@ -895,7 +946,7 @@ def fetch_sp500_constituents() -> List[str]:
     """Get current S&P 500 tickers with fallback to static list."""
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         tables = pd.read_html(StringIO(resp.text))
         df = next(
             t for t in tables
@@ -1032,7 +1083,8 @@ def get_nasdaq_100_plus_tickers() -> List[str]:
     try:
         resp = requests.get(
             "https://en.wikipedia.org/wiki/Nasdaq-100",
-            headers={'User-Agent': 'Mozilla/5.0'}
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10,
         )
         tables = pd.read_html(StringIO(resp.text))
         df = next(
@@ -1141,9 +1193,11 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
         frames: List[pd.DataFrame] = []
         for batch in _chunk_tickers(tickers):
-            df = yf.download(batch, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[
-                "Close"
-            ]
+            df = _yf_download(
+                batch,
+                start=fetch_start,
+                end=end_date,
+            )["Close"]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
@@ -1157,12 +1211,12 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
         # Enhanced data cleaning pipeline
         if not result.empty:
-            cleaned_result, cleaning_alerts, _ = validate_and_clean_market_data(result)
+            cleaned_result, cleaning_alerts, _ = validate_and_clean_market_data(result, info=logging.info)
 
             # Show cleaning summary
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
-                    st.info(f"🧹 Data cleaning: {alert}")
+                    logging.info("Data cleaning: %s", alert)
 
             try:
                 cleaned_result.to_parquet(cache_path)
@@ -1202,9 +1256,11 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
         for batch in _chunk_tickers(tickers):
-            df = yf.download(batch, start=fetch_start, end=end_date, auto_adjust=True, progress=False)[
-                ["Close", "Volume"]
-            ]
+            df = _yf_download(
+                batch,
+                start=fetch_start,
+                end=end_date,
+            )[["Close", "Volume"]]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
             if isinstance(df.columns, pd.MultiIndex):
@@ -1231,7 +1287,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
         # Enhanced data cleaning for prices
         if not close.empty:
-            cleaned_close, close_alerts, _ = validate_and_clean_market_data(close)
+            cleaned_close, close_alerts, _ = validate_and_clean_market_data(close, info=logging.info)
 
             # Clean volume data (less aggressive)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
@@ -1243,7 +1299,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
             if close_alerts:
                 for alert in close_alerts[:1]:  # Show top cleaning action
-                    st.info(f"🧹 Price/Volume cleaning: {alert}")
+                    logging.info("Price/Volume cleaning: %s", alert)
 
             try:
                 pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1).to_parquet(cache_path)
@@ -1271,7 +1327,7 @@ def save_portfolio_to_gist(portfolio_df: pd.DataFrame) -> None:
     try:
         json_content = portfolio_df.to_json(orient="index")
         payload = {"files": {GIST_PORTF_FILE: {"content": json_content}}}
-        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload, timeout=10)
         resp.raise_for_status()
         st.sidebar.success("✅ Successfully saved portfolio to Gist.")
     except Exception as e:
@@ -1333,7 +1389,7 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
     # Gist first
     if GIST_API_URL and GITHUB_TOKEN:
         try:
-            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp = requests.get(GIST_API_URL, headers=HEADERS, timeout=10)
             resp.raise_for_status()
             files = resp.json().get("files", {})
             content = files.get(GIST_PORTF_FILE, {}).get("content", "")
@@ -1709,10 +1765,8 @@ def run_momentum_composite_param(
         valid = [t for t in w.index if t in fwd.columns]
         rets.loc[m] = float((fwd.loc[m, valid] * w.reindex(valid).fillna(0.0)).sum())
 
-        # Turnover (0.5 * L1 distance)
-        tno.loc[m] = 0.5 * float(
-            (w.reindex(prev_w.index, fill_value=0.0) - prev_w.reindex(w.index, fill_value=0.0)).abs().sum()
-        )
+        # Turnover (0.5 * L1 distance over union of tickers)
+        tno.loc[m] = float(l1_turnover(prev_w, w))
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -1744,20 +1798,17 @@ def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
         leverage = np.nan
         try:
             tkr = yf.Ticker(t)
-            fi = tkr.fast_info
-            profitability = fi.get("returnOnAssets") or fi.get("profitMargins")
-            leverage = fi.get("debtToEquity")
-            info = {}
-            if profitability is None or leverage is None:
-                info = _safe_get_info(tkr)
-            if profitability is None:
-                profitability = info.get("returnOnAssets") or info.get("profitMargins")
+            fi = tkr.fast_info or {}
+            info = _safe_get_info(tkr)
+            profitability = info.get("returnOnAssets") or info.get("profitMargins")
+            leverage = info.get("debtToEquity")
             if leverage is None:
-                leverage = info.get("debtToEquity")
+                leverage = fi.get("debtToEquity")
+            if profitability is None:
+                profitability = fi.get("returnOnAssets") or fi.get("profitMargins")
             if leverage is not None and leverage > 10:
-                # many providers return percentage values
                 leverage = leverage / 100.0
-        except Exception as e:
+        except Exception:
             logging.warning("E01 fundamental data fetch failed", exc_info=True)
         rows.append({"Ticker": t, "profitability": profitability, "leverage": leverage})
     return pd.DataFrame(rows).set_index("Ticker")
@@ -1788,13 +1839,13 @@ def _build_isa_weights_fixed(
     sectors_map: Dict[str, str],
     use_enhanced_features: bool = True,
 ) -> pd.Series:
-    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps) to the final combined portfolio.
+    """Apply position sizing + hierarchical caps (name/sector + Software sub-caps)
+    to the final combined portfolio.
 
-    When ``use_enhanced_features`` is True, the raw sleeve weights are further
-    adjusted using risk-parity weights and volatility-aware name caps before the
-    standard hierarchical cap enforcement. Cap trimming doesn't redistribute
-    weight, so any residual cash is scaled back to full exposure at the end of
-    this function.
+    When ``use_enhanced_features`` is True, the raw sleeve weights are blended
+    with risk-parity weights and adjusted by volatility-aware name caps before
+    hierarchical cap enforcement. Cap trimming does **not** redistribute weight;
+    any residual cash is returned to the caller to handle separately.
     """
     monthly = daily_close.resample("M").last()
 
@@ -1837,14 +1888,11 @@ def _build_isa_weights_fixed(
         return combined_raw
 
     if use_enhanced_features:
-        # Apply risk parity weighting
-        rp_weights = risk_parity_weights(daily_close, combined_raw.index.tolist())
-        combined_raw = combined_raw.mul(rp_weights, fill_value=0.0)
-        combined_raw = (
-            combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
-        )
+        rp = risk_parity_weights(daily_close, combined_raw.index.tolist())
+        rp = rp / rp.sum() if rp.sum() > 0 else rp
+        lam = 0.4
+        combined_raw = lam * combined_raw + (1 - lam) * (combined_raw.sum() * rp)
 
-        # Volatility-aware name caps prior to hierarchical cap enforcement
         vol_caps = get_volatility_adjusted_caps(
             combined_raw, daily_close, base_cap=preset.get("mom_cap", 0.25)
         )
@@ -1867,11 +1915,7 @@ def _build_isa_weights_fixed(
         group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
     )
 
-    if final_weights.empty or final_weights.sum() <= 0:
-        return final_weights
-
-    # Keep weights summing to 1 across equities (cash is whatever is left at the portfolio level)
-    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+    return final_weights
 
 def check_constraint_violations(
     weights: pd.Series,
@@ -2050,9 +2094,19 @@ def generate_live_portfolio_isa_monthly(
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
-                prev_w = enforce_caps_iteratively(prev_w, sectors_map, mom_cap, sector_cap)
+                enhanced_map = get_enhanced_sector_map(list(prev_w.index), base_map=sectors_map)
+                group_caps = build_group_caps(enhanced_map)
+                prev_w = enforce_caps_iteratively(
+                    prev_w,
+                    enhanced_map,
+                    mom_cap,
+                    sector_cap,
+                    group_caps=group_caps,
+                )
                 prev_w = prev_w / prev_w.sum()
-                violations = check_constraint_violations(prev_w, sectors_map, mom_cap, sector_cap)
+                violations = check_constraint_violations(
+                    prev_w, sectors_map, mom_cap, sector_cap, group_caps=group_caps
+                )
                 if not violations:
                     decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
                     disp, raw = _format_display(prev_w)
@@ -2137,9 +2191,16 @@ def run_backtest_isa_dynamic(
     mom_weight: Optional[float] = None,
     mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
+    apply_quality_filter: bool = False,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
     Enhanced ISA-Dynamic hybrid backtest with new features.
+
+    Parameters
+    ----------
+    apply_quality_filter: bool, optional
+        If True, filter the universe using *current* fundamentals. Leave False
+        during historical backtests to avoid look-ahead bias.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -2165,15 +2226,18 @@ def run_backtest_isa_dynamic(
     daily = close.drop(columns=["QQQ"])
     qqq  = close["QQQ"]
 
-    # Fundamental quality filter
-    min_prof = st.session_state.get("min_profitability", 0.0)
-    max_lev = st.session_state.get("max_leverage", 2.0)
-    fundamentals = fetch_fundamental_metrics(daily.columns.tolist())
-    keep = fundamental_quality_filter(fundamentals, min_profitability=min_prof, max_leverage=max_lev)
-    if not keep:
-        return None, None, None, None
-    daily = daily[keep]
-    sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
+    # Fundamental quality filter (optional to avoid look-ahead bias in backtests)
+    if apply_quality_filter:
+        min_prof = st.session_state.get("min_profitability", 0.0)
+        max_lev = st.session_state.get("max_leverage", 2.0)
+        fundamentals = fetch_fundamental_metrics(daily.columns.tolist())
+        keep = fundamental_quality_filter(
+            fundamentals, min_profitability=min_prof, max_leverage=max_lev
+        )
+        if not keep:
+            return None, None, None, None
+        daily = daily[keep]
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
 
     if any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
         cfg, opt_sector_cap = optimize_hybrid_strategy(daily)
@@ -2381,8 +2445,10 @@ def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
     """
     for attempt in range(2):
         try:
-            data = yf.download(
-                ticker, start=start, end=end, auto_adjust=True, progress=False
+            data = _yf_download(
+                ticker,
+                start=start,
+                end=end,
             )
             try:
                 px = data["Close"]
@@ -2494,8 +2560,11 @@ def select_optimal_universe(as_of: date | None = None) -> str:
     # Proxy ETFs for each universe
     etfs = {"NASDAQ100+": "QQQ", "S&P500 (All)": "SPY", "Hybrid Top150": "SPY"}
     try:
-        data = yf.download(list(set(etfs.values())), start=start, end=end,
-                            auto_adjust=True, progress=False)["Close"]
+        data = _yf_download(
+            list(set(etfs.values())),
+            start=start,
+            end=end,
+        )["Close"]
         if isinstance(data, pd.Series):
             data = data.to_frame()
     except Exception:
@@ -2625,7 +2694,7 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
 def load_assess_log() -> pd.DataFrame:
     if GIST_API_URL and GITHUB_TOKEN:
         try:
-            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp = requests.get(GIST_API_URL, headers=HEADERS, timeout=10)
             resp.raise_for_status()
             files = resp.json().get("files", {})
             content = files.get(ASSESS_LOG_FILE, {}).get("content", "")
@@ -2643,7 +2712,7 @@ def save_assess_log(df: pd.DataFrame) -> None:
     try:
         csv_str = df.to_csv(index=False)
         payload = {"files": {ASSESS_LOG_FILE: {"content": csv_str}}}
-        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload, timeout=10)
         resp.raise_for_status()
     except Exception as e:
         st.sidebar.warning(f"Could not save assessment log: {e}")
@@ -2855,7 +2924,7 @@ def diagnose_strategy_issues(current_returns: pd.Series,
 def load_live_perf() -> pd.DataFrame:
     if GIST_API_URL and GITHUB_TOKEN:
         try:
-            resp = requests.get(GIST_API_URL, headers=HEADERS)
+            resp = requests.get(GIST_API_URL, headers=HEADERS, timeout=10)
             resp.raise_for_status()
             files = resp.json().get("files", {})
             content = files.get(LIVE_PERF_FILE, {}).get("content", "")
@@ -2874,7 +2943,7 @@ def save_live_perf(df: pd.DataFrame) -> None:
     try:
         csv_str = df.to_csv(index=False)
         payload = {"files": {LIVE_PERF_FILE: {"content": csv_str}}}
-        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload)
+        resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload, timeout=10)
         resp.raise_for_status()
     except Exception as e:
         st.sidebar.warning(f"Could not save live perf: {e}")
