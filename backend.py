@@ -2941,7 +2941,7 @@ def diagnose_strategy_issues(current_returns: pd.Series,
         issues.append("No significant issues detected")
     
     return issues
-
+                               
 # =========================
 # TRUST CHECKS (Signal, Construction, Health)
 # =========================
