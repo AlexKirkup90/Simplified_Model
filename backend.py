@@ -59,7 +59,7 @@ STRATEGY_PRESETS = {
     }
 }
 
-# Default mapping from regime metrics to strategy parameters.  These
+# Default mapping from regime metrics to strategy parameters. These
 # values are recalibrated periodically by ``update_parameter_mapping``.
 PARAM_MAP_DEFAULTS = {
     "low_vol": 0.02,
@@ -2183,9 +2183,16 @@ def run_backtest_isa_dynamic(
     mom_weight: Optional[float] = None,
     mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
+    apply_quality_filter: bool = False,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
     Enhanced ISA-Dynamic hybrid backtest with new features.
+
+    Parameters
+    ----------
+    apply_quality_filter: bool, optional
+        If True, filter the universe using *current* fundamentals. Leave False
+        during historical backtests to avoid look-ahead bias.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -2211,15 +2218,18 @@ def run_backtest_isa_dynamic(
     daily = close.drop(columns=["QQQ"])
     qqq  = close["QQQ"]
 
-    # Fundamental quality filter
-    min_prof = st.session_state.get("min_profitability", 0.0)
-    max_lev = st.session_state.get("max_leverage", 2.0)
-    fundamentals = fetch_fundamental_metrics(daily.columns.tolist())
-    keep = fundamental_quality_filter(fundamentals, min_profitability=min_prof, max_leverage=max_lev)
-    if not keep:
-        return None, None, None, None
-    daily = daily[keep]
-    sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
+    # Fundamental quality filter (optional to avoid look-ahead bias in backtests)
+    if apply_quality_filter:
+        min_prof = st.session_state.get("min_profitability", 0.0)
+        max_lev = st.session_state.get("max_leverage", 2.0)
+        fundamentals = fetch_fundamental_metrics(daily.columns.tolist())
+        keep = fundamental_quality_filter(
+            fundamentals, min_profitability=min_prof, max_leverage=max_lev
+        )
+        if not keep:
+            return None, None, None, None
+        daily = daily[keep]
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
 
     if any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
         cfg, opt_sector_cap = optimize_hybrid_strategy(daily)

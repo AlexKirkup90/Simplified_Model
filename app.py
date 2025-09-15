@@ -508,7 +508,18 @@ with tab3:
         monthly_net = monthly_net[monthly_net.index >= pd.Timestamp("2017-07-01")]
 
         monthly_net_df = pd.DataFrame(monthly_net, columns=["Net Return (%)"])
-        monthly_net_df.index = monthly_net_df.index.strftime("%Y-%m")
+
+        # Robust index formatting: handle Datetime/Period or pre-formatted strings
+        idx = monthly_net_df.index
+        if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
+            monthly_net_df.index = idx.strftime("%Y-%m")
+        else:
+            parsed = pd.to_datetime(idx, errors="coerce")
+            if parsed.notna().all():
+                monthly_net_df.index = parsed.strftime("%Y-%m")
+            else:
+                monthly_net_df.index = pd.Index(idx.astype(str))
+
         st.dataframe(monthly_net_df.round(2), use_container_width=True)
 
         csv_bytes = monthly_net_df.round(4).to_csv().encode("utf-8")

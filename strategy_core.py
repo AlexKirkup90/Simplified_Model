@@ -469,12 +469,15 @@ def run_backtest_mean_reversion(
             valid = valid.intersection(members)
         rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
 
-        # Use shared helper if you have one; otherwise fallback
-        try:
-            # If strategy_core.l1_turnover is imported, prefer it
-            tno.loc[dt] = l1_turnover(prev_w, w)  # type: ignore[name-defined]
-        except Exception:
-            tno.loc[dt] = _l1_turnover(prev_w, w)
+        # Robust 0.5 * L1 turnover (handles changing universes)
+        if prev_w is None:
+            # first rebalance
+            tno.loc[dt] = 0.5 * w.abs().sum()
+        else:
+            union = w.index.union(prev_w.index)
+            aligned_w = w.reindex(union, fill_value=0.0)
+            aligned_prev = prev_w.reindex(union, fill_value=0.0)
+            tno.loc[dt] = 0.5 * (aligned_w - aligned_prev).abs().sum()
 
         prev_w = w
 
