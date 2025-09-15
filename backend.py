@@ -838,38 +838,70 @@ def calculate_portfolio_correlation_to_market(
 ) -> float:
     """Calculate correlation between portfolio and benchmark.
 
-    Both ``portfolio_returns`` and ``market_returns`` may be at any frequency;
-    the series are resampled to monthly returns before computing correlation to
-    reduce high‑frequency noise.
+    Both series may be at any frequency; we downsample to monthly first when
+    a datetime-like index is available to reduce high-frequency noise.
     """
-    if market_returns is None:
-        # Fetch QQQ data for correlation
-        try:
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - relativedelta(months=6)).strftime('%Y-%m-%d')
-            qqq_data = _yf_download(
-                'QQQ',
-                start=start_date,
-                end=end_date,
-            )['Close']
-            market_returns = qqq_data.pct_change().dropna()
-        except:
-            return np.nan
 
-    # Resample to common monthly frequency
-    port_monthly = (1 + portfolio_returns.dropna()).resample('M').prod() - 1
-    market_monthly = (1 + market_returns.dropna()).resample('M').prod() - 1
+    def _to_monthly_returns(r: pd.Series) -> pd.Series:
+        """Convert an arbitrary-return series to monthly returns if possible.
+        If index isn't datetime-like and can't be coerced, return as-is."""
+        r = pd.Series(r).astype(float).dropna()
+        if r.empty:
+            return r
 
-    # Align periods
-    common_dates = port_monthly.index.intersection(market_monthly.index)
-    if len(common_dates) < 3:  # Need minimum periods
+        idx = r.index
+        # Coerce to DatetimeIndex when possible
+        if not isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
+            try:
+                coerced = pd.to_datetime(idx, errors="coerce")
+                mask = ~coerced.isna()
+                if mask.any():
+                    r = r.loc[mask]
+                    r.index = coerced[mask]
+                else:
+                    # Cannot coerce -> return without resampling
+                    return r
+            except Exception:
+                return r
+
+        # Normalize PeriodIndex to Timestamp for resampling
+        if isinstance(r.index, pd.PeriodIndex):
+            r.index = r.index.to_timestamp()
+
+        # Now safe to resample monthly
+        return (1.0 + r).groupby(pd.Grouper(freq="M")).prod() - 1.0
+
+    # Portfolio series
+    port = pd.Series(portfolio_returns).astype(float).dropna()
+    if port.empty:
         return np.nan
 
-    port_aligned = port_monthly.reindex(common_dates)
-    market_aligned = market_monthly.reindex(common_dates)
+    # Market series (fetch QQQ if not provided)
+    if market_returns is None:
+        try:
+            end = datetime.now()
+            start = end - relativedelta(months=9)
+            qqq_px = get_benchmark_series("QQQ", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+            mkt = qqq_px.pct_change().dropna()
+        except Exception:
+            return np.nan
+    else:
+        mkt = pd.Series(market_returns).astype(float).dropna()
 
-    correlation = port_aligned.corr(market_aligned)
-    return correlation if not pd.isna(correlation) else 0.0
+    # Downsample to monthly when possible
+    port_m = _to_monthly_returns(port)
+    mkt_m  = _to_monthly_returns(mkt)
+
+    if port_m.empty or mkt_m.empty:
+        return np.nan
+
+    # Align and require enough overlap
+    common = port_m.index.intersection(mkt_m.index)
+    if len(common) < 3:
+        return np.nan
+
+    corr = port_m.reindex(common).corr(mkt_m.reindex(common))
+    return float(corr) if pd.notna(corr) else np.nan
 
 # =========================
 # NEW: QQQ Hedge Builder
