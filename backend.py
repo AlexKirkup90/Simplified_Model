@@ -2943,6 +2943,168 @@ def diagnose_strategy_issues(current_returns: pd.Series,
     return issues
 
 # =========================
+# TRUST CHECKS (Signal, Construction, Health)
+# =========================
+def summarize_signal_alignment(metrics: Dict[str, float]) -> Dict[str, Any]:
+    """Quick pass/fail style view for regime vs market reality."""
+    if not metrics:
+        return {"ok": False, "reason": "no-metrics", "checks": {}}
+
+    breadth    = float(metrics.get("breadth_pos_6m", np.nan))
+    qqq_above  = float(metrics.get("qqq_above_200dma", np.nan))
+    vol10      = float(metrics.get("qqq_vol_10d", np.nan))
+    vix_ts     = float(metrics.get("vix_term_structure", np.nan))
+    regime_lbl = str(metrics.get("regime", "Unknown"))
+
+    checks = {
+        "qqq_above_200dma": (qqq_above >= 1.0),
+        "breadth_ok": (not np.isnan(breadth) and breadth >= 0.50),
+        "vol_ok": (not np.isnan(vol10) and vol10 < 0.03),
+        "vix_ts_ok": (not np.isnan(vix_ts) and vix_ts >= 1.0),  # contango-ish
+    }
+
+    # If labeled Strong Risk-On, require stricter tests
+    if "strong" in regime_lbl.lower():
+        checks["breadth_strong"] = (not np.isnan(breadth) and breadth >= 0.60)
+        checks["vol_strong"] = (not np.isnan(vol10) and vol10 < 0.025)
+
+    ok = all(v is True for v in checks.values())
+    return {"ok": ok, "reason": regime_lbl, "checks": checks}
+
+
+def summarize_portfolio_construction(
+    weights: pd.Series | None,
+    sectors_map: Dict[str, str] | None,
+    name_cap: float,
+    sector_cap: float,
+    turnover_series: pd.Series | None = None,
+) -> Dict[str, Any]:
+    """Caps, exposure, turnover sanity."""
+    out = {"ok": True, "issues": [], "stats": {}}
+    if weights is None or len(weights) == 0:
+        out["ok"] = False
+        out["issues"].append("no-weights")
+        return out
+
+    w = pd.Series(weights).dropna().astype(float)
+    total_exp = float(w.sum())
+    max_w = float(w.max()) if len(w) else 0.0
+
+    # Constraint violations (uses your existing checker)
+    violations = []
+    if sectors_map:
+        try:
+            violations = check_constraint_violations(
+                w, sectors_map, name_cap=name_cap, sector_cap=sector_cap, group_caps=None
+            )
+        except Exception:
+            violations = []
+    if violations:
+        out["ok"] = False
+        out["issues"].extend(violations)
+
+    # Turnover — use last 12M mean if available
+    tpy = None
+    if turnover_series is not None and len(turnover_series) > 0:
+        try:
+            ts = pd.Series(turnover_series).dropna()
+            if len(ts) >= 6:
+                tpy = float(ts.tail(12).sum() / max(1, len(ts.tail(12)) / 1.0))  # monthly sum avg
+        except Exception:
+            tpy = None
+
+    out["stats"] = {
+        "total_equity_exposure": total_exp,
+        "max_name_weight": max_w,
+        "avg_turnover_last_12m": tpy,
+    }
+
+    # Heuristics
+    if total_exp <= 0.50:
+        out["issues"].append("low-exposure")
+        out["ok"] = False
+    if max_w > max(0.35, name_cap + 0.10):  # hard stop if crazy
+        out["issues"].append(f"max-name-weight {max_w:.2%} too high")
+        out["ok"] = False
+    if tpy is not None and tpy > 1.0:  # >100% monthly (0.5*L1 def)
+        out["issues"].append("excessive-turnover")
+        out["ok"] = False
+
+    return out
+
+
+def summarize_health(
+    monthly_returns: pd.Series,
+    benchmark_monthly_returns: pd.Series | None = None,
+) -> Dict[str, Any]:
+    """Wraps your existing health calc + adds rolling correlation guard."""
+    if monthly_returns is None or len(monthly_returns) == 0:
+        return {"ok": False, "issues": ["no-returns"], "stats": {}}
+
+    stats = get_strategy_health_metrics(monthly_returns, benchmark_monthly_returns)
+
+    corr = stats.get("benchmark_correlation", np.nan)
+    rolling_ok = (np.isnan(corr) or corr < 0.85)  # not a closet tracker
+    issues = []
+    if not rolling_ok:
+        issues.append("high-benchmark-correlation")
+
+    # Drawdown guardrails
+    dd = stats.get("current_drawdown", 0.0)
+    if dd < -0.30:
+        issues.append("large-drawdown")
+
+    ok = len(issues) == 0
+    return {"ok": ok, "issues": issues, "stats": stats}
+
+
+def run_trust_checks(
+    weights_df: pd.DataFrame | None,
+    metrics: Dict[str, float] | None,
+    turnover_series: pd.Series | None,
+    name_cap: float,
+    sector_cap: float,
+) -> Dict[str, Any]:
+    """Convenience wrapper used by the app tab."""
+    # Weights
+    weights = None
+    sectors_map = None
+    try:
+        if weights_df is not None and "Weight" in weights_df.columns:
+            weights = weights_df["Weight"].astype(float)
+            base_map = get_sector_map(list(weights.index))
+            sectors_map = get_enhanced_sector_map(list(weights.index), base_map=base_map)
+    except Exception:
+        pass
+
+    # 1) Signal alignment
+    sig = summarize_signal_alignment(metrics or {})
+
+    # 2) Portfolio construction
+    constr = summarize_portfolio_construction(weights, sectors_map, name_cap, sector_cap, turnover_series)
+
+    # 3) Health (use the same series you show in Performance tab)
+    # Pull what the app saved in session
+    base_cum = st.session_state.get("strategy_cum_net") or st.session_state.get("strategy_cum_gross")
+    qqq_cum  = st.session_state.get("qqq_cum")
+
+    def _to_monthly(series):
+        if series is None or len(series) == 0:
+            return pd.Series(dtype=float)
+        r = pd.Series(series).pct_change().dropna()
+        r.index = pd.to_datetime(r.index, errors="coerce")
+        r = r[~r.index.isna()]
+        return (1 + r).resample("M").prod() - 1
+
+    health = summarize_health(
+        _to_monthly(base_cum),
+        _to_monthly(qqq_cum) if qqq_cum is not None else None
+    )
+
+    score = sum(int(x["ok"]) for x in (sig, constr, health))
+    return {"score": score, "signal": sig, "construction": constr, "health": health}
+
+# =========================
 # Live performance tracking (Enhanced)
 # =========================
 def load_live_perf() -> pd.DataFrame:
