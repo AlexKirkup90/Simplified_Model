@@ -164,8 +164,8 @@ go = st.button("Generate Portfolio & Backtest", type="primary", use_container_wi
 # ---------------------------
 # Enhanced Tabs
 # ---------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["📊 Rebalancing Plan", "✅ Current Portfolio", "📈 Performance", "🧭 Regime", "🔎 Changes", "🏥 Strategy Health"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["📊 Rebalancing Plan", "✅ Current Portfolio", "📈 Performance", "🧭 Regime", "🔎 Changes", "🏥 Strategy Health", "🧪 Trust Checks"]
 )
 
 # Placeholders to reuse below
