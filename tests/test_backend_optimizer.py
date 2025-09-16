@@ -48,41 +48,38 @@ def test_run_backtest_isa_dynamic_uses_bayesian_optimizer(monkeypatch):
 
     monkeypatch.setattr(strategy_core, "run_hybrid_backtest", fake_run_hybrid_backtest)
 
-# Dummy optimizer outputs (Bayesian-style)
-dummy_cfg = backend.HybridConfig(
-    momentum_top_n=2,
-    momentum_cap=0.40,
-    mr_top_n=4,
-    mom_weight=0.60,
-    mr_weight=0.40,
-)
+    # Dummy optimizer outputs (Bayesian-style)
+    dummy_cfg = backend.HybridConfig(
+        momentum_top_n=2,
+        momentum_cap=0.40,
+        mr_top_n=4,
+        mom_weight=0.60,
+        mr_weight=0.40,
+    )
 
-diagnostics = pd.DataFrame(
-    [
-        {"momentum_top_n": 2, "momentum_cap": 0.40, "mom_weight": 0.60, "mr_weight": 0.40, "sharpe": 1.23},
-        {"momentum_top_n": 5, "momentum_cap": 0.25, "mom_weight": 0.70, "mr_weight": 0.30, "sharpe": 0.90},
-    ]
-)
+    diagnostics = pd.DataFrame(
+        [
+            {"momentum_top_n": 2, "momentum_cap": 0.40, "mom_weight": 0.60, "mr_weight": 0.40, "sharpe": 1.23},
+            {"momentum_top_n": 5, "momentum_cap": 0.25, "mom_weight": 0.70, "mr_weight": 0.30, "sharpe": 0.90},
+        ]
+    )
 
-# Capture kwargs if you want to assert on them later
-captured = {}
+    def fake_bayes_opt(prices, **kwargs):
+        captured["optimizer_kwargs"] = kwargs
+        return dummy_cfg, diagnostics
 
-def fake_bayes_opt(prices, **kwargs):
-    captured["optimizer_kwargs"] = kwargs
-    return dummy_cfg, diagnostics
+    # Patch the optimizer entry point used by backend
+    monkeypatch.setattr(backend.optimizer, "bayesian_optimize_hybrid", fake_bayes_opt, raising=True)
 
-# Patch the optimizer entry point used by backend
-monkeypatch.setattr(backend.optimizer, "bayesian_optimize_hybrid", fake_bayes_opt, raising=True)
-
-# Keep ancillary patches from main branch for deterministic tests
-monkeypatch.setattr(backend, "compute_regime_metrics", lambda *args, **kwargs: {}, raising=True)
-monkeypatch.setattr(backend, "build_hedge_weight", lambda *args, **kwargs: 0.0, raising=True)
-monkeypatch.setattr(
-    backend,
-    "calculate_portfolio_correlation_to_market",
-    lambda *args, **kwargs: 0.0,
-    raising=True,
-)
+    # Keep ancillary patches from main branch for deterministic tests
+    monkeypatch.setattr(backend, "compute_regime_metrics", lambda *args, **kwargs: {}, raising=True)
+    monkeypatch.setattr(backend, "build_hedge_weight", lambda *args, **kwargs: 0.0, raising=True)
+    monkeypatch.setattr(
+        backend,
+        "calculate_portfolio_correlation_to_market",
+        lambda *args, **kwargs: 0.0,
+        raising=True,
+    )
 
     st.session_state["min_profitability"] = 0.0
     st.session_state["max_leverage"] = 10.0
@@ -97,6 +94,18 @@ monkeypatch.setattr(
     ) = backend.run_backtest_isa_dynamic(auto_optimize=True, roundtrip_bps=15.0)
 
     cfg = captured["cfg"]
+    assert isinstance(cfg, backend.HybridConfig)
+    assert cfg.tc_bps == 15.0
+    assert captured.get("apply_vol_target") is False
+
+    assert isinstance(best_cfg, backend.HybridConfig)
+    assert best_cfg == dummy_cfg
+    pd.testing.assert_frame_equal(search_diag, diagnostics)
+
+    optimizer_kwargs = captured.get("optimizer_kwargs", {})
+    assert optimizer_kwargs.get("tc_bps") == 15.0
+
+
 def test_run_backtest_isa_dynamic_with_auto_opt(monkeypatch):
     # Minimal dummy data for backtest plumbing
     dates = pd.date_range("2020-01-01", periods=10, freq="D")
