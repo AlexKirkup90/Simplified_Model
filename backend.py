@@ -1,9 +1,17 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
+from __future__ import annotations
+
 import os, io, warnings, json, hashlib
 from typing import Optional, Tuple, Dict, List, Any, Callable
 from dataclasses import replace
 import numpy as np
 import pandas as pd
+try:  # optional acceleration library
+    import polars as pl  # type: ignore
+    _HAS_POLARS = True
+except ImportError:  # pragma: no cover - optional dependency
+    pl = None  # type: ignore
+    _HAS_POLARS = False
 import yfinance as yf
 import requests
 from io import StringIO
@@ -114,6 +122,8 @@ _YF_BATCH_SIZE = 200
 
 PERF: Dict[str, Any] = {
     "fast_io": True,
+    # Enable the optional polars-backed compute path for faster signal generation
+    # by setting this flag to True (requires the polars package).
     "use_polars": False,
     "parallel_grid": False,
     "n_jobs": 4,
@@ -262,6 +272,226 @@ def linear_interpolate_short_gaps(
             imputed_mask.loc[idx_slice, column] = True
 
     return filled, imputed_mask
+
+
+def _use_polars_engine() -> bool:
+    """Return True when the optimized polars path should be used."""
+    return bool(PERF.get("use_polars") and _HAS_POLARS and pl is not None)
+
+
+def _prepare_polars_daily_frame(daily: pd.DataFrame) -> tuple["pl.DataFrame", list[str]]:
+    """Convert a pandas daily price frame into a polars DataFrame and column list."""
+    if not _use_polars_engine():  # pragma: no cover - guarded by caller
+        raise RuntimeError("polars is not available")
+
+    if isinstance(daily.index, pd.DatetimeIndex):
+        daily_sorted = daily.sort_index()
+        if daily_sorted.index.tz is not None:
+            daily_sorted = daily_sorted.copy()
+            daily_sorted.index = daily_sorted.index.tz_localize(None)
+    else:
+        daily_sorted = daily.sort_index()
+
+    idx_name = daily_sorted.index.name or "date"
+    daily_reset = daily_sorted.reset_index().rename(columns={idx_name: "date"})
+    pl_df = pl.from_pandas(daily_reset)
+    if "date" in pl_df.columns and pl_df["date"].dtype != pl.Datetime:
+        pl_df = pl_df.with_columns(pl.col("date").cast(pl.Datetime))
+
+    value_cols = [col for col in pl_df.columns if col != "date"]
+    return pl_df.sort("date"), value_cols
+
+
+def _polars_to_pandas_indexed(df: "pl.DataFrame") -> pd.DataFrame:
+    """Convert a polars frame with a date column back to a pandas DataFrame index."""
+    if df.height == 0:
+        return pd.DataFrame()
+    pdf = df.to_pandas()
+    if "date" in pdf.columns:
+        pdf["date"] = pd.to_datetime(pdf["date"])
+        pdf = pdf.set_index("date")
+    return pdf.sort_index()
+
+
+def _polars_zscore_from_last_row(frame: "pl.DataFrame", columns: list[str]) -> pd.Series:
+    """Compute a z-score from the final row of a polars DataFrame."""
+    if not columns:
+        return pd.Series(dtype=float)
+    if frame.height == 0:
+        return pd.Series(0.0, index=columns)
+
+    last_row = frame.select([pl.col(col) for col in columns]).tail(1)
+    if last_row.height == 0:
+        return pd.Series(0.0, index=columns)
+
+    melted = last_row.melt(variable_name="ticker", value_name="value")
+    filtered = melted.filter(
+        pl.col("value").is_not_null()
+        & pl.col("value").is_not_nan()
+        & pl.col("value").is_finite()
+    )
+
+    if filtered.height == 0:
+        return pd.Series(0.0, index=columns)
+
+    values = filtered["value"]
+    std = values.std(ddof=0)
+    if std is None or std == 0 or (isinstance(std, float) and np.isnan(std)):
+        return pd.Series(0.0, index=columns)
+
+    mean = values.mean()
+    z_values = (values - mean) / (std + 1e-9)
+    z_map = dict(zip(filtered["ticker"].to_list(), z_values.to_list()))
+    return pd.Series([float(z_map.get(col, 0.0)) for col in columns], index=columns, dtype=float)
+
+
+def _polars_frame_from_series(
+    series: pd.Series | "pl.Series", columns: list[str]
+) -> "pl.DataFrame | None":
+    """Create a single-row polars frame from a 1-D series aligned to ``columns``."""
+    if not _use_polars_engine():
+        return None
+
+    if isinstance(series, pd.Series):
+        aligned = series.reindex(columns)
+        data = {col: [aligned.get(col, np.nan)] for col in columns}
+        return pl.DataFrame(data)
+
+    if _HAS_POLARS and isinstance(series, pl.Series):
+        values = series.to_list()
+        data = {
+            col: [values[idx] if idx < len(values) else None]
+            for idx, col in enumerate(columns)
+        }
+        return pl.DataFrame(data)
+
+    return None
+
+
+def _prepare_polars_matrix(
+    data: pd.DataFrame | "pl.DataFrame",
+) -> tuple["pl.DataFrame | None", list[str]]:
+    """Coerce ``data`` into a polars DataFrame alongside the usable column list."""
+    if not _use_polars_engine():
+        return None, []
+
+    if isinstance(data, pd.DataFrame):
+        df_sorted = data.sort_index()
+        return pl.from_pandas(df_sorted), list(df_sorted.columns)
+
+    if _HAS_POLARS and isinstance(data, pl.DataFrame):
+        frame = data.sort("date") if "date" in data.columns else data
+        columns = [col for col in frame.columns if col != "date"]
+        if not columns and "date" not in frame.columns:
+            columns = frame.columns
+        return frame, list(columns)
+
+    return None, []
+
+
+def _blended_momentum_z_polars(
+    monthly: pd.DataFrame | "pl.DataFrame",
+) -> pd.Series | None:
+    if not _use_polars_engine():
+        return None
+
+    monthly_pl, columns = _prepare_polars_matrix(monthly)
+    if monthly_pl is None:
+        return None
+    if monthly_pl.height < 13:
+        return pd.Series(dtype=float)
+    if not columns:
+        return pd.Series(dtype=float)
+
+    def _returns(period: int) -> "pl.DataFrame":
+        return monthly_pl.select(
+            [
+                ((pl.col(col) / pl.col(col).shift(period)) - 1).alias(col)
+                for col in columns
+            ]
+        )
+
+    r3 = _polars_zscore_from_last_row(_returns(3), columns)
+    r6 = _polars_zscore_from_last_row(_returns(6), columns)
+    r12 = _polars_zscore_from_last_row(_returns(12), columns)
+
+    return (
+        0.2 * r3.add(0.0, fill_value=0.0)
+        + 0.4 * r6.add(0.0, fill_value=0.0)
+        + 0.4 * r12.add(0.0, fill_value=0.0)
+    )
+
+
+def _lowvol_z_polars(
+    daily: pd.DataFrame | "pl.DataFrame",
+    vol_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series | None:
+    if not _use_polars_engine():
+        return None
+
+    daily_pl, columns = _prepare_polars_matrix(daily) if daily is not None else (None, [])
+
+    if vol_series is not None:
+        if not columns and isinstance(vol_series, pd.Series):
+            columns = list(vol_series.index)
+        elif not columns and _HAS_POLARS and isinstance(vol_series, pl.Series):
+            columns = [str(idx) for idx in range(len(vol_series))]
+
+        frame = _polars_frame_from_series(vol_series, columns)
+        if frame is None:
+            return None
+        return _polars_zscore_from_last_row(frame, columns)
+
+    if daily_pl is None:
+        return None
+    if not columns:
+        return pd.Series(dtype=float)
+    if daily_pl.height < 80:
+        return pd.Series(0.0, index=columns)
+
+    returns_pl = daily_pl.select(
+        [((pl.col(col) / pl.col(col).shift(1)) - 1).alias(col) for col in columns]
+    )
+    vol_pl = returns_pl.select(
+        [pl.col(col).rolling_std(window_size=63).alias(col) for col in columns]
+    )
+    return _polars_zscore_from_last_row(vol_pl, columns)
+
+
+def _trend_z_polars(
+    daily: pd.DataFrame | "pl.DataFrame",
+    dist_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series | None:
+    if not _use_polars_engine():
+        return None
+
+    daily_pl, columns = _prepare_polars_matrix(daily) if daily is not None else (None, [])
+
+    if dist_series is not None:
+        if not columns and isinstance(dist_series, pd.Series):
+            columns = list(dist_series.index)
+        elif not columns and _HAS_POLARS and isinstance(dist_series, pl.Series):
+            columns = [str(idx) for idx in range(len(dist_series))]
+
+        frame = _polars_frame_from_series(dist_series, columns)
+        if frame is None:
+            return None
+        return _polars_zscore_from_last_row(frame, columns)
+
+    if daily_pl is None:
+        return None
+    if not columns:
+        return pd.Series(dtype=float)
+    if daily_pl.height < 220:
+        return pd.Series(0.0, index=columns)
+
+    dist_pl = daily_pl.select(
+        [
+            ((pl.col(col) / pl.col(col).rolling_mean(window_size=200)) - 1).alias(col)
+            for col in columns
+        ]
+    )
+    return _polars_zscore_from_last_row(dist_pl, columns)
 
 
 # =========================
@@ -1198,7 +1428,20 @@ def parallel_yf_download(tickers, start, end, slices: int = 2):
     except Exception:
         slices = 2
 
-    if slices <= 1 or Parallel is None or delayed is None:
+    try:
+        if len(tickers) <= 1:
+            slices = 1
+    except TypeError:
+        slices = max(1, slices)
+
+    download_mod = getattr(getattr(yf, "download", None), "__module__", "")
+
+    if (
+        slices <= 1
+        or Parallel is None
+        or delayed is None
+        or "yfinance" not in str(download_mod)
+    ):
         return _yf_download(tickers, start=start, end=end)
 
     try:
@@ -1217,7 +1460,7 @@ def parallel_yf_download(tickers, start, end, slices: int = 2):
         n_jobs_cfg = 1
     n_jobs = max(1, min(len(pairs), n_jobs_cfg))
 
-    parts = Parallel(n_jobs=n_jobs)(
+    parts = Parallel(n_jobs=n_jobs, backend="threading")(
         delayed(_yf_download)(tickers, start=s, end=e) for s, e in pairs
     )
 
@@ -2007,6 +2250,83 @@ def kpi_row(name: str,
 # =========================
 # Composite Signals (mom + trend + lowvol) + Stickiness (Enhanced)
 # =========================
+def _compute_signal_panels_polars(
+    daily: pd.DataFrame,
+) -> Dict[str, pd.DataFrame | pd.Series]:
+    pl_daily, value_cols = _prepare_polars_daily_frame(daily)
+
+    if not value_cols:
+        empty_df = pd.DataFrame(index=daily.index)
+        return {
+            "monthly": empty_df,
+            "r3": empty_df,
+            "r6": empty_df,
+            "r12": empty_df,
+            "vol63": empty_df,
+            "ma200": empty_df,
+            "dist200": empty_df,
+        }
+
+    monthly_pl = (
+        pl_daily.groupby_dynamic(
+            "date", every="1mo", period="1mo", label="right", closed="right"
+        )
+        .agg([pl.col(col).last().alias(col) for col in value_cols])
+        .sort("date")
+    )
+
+    def _shift_returns(period: int) -> "pl.DataFrame":
+        return pl_daily.select(
+            [pl.col("date")]
+            + [
+                ((pl.col(col) / pl.col(col).shift(period)) - 1).alias(col)
+                for col in value_cols
+            ]
+        )
+
+    r3_pl = _shift_returns(63)
+    r6_pl = _shift_returns(126)
+    r12_pl = _shift_returns(252)
+
+    daily_returns_pl = pl_daily.select(
+        [pl.col("date")]
+        + [((pl.col(col) / pl.col(col).shift(1)) - 1).alias(col) for col in value_cols]
+    )
+    vol63_pl = daily_returns_pl.select(
+        [pl.col("date")]
+        + [pl.col(col).rolling_std(window_size=63).alias(col) for col in value_cols]
+    )
+    ma200_pl = pl_daily.select(
+        [pl.col("date")]
+        + [pl.col(col).rolling_mean(window_size=200).alias(col) for col in value_cols]
+    )
+    dist200_pl = pl_daily.select(
+        [pl.col("date")]
+        + [
+            ((pl.col(col) / pl.col(col).rolling_mean(window_size=200)) - 1).alias(col)
+            for col in value_cols
+        ]
+    )
+
+    monthly = _polars_to_pandas_indexed(monthly_pl)
+    r3 = _polars_to_pandas_indexed(r3_pl)
+    r6 = _polars_to_pandas_indexed(r6_pl)
+    r12 = _polars_to_pandas_indexed(r12_pl)
+    vol63 = _polars_to_pandas_indexed(vol63_pl)
+    ma200 = _polars_to_pandas_indexed(ma200_pl)
+    dist200 = _polars_to_pandas_indexed(dist200_pl).replace([np.inf, -np.inf], np.nan)
+
+    return {
+        "monthly": monthly,
+        "r3": r3,
+        "r6": r6,
+        "r12": r12,
+        "vol63": vol63,
+        "ma200": ma200,
+        "dist200": dist200,
+    }
+
+
 @st.cache_data(ttl=43200)
 def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
     """Cache common signal inputs derived from daily close data."""
@@ -2021,6 +2341,12 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
             "ma200": empty_df,
             "dist200": empty_df,
         }
+
+    if _use_polars_engine():
+        try:
+            return _compute_signal_panels_polars(daily)
+        except Exception:
+            logging.exception("Falling back to pandas signal panel computation")
 
     daily_sorted = daily.sort_index()
     monthly = daily_sorted.resample("M").last()
@@ -2043,42 +2369,118 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
     }
 
 
-def blended_momentum_z(monthly: pd.DataFrame) -> pd.Series:
-    if monthly.shape[0] < 13: return pd.Series(dtype=float)
-    r3, r6, r12 = monthly.pct_change(3).iloc[-1], monthly.pct_change(6).iloc[-1], monthly.pct_change(12).iloc[-1]
-    def z(s, cols):
-        s = s.replace([np.inf,-np.inf], np.nan).dropna()
-        if s.empty or s.std(ddof=0)==0: return pd.Series(0.0, index=cols)
-        return ((s - s.mean()) / (s.std(ddof=0) + 1e-9)).reindex(cols).fillna(0.0)
-    cols = monthly.columns
-    return 0.2*z(r3,cols) + 0.4*z(r6,cols) + 0.4*z(r12,cols)
+def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
+    if monthly is None:
+        return pd.Series(dtype=float)
 
-def lowvol_z(daily: pd.DataFrame, vol_series: pd.Series | None = None) -> pd.Series:
+    if _use_polars_engine():
+        try:
+            result = _blended_momentum_z_polars(monthly)
+            if result is not None:
+                return result
+        except Exception:
+            logging.exception("Falling back to pandas blended momentum computation")
+
+    if _HAS_POLARS and isinstance(monthly, pl.DataFrame):
+        monthly = monthly.to_pandas()
+
+    if not isinstance(monthly, pd.DataFrame) or monthly.shape[0] < 13:
+        return pd.Series(dtype=float)
+
+    monthly_sorted = monthly.sort_index()
+    r3 = monthly_sorted.pct_change(3).iloc[-1]
+    r6 = monthly_sorted.pct_change(6).iloc[-1]
+    r12 = monthly_sorted.pct_change(12).iloc[-1]
+
+    def z(s: pd.Series, cols: pd.Index | list[str]) -> pd.Series:
+        clean = s.replace([np.inf, -np.inf], np.nan).dropna()
+        if clean.empty or clean.std(ddof=0) == 0:
+            return pd.Series(0.0, index=cols)
+        return ((clean - clean.mean()) / (clean.std(ddof=0) + 1e-9)).reindex(cols).fillna(0.0)
+
+    cols = monthly_sorted.columns
+    return 0.2 * z(r3, cols) + 0.4 * z(r6, cols) + 0.4 * z(r12, cols)
+
+def lowvol_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    vol_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    if _use_polars_engine():
+        try:
+            result = _lowvol_z_polars(daily, vol_series)
+            if result is not None:
+                return result
+        except Exception:
+            logging.exception("Falling back to pandas low-volatility computation")
+
+    if _HAS_POLARS and isinstance(daily, pl.DataFrame):
+        daily = daily.to_pandas()
+    if _HAS_POLARS and isinstance(vol_series, pl.Series):
+        vol_series = vol_series.to_pandas()
+
     if vol_series is not None:
+        if not isinstance(daily, pd.DataFrame):
+            return pd.Series(dtype=float)
         vol = vol_series.replace([np.inf, -np.inf], np.nan).dropna()
         if vol.empty or vol.std(ddof=0) == 0:
             return pd.Series(0.0, index=daily.columns)
         z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
         return z.reindex(daily.columns).fillna(0.0)
 
-    if daily.shape[0] < 80: return pd.Series(0.0, index=daily.columns)
-    vol = daily.pct_change().rolling(63).std().iloc[-1].replace([np.inf,-np.inf], np.nan).dropna()
-    if vol.empty or vol.std(ddof=0)==0: return pd.Series(0.0, index=daily.columns)
+    if not isinstance(daily, pd.DataFrame):
+        return pd.Series(dtype=float)
+    if daily.shape[0] < 80:
+        return pd.Series(0.0, index=daily.columns)
+
+    vol = (
+        daily.pct_change()
+        .rolling(63)
+        .std()
+        .iloc[-1]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if vol.empty or vol.std(ddof=0) == 0:
+        return pd.Series(0.0, index=daily.columns)
     z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
     return z.reindex(daily.columns).fillna(0.0)
 
-def trend_z(daily: pd.DataFrame, dist_series: pd.Series | None = None) -> pd.Series:
+def trend_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    dist_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    if _use_polars_engine():
+        try:
+            result = _trend_z_polars(daily, dist_series)
+            if result is not None:
+                return result
+        except Exception:
+            logging.exception("Falling back to pandas trend computation")
+
+    if _HAS_POLARS and isinstance(daily, pl.DataFrame):
+        daily = daily.to_pandas()
+    if _HAS_POLARS and isinstance(dist_series, pl.Series):
+        dist_series = dist_series.to_pandas()
+
     if dist_series is not None:
+        if not isinstance(daily, pd.DataFrame):
+            return pd.Series(dtype=float)
         dist = dist_series.replace([np.inf, -np.inf], np.nan).dropna()
         if dist.empty or dist.std(ddof=0) == 0:
             return pd.Series(0.0, index=daily.columns)
         z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
         return z.reindex(daily.columns).fillna(0.0)
 
-    if daily.shape[0] < 220: return pd.Series(0.0, index=daily.columns)
-    ma200 = daily.rolling(200).mean().iloc[-1]; last = daily.iloc[-1]
-    dist = (last/ma200 - 1).replace([np.inf,-np.inf], np.nan).dropna()
-    if dist.empty or dist.std(ddof=0)==0: return pd.Series(0.0, index=daily.columns)
+    if not isinstance(daily, pd.DataFrame):
+        return pd.Series(dtype=float)
+    if daily.shape[0] < 220:
+        return pd.Series(0.0, index=daily.columns)
+
+    ma200 = daily.rolling(200).mean().iloc[-1]
+    last = daily.iloc[-1]
+    dist = (last / ma200 - 1).replace([np.inf, -np.inf], np.nan).dropna()
+    if dist.empty or dist.std(ddof=0) == 0:
+        return pd.Series(0.0, index=daily.columns)
     z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
     return z.reindex(daily.columns).fillna(0.0)
 
