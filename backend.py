@@ -83,10 +83,17 @@ def _emit_info(msg: str, info: Callable[[str], None] | None = None) -> None:
         info(msg)
         return
     try:
-import streamlit as st  # type: ignore
+    import streamlit as st  # type: ignore
+except ImportError:
+    st = None
+
+try:
+    if st is not None:
         st.info(msg)
-    except Exception:
+    else:
         logging.info(msg)
+except Exception:
+    logging.info(msg)
 
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
