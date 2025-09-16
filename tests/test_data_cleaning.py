@@ -37,7 +37,7 @@ def test_fill_missing_data():
     idx = pd.date_range("2024-01-01", periods=3, freq="D")
     df = pd.DataFrame({"A": [1.0, None, 3.0]}, index=idx)
 
-    filled, fill_mask, cap_mask = backend.fill_missing_data(
+    filled, fill_mask = backend.fill_missing_data(
         df, max_gap_days=3, info=lambda msg: messages.append(msg)
     )
 
@@ -46,9 +46,6 @@ def test_fill_missing_data():
 
     expected_mask = pd.DataFrame({"A": [False, True, False]}, index=idx)
     pd.testing.assert_frame_equal(fill_mask, expected_mask)
-
-    expected_cap_mask = pd.DataFrame({"A": [False, False, False]}, index=idx)
-    pd.testing.assert_frame_equal(cap_mask, expected_cap_mask)
 
     assert messages == ["🔧 Data filling: Filled 1 missing data points with interpolation"]
 
@@ -64,22 +61,22 @@ def test_validate_and_clean_market_data():
         },
         index=idx,
     )
-    cleaned, alerts, fill_mask, cap_mask = backend.validate_and_clean_market_data(
+    cleaned, alerts, cap_mask, interp_mask = backend.validate_and_clean_market_data(
         df, info=lambda msg: messages.append(msg)
     )
 
     expected = pd.DataFrame({"A": [1.0, 1.0, 1.3, 1.0, 1.0]}, index=idx)
     pd.testing.assert_frame_equal(cleaned, expected)
 
-    expected_fill_mask = pd.DataFrame(
-        {"A": [False, False, False, False, True]}, index=idx
-    )
-    pd.testing.assert_frame_equal(fill_mask, expected_fill_mask)
-
     expected_cap_mask = pd.DataFrame(
         {"A": [False, False, True, False, False]}, index=idx
     )
     pd.testing.assert_frame_equal(cap_mask, expected_cap_mask)
+
+    expected_interp_mask = pd.DataFrame(
+        {"A": [False, False, False, False, True]}, index=idx
+    )
+    pd.testing.assert_frame_equal(interp_mask, expected_interp_mask)
 
     assert alerts == [
         "Removed 1 stocks with >20% missing data",

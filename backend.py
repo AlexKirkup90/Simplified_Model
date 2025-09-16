@@ -238,7 +238,6 @@ def linear_interpolate_short_gaps(
 # =========================
 # Data cleaning helpers (robust capping + interpolation)
 # =========================
-from typing import Optional, Callable, Tuple, List
 
 def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
     """Robust location/scale (median & MAD*1.4826) with sane fallbacks."""
@@ -369,6 +368,7 @@ def clean_extreme_moves(
 
     # Apply a basic floor first
     cleaned = prices.copy()
+    floor_mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
     if min_price is not None:
         floor_mask = (cleaned < min_price) & cleaned.notna()
         if floor_mask.any().any():
@@ -382,11 +382,15 @@ def clean_extreme_moves(
         min_price=min_price,
     )
 
-    fixes = int(cap_mask.values.sum())
+    cap_mask = cap_mask.astype(bool).reindex_like(cleaned).fillna(False)
+    floor_mask = floor_mask.astype(bool)
+    combined_mask = (cap_mask | floor_mask).astype(bool)
+
+    fixes = int(combined_mask.to_numpy().sum())
     if callable(info) and fixes > 0:
         info(f"🧹 Data cleaning: Fixed {fixes} extreme price moves across all stocks")
 
-    return capped, cap_mask.astype(bool)
+    return capped, combined_mask
 
 
 def fill_missing_data(
@@ -417,18 +421,18 @@ def validate_and_clean_market_data(
     zscore_threshold: float | None = 4.0,
     max_gap_days: int = 3,
     info: Optional[Callable[[str], None]] = None,
-) -> tuple[pd.DataFrame, List[str], pd.DataFrame]:
+) -> tuple[pd.DataFrame, List[str], pd.DataFrame, pd.DataFrame]:
     """
     Full validation + cleaning pipeline:
       1) Drop tickers with too much missing data
       2) Cap extreme moves (robust z/MAD + optional hard cap)
       3) Interpolate short gaps on levels
-    Returns: (cleaned_df, alerts_list, combined_mask)
+    Returns: (cleaned_df, alerts_list, cap_mask, interp_mask)
     """
     if prices is None or prices.empty:
         empty = pd.DataFrame(index=getattr(prices, "index", []))
         empty_mask = pd.DataFrame(False, index=empty.index, columns=[])
-        return empty, [], empty_mask
+        return empty, [], empty_mask.copy(), empty_mask.copy()
 
     data = prices.copy()
     alerts: List[str] = []
@@ -447,7 +451,7 @@ def validate_and_clean_market_data(
 
     if data.empty:
         mask = pd.DataFrame(False, index=prices.index, columns=data.columns)
-        return data, alerts, mask
+        return data, alerts, mask.copy(), mask.copy()
 
     # 2) Cap extreme moves
     cleaned, mask_clean = clean_extreme_moves(
@@ -465,8 +469,10 @@ def validate_and_clean_market_data(
         info=info,
     )
 
-    combined_mask = (mask_clean | mask_fill).astype(bool)
-    return filled, alerts, combined_mask
+    cap_mask = mask_clean.reindex_like(filled).fillna(False).astype(bool)
+    interp_mask = mask_fill.reindex_like(filled).fillna(False).astype(bool)
+
+    return filled, alerts, cap_mask, interp_mask
   
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
@@ -1430,147 +1436,6 @@ def _prepare_universe_for_backtest(
     return close, vol, sectors_map, label
 
 # =========================
-# Data cleaning helpers
-# =========================
-def clean_extreme_moves(
-    prices: pd.DataFrame,
-    max_daily_move: float = 0.30,
-    min_price: float = 0.5,
-    zscore_threshold: float = 4.0,
-    info: Optional[Callable[[str], None]] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Clamp implausible price swings and return the cleaned data with a mask."""
-
-    if prices is None or prices.empty:
-        empty_mask = pd.DataFrame(
-            False,
-            index=getattr(prices, "index", []),
-            columns=getattr(prices, "columns", []),
-        )
-        empty = prices.copy() if hasattr(prices, "copy") else pd.DataFrame()
-        return empty, empty_mask
-
-    cleaned = prices.copy()
-    floor_mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
-
-    if min_price is not None:
-        floor_mask = (cleaned < min_price) & cleaned.notna()
-        if floor_mask.any().any():
-            cleaned[floor_mask] = float(min_price)
-
-    capped, cap_mask = cap_abnormal_returns(
-        cleaned,
-        max_daily_move=max_daily_move,
-        zscore_threshold=zscore_threshold,
-        min_price=min_price,
-    )
-
-    cap_mask = cap_mask.astype(bool).reindex_like(cleaned).fillna(False)
-    floor_mask = floor_mask.astype(bool).reindex_like(cleaned).fillna(False)
-    combined_mask = (cap_mask | floor_mask).astype(bool)
-
-    fixes = int(combined_mask.to_numpy().sum())
-    if fixes > 0:
-        msg = f"🧹 Data cleaning: Fixed {fixes} extreme price moves across all stocks"
-        _emit_info(msg, info)
-
-    return capped, combined_mask
-
-
-def fill_missing_data(
-    prices: pd.DataFrame,
-    max_gap_days: int = 3,
-    info: Optional[Callable[[str], None]] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Interpolate short gaps on price levels and return the filled data and masks."""
-
-    if prices is None or prices.empty:
-        empty = prices.copy() if hasattr(prices, "copy") else pd.DataFrame()
-        empty_mask = pd.DataFrame(
-            False,
-            index=getattr(prices, "index", []),
-            columns=getattr(prices, "columns", []),
-        )
-        return empty, empty_mask, empty_mask.copy()
-
-    filled, interp_mask = linear_interpolate_short_gaps(prices, max_gap=max_gap_days)
-    interp_mask = interp_mask.reindex_like(filled).fillna(False).astype(bool)
-
-    filled_points = int(interp_mask.to_numpy().sum())
-    if filled_points > 0:
-        msg = f"🔧 Data filling: Filled {filled_points} missing data points with interpolation"
-        _emit_info(msg, info)
-
-    cap_mask = pd.DataFrame(False, index=filled.index, columns=filled.columns)
-    return filled, interp_mask, cap_mask
-
-
-def validate_and_clean_market_data(
-    prices: pd.DataFrame,
-    *,
-    max_missing_ratio: float = 0.20,
-    max_daily_move: float = 0.30,
-    min_price: float = 0.5,
-    zscore_threshold: float | None = 4.0,
-    max_gap_days: int = 3,
-    info: Optional[Callable[[str], None]] = None,
-) -> Tuple[pd.DataFrame, List[str], pd.DataFrame, pd.DataFrame]:
-    """Run the full cleaning pipeline and return the cleaned data plus masks."""
-
-    if prices is None or prices.empty:
-        empty = prices.copy() if hasattr(prices, "copy") else pd.DataFrame()
-        empty_mask = pd.DataFrame(
-            False,
-            index=getattr(prices, "index", []),
-            columns=getattr(prices, "columns", []),
-        )
-        return empty, [], empty_mask.copy(), empty_mask.copy()
-
-    data = prices.copy()
-    alerts: List[str] = []
-    original_shape = data.shape
-
-    if max_missing_ratio is not None and data.shape[1] > 0:
-        miss_frac = data.isna().mean()
-        drop_cols = miss_frac[miss_frac > max_missing_ratio].index.tolist()
-        if drop_cols:
-            data = data.drop(columns=drop_cols)
-            alerts.append(
-                f"Removed {len(drop_cols)} stocks with >{int(round(max_missing_ratio * 100))}% missing data"
-            )
-    else:
-        drop_cols = []
-
-    if data.shape != original_shape:
-        alerts.append(f"Data shape: {original_shape} → {data.shape}")
-
-    if data.empty:
-        empty_mask = pd.DataFrame(False, index=prices.index, columns=data.columns)
-        return data, alerts, empty_mask.copy(), empty_mask.copy()
-
-    cleaned, cap_mask = clean_extreme_moves(
-        data,
-        max_daily_move=max_daily_move,
-        min_price=min_price,
-        zscore_threshold=zscore_threshold if zscore_threshold is not None else None,
-        info=info,
-    )
-
-    filled, fill_mask, fill_cap_mask = fill_missing_data(
-        cleaned,
-        max_gap_days=max_gap_days,
-        info=info,
-    )
-
-    cap_mask = cap_mask.reindex_like(filled).fillna(False)
-    fill_mask = fill_mask.reindex_like(filled).fillna(False)
-    fill_cap_mask = fill_cap_mask.reindex_like(filled).fillna(False)
-    combined_cap_mask = (cap_mask | fill_cap_mask).astype(bool)
-
-    return filled, alerts, fill_mask.astype(bool), combined_cap_mask
-
-
-# =========================
 # Data fetching (cache) - Enhanced with validation
 # =========================
 from typing import List, Tuple
@@ -1706,37 +1571,58 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 # =========================
 def save_portfolio_to_gist(portfolio_df: pd.DataFrame) -> None:
     if not GIST_API_URL or not GITHUB_TOKEN:
-        st.sidebar.warning("Gist secrets not configured; skipping Gist save.")
+        if _HAS_ST:
+            st.sidebar.warning("Gist secrets not configured; skipping Gist save.")
+        else:
+            logging.warning("Gist secrets not configured; skipping Gist save.")
         return
     try:
         json_content = portfolio_df.to_json(orient="index")
         payload = {"files": {GIST_PORTF_FILE: {"content": json_content}}}
         resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload, timeout=10)
         resp.raise_for_status()
-        st.sidebar.success("✅ Successfully saved portfolio to Gist.")
+        if _HAS_ST:
+            st.sidebar.success("✅ Successfully saved portfolio to Gist.")
+        else:
+            logging.info("Successfully saved portfolio to Gist.")
     except Exception as e:
-        st.sidebar.error(f"Gist save failed: {e}")
+        if _HAS_ST:
+            st.sidebar.error(f"Gist save failed: {e}")
+        else:
+            logging.error("Gist save failed: %s", e)
 
 def load_previous_portfolio() -> Optional[pd.DataFrame]:
     def _process(df: pd.DataFrame, source: str) -> Optional[pd.DataFrame]:
         """Normalize weights and check constraints. Return None if invalid."""
         if "Weight" not in df.columns:
-            st.sidebar.warning(f"Discarded {source} portfolio: missing 'Weight' column")
+            if _HAS_ST:
+                st.sidebar.warning(f"Discarded {source} portfolio: missing 'Weight' column")
+            else:
+                logging.warning("Discarded %s portfolio: missing 'Weight' column", source)
             return None
 
         try:
             weights = pd.to_numeric(df["Weight"], errors="coerce")
         except Exception:
-            st.sidebar.warning(f"Discarded {source} portfolio: non-numeric weights")
+            if _HAS_ST:
+                st.sidebar.warning(f"Discarded {source} portfolio: non-numeric weights")
+            else:
+                logging.warning("Discarded %s portfolio: non-numeric weights", source)
             return None
 
         if weights.isna().any():
-            st.sidebar.warning(f"Discarded {source} portfolio: non-numeric weights")
+            if _HAS_ST:
+                st.sidebar.warning(f"Discarded {source} portfolio: non-numeric weights")
+            else:
+                logging.warning("Discarded %s portfolio: non-numeric weights", source)
             return None
 
         total = weights.sum()
         if not np.isfinite(total) or total <= 0:
-            st.sidebar.warning(f"Discarded {source} portfolio: normalization failed")
+            if _HAS_ST:
+                st.sidebar.warning(f"Discarded {source} portfolio: normalization failed")
+            else:
+                logging.warning("Discarded %s portfolio: normalization failed", source)
             return None
 
         weights = weights / total
@@ -1760,9 +1646,11 @@ def load_previous_portfolio() -> Optional[pd.DataFrame]:
                     group_caps=group_caps,
                 )
                 if violations:
-                    st.sidebar.warning(
-                        f"Discarded {source} portfolio: constraint violations {violations}"
-                    )
+                    msg = f"Discarded {source} portfolio: constraint violations {violations}"
+                    if _HAS_ST:
+                        st.sidebar.warning(msg)
+                    else:
+                        logging.warning(msg)
                     return None
         except Exception as e:
             # If anything goes wrong, just proceed without constraint check
@@ -1804,7 +1692,10 @@ def save_current_portfolio(df: pd.DataFrame) -> None:
             out.index.name = "Ticker"
         out.reset_index().to_csv(LOCAL_PORTF_FILE, index=False)
     except Exception as e:
-        st.sidebar.warning(f"Could not save local portfolio: {e}")
+        if _HAS_ST:
+            st.sidebar.warning(f"Could not save local portfolio: {e}")
+        else:
+            logging.warning("Could not save local portfolio: %s", e)
 
 
 def save_portfolio_if_rebalance(
@@ -1826,11 +1717,16 @@ def save_portfolio_if_rebalance(
                 next_month = pd.Timestamp(latest) + pd.offsets.MonthBegin(1)
                 next_window = first_trading_day(next_month, None)
         if next_window is not None:
-            st.sidebar.info(
-                f"Not a rebalance day – next window opens {next_window.date()}"
-            )
+            msg = f"Not a rebalance day – next window opens {next_window.date()}"
+            if _HAS_ST:
+                st.sidebar.info(msg)
+            else:
+                logging.info(msg)
         else:
-            st.sidebar.info("Not a rebalance day – skipping save")
+            if _HAS_ST:
+                st.sidebar.info("Not a rebalance day – skipping save")
+            else:
+                logging.info("Not a rebalance day – skipping save")
         return False
 
     # Proceed with standard save routines
@@ -2515,10 +2411,11 @@ def generate_live_portfolio_isa_monthly(
                 if not violations:
                     decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
                     final_weights = prev_w.astype(float)
-                decision = (
-                    f"Health {health:.2f} ≥ trigger {params['trigger']:.2f}"
-                    " — constraints violated, rebalancing to new targets."
-                )
+                else:
+                    decision = (
+                        f"Health {health:.2f} ≥ trigger {params['trigger']:.2f}"
+                        " — constraints violated, rebalancing to new targets."
+                    )
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
@@ -2625,7 +2522,14 @@ def run_backtest_isa_dynamic(
     auto_optimize: bool = False,
     target_vol_annual: Optional[float] = None,
     apply_vol_target: bool = False,
-) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+) -> Tuple[
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[HybridConfig],
+    pd.DataFrame,
+]:
     """
     Enhanced ISA-Dynamic hybrid backtest with stickiness, sector caps, and optional extras.
 
@@ -2657,9 +2561,8 @@ def run_backtest_isa_dynamic(
         If True, apply a current-fundamentals quality screen. Keep False for historical
         tests to avoid look-ahead bias.
     auto_optimize : bool, default False
-        If True, run parameter optimisation (e.g., grid/Bayesian). The function
-        still returns the legacy 4-tuple for compatibility; optimisation
-        artefacts should be stored/logged elsewhere if needed.
+        If True, run parameter optimisation (e.g., grid/Bayesian) and return
+        any best-found configuration alongside diagnostics for inspection.
     target_vol_annual : float, optional
         Annualised volatility target (e.g., 0.15) for optional vol targeting.
     apply_vol_target : bool, default False
@@ -2676,11 +2579,10 @@ def run_backtest_isa_dynamic(
         Benchmark cumulative equity (e.g., QQQ).
     hybrid_tno : Series or None
         Monthly turnover (0.5 × L1) for the hybrid portfolio.
-
-    Notes
-    -----
-    This signature is backward-compatible with existing `app.py` usage while adding
-    optimisation and vol-target controls.
+    optimization_cfg : HybridConfig or None
+        Best configuration identified during optimisation (if any search was run).
+    search_diagnostics : DataFrame
+        Diagnostics or search history from optimisation routines (empty if unused).
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -3307,7 +3209,10 @@ def save_assess_log(df: pd.DataFrame) -> None:
         resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload, timeout=10)
         resp.raise_for_status()
     except Exception as e:
-        st.sidebar.warning(f"Could not save assessment log: {e}")
+        if _HAS_ST:
+            st.sidebar.warning(f"Could not save assessment log: {e}")
+        else:
+            logging.warning("Could not save assessment log: %s", e)
 
 def record_assessment_outcome(as_of: date | None = None,
                               benchmark: str = "QQQ") -> Dict[str, Any]:
@@ -3700,7 +3605,10 @@ def save_live_perf(df: pd.DataFrame) -> None:
         resp = requests.patch(GIST_API_URL, headers=HEADERS, json=payload, timeout=10)
         resp.raise_for_status()
     except Exception as e:
-        st.sidebar.warning(f"Could not save live perf: {e}")
+        if _HAS_ST:
+            st.sidebar.warning(f"Could not save live perf: {e}")
+        else:
+            logging.warning("Could not save live perf: %s", e)
 
 def calc_one_day_live_return(weights: pd.Series, daily_prices: pd.DataFrame) -> float:
     if weights is None or weights.empty or daily_prices.empty:
