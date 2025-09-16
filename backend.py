@@ -69,6 +69,9 @@ ASSESS_LOG_FILE   = "assess_log.csv"
 ROUNDTRIP_BPS_DEFAULT   = 20
 REGIME_MA               = 200
 AVG_TRADE_SIZE_DEFAULT  = 0.02  # 2% avg single-leg trade size
+HEDGE_MAX_DEFAULT       = 0.20
+HEDGE_TICKER_LABEL      = "QQQ (Hedge)"
+HEDGE_TICKER_ALIASES    = {HEDGE_TICKER_LABEL, "QQQ_HEDGE", "QQQ-HEDGE"}
 
 # Defaults for regime-based exposure adjustments
 VIX_TS_THRESHOLD_DEFAULT = 1.0   # VIX3M / VIX ratio; <1 implies stress
@@ -122,6 +125,25 @@ def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
 
     # 3) Fallback to logging
     logging.info(msg)
+
+
+def _record_hedge_state(scope: str,
+                        weight: float,
+                        correlation: float | None,
+                        regime_metrics: Dict[str, float]) -> None:
+    """Persist the latest hedge details for UI/reporting purposes."""
+    if not _HAS_ST:
+        return
+
+    summary = {
+        "weight": float(weight or 0.0),
+        "correlation": (None if correlation is None or pd.isna(correlation)
+                         else float(correlation)),
+        "qqq_above_200dma": regime_metrics.get("qqq_above_200dma"),
+        "breadth_pos_6m": regime_metrics.get("breadth_pos_6m"),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    st.session_state[f"latest_{scope}_hedge"] = summary
 
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
@@ -184,11 +206,21 @@ def linear_interpolate_short_gaps(
             left = s - 1
             right = e + 1
             # Need valid endpoints on both sides to interpolate
-            if left < 0 or right >= len(series):
+            left_val = series.iat[left] if left >= 0 else np.nan
+            right_val = series.iat[right] if right < len(series) else np.nan
+
+            if left < 0 or pd.isna(left_val):
+                if pd.isna(right_val):
+                    continue
+                idx_slice = series.index[s : e + 1]
+                filled.loc[idx_slice, column] = right_val
+                imputed_mask.loc[idx_slice, column] = True
                 continue
-            left_val = series.iat[left]
-            right_val = series.iat[right]
-            if pd.isna(left_val) or pd.isna(right_val):
+
+            if right >= len(series) or pd.isna(right_val):
+                idx_slice = series.index[s : e + 1]
+                filled.loc[idx_slice, column] = left_val
+                imputed_mask.loc[idx_slice, column] = True
                 continue
 
             idx_slice = series.index[s : e + 1]
@@ -202,51 +234,40 @@ def linear_interpolate_short_gaps(
     return filled, imputed_mask
 
 
+# =========================
+# Data cleaning helpers (robust capping + interpolation)
+# =========================
+from typing import Optional, Callable, Tuple, List
+
 def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
-    """Return the location and scale estimates for a return series."""
-
-    if returns.dropna().empty:
+    """Robust location/scale (median & MAD*1.4826) with sane fallbacks."""
+    r = returns.dropna()
+    if r.empty:
         return 0.0, 0.0
-
-    median = float(returns.median())
-    mad = float((returns - median).abs().median())
+    med = float(r.median())
+    mad = float((r - med).abs().median())
     if mad and mad > 0:
-        scale = 1.4826 * mad  # Consistent MAD estimator for normal data
+        scale = 1.4826 * mad
     else:
-        std = float(returns.std(ddof=0))
+        std = float(r.std(ddof=0))
         scale = std if std and std > 0 else 0.0
-    return median, scale
+    return med, scale
 
 
 def cap_abnormal_returns(
     prices: pd.DataFrame,
     *,
     max_daily_move: float | None = None,
-    zscore_threshold: float = 6.0,
-    min_price: float | None = None,
+    zscore_threshold: float | None = 4.0,
+    min_price: float | None = 0.5,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Cap abnormal daily returns in *prices* and flag adjusted points.
-
-    Parameters
-    ----------
-    prices : DataFrame
-        Price levels per ticker.
-    max_daily_move : float | None, optional
-        Optional hard ceiling on single day moves expressed as absolute return.
-    zscore_threshold : float, optional
-        Number of robust standard deviations used to flag outliers.
-    min_price : float | None, optional
-        Optional floor applied to the adjusted price.
-    """
-
+    """Cap abnormal daily returns (robust z-scores and/or hard cap). Returns (cleaned_prices, mask)."""
     if prices is None or prices.empty:
-        empty_mask = pd.DataFrame(
-            False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", [])
-        )
-        return prices, empty_mask
+        empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
+        return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
 
     cleaned = prices.copy()
-    capped_mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
+    mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
 
     for col in cleaned.columns:
         series = cleaned[col].astype(float)
@@ -255,48 +276,56 @@ def cap_abnormal_returns(
 
         returns = series.pct_change(fill_method=None)
         loc, scale = _robust_return_stats(returns)
-        if scale <= 0 and max_daily_move is None:
+
+        if (zscore_threshold is None or scale <= 0) and max_daily_move is None:
+            # nothing to do for this column
             continue
 
-        if scale > 0:
-            zscores = (returns - loc) / scale
+        if scale > 0 and zscore_threshold is not None:
+            z = (returns - loc) / scale
+            outliers = z.abs() > float(zscore_threshold)
         else:
-            zscores = pd.Series(0.0, index=returns.index)
+            outliers = pd.Series(False, index=returns.index)
 
-        outliers = zscores.abs() > zscore_threshold
         if max_daily_move is not None:
-            outliers |= returns.abs() > max_daily_move
+            outliers |= returns.abs() > float(max_daily_move)
 
         if not outliers.any():
             continue
 
-        col_mask = capped_mask[col]
+        col_mask = mask[col]
 
         for idx in outliers.index[outliers]:
+            # guard on index and NA
             if idx not in returns.index or pd.isna(returns.loc[idx]):
                 continue
 
+            # position of the outlier point in the level series
             try:
                 pos = series.index.get_loc(idx)
             except KeyError:
                 continue
+            if pos <= 0:
+                continue  # need a previous valid price to reconstruct
 
+            # previous valid price
             prev_values = series.iloc[:pos].dropna()
             if prev_values.empty:
                 continue
-
             prev_price = float(prev_values.iloc[-1])
-            if not np.isfinite(prev_price) or prev_price == 0:
+            if not np.isfinite(prev_price) or prev_price == 0.0:
                 continue
 
+            # clamp the return value by both z-threshold and hard cap (if provided)
             ret_val = float(returns.loc[idx])
             if max_daily_move is not None:
                 ret_val = float(np.clip(ret_val, -max_daily_move, max_daily_move))
-            if scale > 0:
-                upper = loc + zscore_threshold * scale
-                lower = loc - zscore_threshold * scale
-                ret_val = float(np.clip(ret_val, lower, upper))
+            if zscore_threshold is not None and scale > 0:
+                hi = loc + zscore_threshold * scale
+                lo = loc - zscore_threshold * scale
+                ret_val = float(np.clip(ret_val, lo, hi))
 
+            # reconstruct a new price
             original_price = float(series.iloc[pos])
             new_price = prev_price * (1.0 + ret_val)
             if min_price is not None and np.isfinite(min_price):
@@ -307,181 +336,137 @@ def cap_abnormal_returns(
             if np.isclose(new_price, original_price, rtol=1e-9, atol=1e-12):
                 continue
 
+            # apply the change and update masks / neighboring returns
             series.iloc[pos] = new_price
             col_mask.loc[idx] = True
 
-            # Update neighbouring returns so subsequent iterations use refreshed levels
             returns.loc[idx] = ret_val
             if pos + 1 < len(series):
-                next_idx = series.index[pos + 1]
-                if next_idx in returns.index and pd.notna(series.iloc[pos + 1]) and new_price != 0:
-                    returns.loc[next_idx] = (series.iloc[pos + 1] / new_price) - 1.0
+                nxt_idx = series.index[pos + 1]
+                nxt_val = series.iloc[pos + 1]
+                if nxt_idx in returns.index and pd.notna(nxt_val) and new_price != 0:
+                    returns.loc[nxt_idx] = (nxt_val / new_price) - 1.0
 
         cleaned[col] = series
-        capped_mask[col] = col_mask
+        mask[col] = col_mask
 
-    return cleaned, capped_mask
+    return cleaned, mask
 
 
 def clean_extreme_moves(
     prices: pd.DataFrame,
     *,
-    max_daily_move: float = 0.30,
-    min_price: float = 1.0,
-    zscore_threshold: float = 6.0,
+    max_daily_move: float = 0.35,
+    min_price: float = 0.5,
+    zscore_threshold: float | None = 4.0,
     info: Optional[Callable[[str], None]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Clamp implausible price swings and return a mask of adjustments."""
-
+    """Clamp implausible price swings (robust) and return (cleaned, mask)."""
     if prices is None or prices.empty:
-        empty_mask = pd.DataFrame(
-            False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", [])
-        )
-        return prices, empty_mask
+        empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
+        return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
 
+    # Apply a basic floor first
     cleaned = prices.copy()
-    mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
-
     if min_price is not None:
-        below_floor = (cleaned < min_price) & cleaned.notna()
-        if below_floor.any().any():
-            cleaned[below_floor] = float(min_price)
-            mask[below_floor] = True
+        floor_mask = (cleaned < min_price) & cleaned.notna()
+        if floor_mask.any().any():
+            cleaned[floor_mask] = float(min_price)
 
-    cleaned, capped_mask = cap_abnormal_returns(
+    # Robust capping
+    capped, cap_mask = cap_abnormal_returns(
         cleaned,
         max_daily_move=max_daily_move,
         zscore_threshold=zscore_threshold,
         min_price=min_price,
     )
-    mask |= capped_mask
 
-    adjustments = int(mask.values.sum())
-    if callable(info) and adjustments:
-        info(f"🧹 Data cleaning: Fixed {adjustments} extreme price moves across all stocks")
+    fixes = int(cap_mask.values.sum())
+    if callable(info) and fixes > 0:
+        info(f"🧹 Data cleaning: Fixed {fixes} extreme price moves across all stocks")
 
-    return cleaned, mask
+    return capped, cap_mask.astype(bool)
 
 
 def fill_missing_data(
     prices: pd.DataFrame,
     *,
     max_gap_days: int = 3,
-    post_cap_max_daily_move: float | None = None,
-    zscore_threshold: float = 6.0,
-    min_price: float | None = None,
     info: Optional[Callable[[str], None]] = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Fill short gaps via interpolation and cap abnormal post-fill returns."""
-
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fill short gaps via *linear interpolation on the price level* and return (filled, mask)."""
     if prices is None or prices.empty:
-        empty_mask = pd.DataFrame(
-            False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", [])
-        )
-        return prices, empty_mask, empty_mask.copy()
+        empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
+        return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
 
-    filled, interp_mask = linear_interpolate_short_gaps(prices, max_gap=max_gap_days)
-
-    # Handle short leading and trailing gaps via carry-forward/backward when bounded by max_gap_days
-    for col in filled.columns:
-        series = filled[col]
-        if series.notna().sum() == 0:
-            continue
-
-        first_valid = series.first_valid_index()
-        if first_valid is not None:
-            first_pos = series.index.get_loc(first_valid)
-            if first_pos > 0:
-                leading_idx = series.index[:first_pos]
-                leading_na = series.loc[leading_idx].isna()
-                if leading_na.any() and len(leading_idx) <= max_gap_days:
-                    fill_value = series.loc[first_valid]
-                    filled.loc[leading_na.index[leading_na], col] = fill_value
-                    interp_mask.loc[leading_na.index[leading_na], col] = True
-
-        last_valid = series.last_valid_index()
-        if last_valid is not None:
-            last_pos = series.index.get_loc(last_valid)
-            trailing_idx = series.index[last_pos + 1 :]
-            if len(trailing_idx) > 0:
-                trailing_na = series.loc[trailing_idx].isna()
-                if trailing_na.any() and len(trailing_idx) <= max_gap_days:
-                    fill_value = series.loc[last_valid]
-                    filled.loc[trailing_na.index[trailing_na], col] = fill_value
-                    interp_mask.loc[trailing_na.index[trailing_na], col] = True
-
-    interp_count = int(interp_mask.values.sum())
-    if callable(info) and interp_count:
-        info(f"🔧 Data filling: Filled {interp_count} missing data points with interpolation")
-
-    capped, capped_mask = cap_abnormal_returns(
-        filled,
-        max_daily_move=post_cap_max_daily_move,
-        zscore_threshold=zscore_threshold,
-        min_price=min_price,
-    )
-
-    capped_count = int(capped_mask.values.sum())
-    if callable(info) and capped_count:
-        info(f"⚠️ Data filling: Capped {capped_count} abnormal interpolated returns")
-
-    return capped, interp_mask, capped_mask
+    # Assumes `linear_interpolate_short_gaps` is defined elsewhere
+    filled, mask = linear_interpolate_short_gaps(prices, max_gap=max_gap_days)
+    n = int(mask.to_numpy().sum())
+    if callable(info) and n > 0:
+        info(f"🔧 Data filling: Filled {n} missing data points with interpolation")
+    return filled, mask.astype(bool)
 
 
 def validate_and_clean_market_data(
     prices: pd.DataFrame,
     *,
-    max_missing_fraction: float = 0.2,
+    max_missing_ratio: float = 0.20,
+    max_daily_move: float = 0.35,
+    min_price: float = 0.5,
+    zscore_threshold: float | None = 4.0,
     max_gap_days: int = 3,
-    max_daily_move: float = 0.30,
-    zscore_threshold: float = 6.0,
-    min_price: float = 1.0,
     info: Optional[Callable[[str], None]] = None,
-) -> tuple[pd.DataFrame, list[str], pd.DataFrame, pd.DataFrame]:
-    """Run the full validation and cleaning pipeline for market data."""
-
+) -> tuple[pd.DataFrame, List[str], pd.DataFrame]:
+    """
+    Full validation + cleaning pipeline:
+      1) Drop tickers with too much missing data
+      2) Cap extreme moves (robust z/MAD + optional hard cap)
+      3) Interpolate short gaps on levels
+    Returns: (cleaned_df, alerts_list, combined_mask)
+    """
     if prices is None or prices.empty:
-        empty_mask = pd.DataFrame(
-            False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", [])
-        )
-        return prices, [], empty_mask, empty_mask.copy()
+        empty = pd.DataFrame(index=getattr(prices, "index", []))
+        empty_mask = pd.DataFrame(False, index=empty.index, columns=[])
+        return empty, [], empty_mask
 
-    df = prices.copy()
-    alerts: list[str] = []
+    data = prices.copy()
+    alerts: List[str] = []
+    original_shape = data.shape
 
-    missing_frac = df.isna().mean()
-    drop_cols = missing_frac[missing_frac > max_missing_fraction].index.tolist()
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-        alerts.append(
-            f"Removed {len(drop_cols)} stocks with >{int(max_missing_fraction * 100)}% missing data"
-        )
-        alerts.append(f"Data shape: {prices.shape} → {df.shape}")
+    # 1) Drop very sparse tickers
+    if max_missing_ratio is not None and data.shape[1] > 0:
+        miss_frac = data.isna().mean()
+        drop_cols = miss_frac[miss_frac > max_missing_ratio].index.tolist()
+        if drop_cols:
+            data = data.drop(columns=drop_cols)
+            alerts.append(f"Removed {len(drop_cols)} stocks with >{int(round(max_missing_ratio*100))}% missing data")
 
-    if df.empty:
-        empty_mask = pd.DataFrame(False, index=prices.index, columns=df.columns)
-        return df, alerts, empty_mask, empty_mask.copy()
+    if data.shape != original_shape:
+        alerts.append(f"Data shape: {original_shape} → {data.shape}")
 
-    cleaned, extreme_mask = clean_extreme_moves(
-        df,
+    if data.empty:
+        mask = pd.DataFrame(False, index=prices.index, columns=data.columns)
+        return data, alerts, mask
+
+    # 2) Cap extreme moves
+    cleaned, mask_clean = clean_extreme_moves(
+        data,
         max_daily_move=max_daily_move,
         min_price=min_price,
         zscore_threshold=zscore_threshold,
         info=info,
     )
 
-    filled, fill_mask, fill_cap_mask = fill_missing_data(
+    # 3) Fill short gaps
+    filled, mask_fill = fill_missing_data(
         cleaned,
         max_gap_days=max_gap_days,
-        post_cap_max_daily_move=max_daily_move,
-        zscore_threshold=zscore_threshold,
-        min_price=min_price,
         info=info,
     )
 
-    capped_mask = extreme_mask | fill_cap_mask
-
-    return filled, alerts, fill_mask, capped_mask
+    combined_mask = (mask_clean | mask_fill).astype(bool)
+    return filled, alerts, combined_mask
+  
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
 # =========================
@@ -1261,6 +1246,39 @@ def _parquet_cache_path(prefix: str, tickers: List[str], start_date: str, end_da
     return PARQUET_CACHE_DIR / fname
 
 
+def _read_cached_dataframe(path: Path) -> Optional[pd.DataFrame]:
+    """Read a cached DataFrame with graceful fallback.
+
+    The primary format is parquet, but when pyarrow/fastparquet is unavailable
+    (common in lightweight test environments) we transparently fall back to
+    :func:`pandas.read_pickle`. The helper returns ``None`` if the cache is
+    missing or unreadable so callers can re-fetch the data.
+    """
+
+    if not path.exists():
+        return None
+
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        try:
+            return pd.read_pickle(path)
+        except Exception:
+            return None
+
+
+def _write_cached_dataframe(df: pd.DataFrame, path: Path) -> None:
+    """Persist ``df`` to ``path`` using parquet with pickle fallback."""
+
+    try:
+        df.to_parquet(path)
+    except Exception:
+        try:
+            df.to_pickle(path)
+        except Exception:
+            pass
+
+
 def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
     """Fetch ``ticker.info`` with a timeout and graceful fallback."""
 
@@ -1284,6 +1302,13 @@ def get_sector_map(tickers: List[str]) -> Dict[str, str]:
     ``ticker.info`` are wrapped with a timeout to avoid hangs. Tickers with
     missing sector information are stored as ``"Unknown"``.
     """
+
+    tickers = list(tickers)
+
+    # Ensure the synthetic hedge ticker is always mapped without hitting yfinance
+    for alias in HEDGE_TICKER_ALIASES:
+        if alias in tickers and alias not in _SECTOR_CACHE:
+            _SECTOR_CACHE[alias] = "Hedge Overlay"
 
     new_tickers = [t for t in tickers if t not in _SECTOR_CACHE]
     for t in new_tickers:
@@ -1404,26 +1429,155 @@ def _prepare_universe_for_backtest(
     return close, vol, sectors_map, label
 
 # =========================
-# Data fetching (cache) - Enhanced with validation
+# Data cleaning helpers
 # =========================
-@st.cache_data(ttl=43200)
-def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
-    cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
-    if cache_path.exists():
-        try:
-            return pd.read_parquet(cache_path)
-        except Exception:
-            pass
+def clean_extreme_moves(
+    prices: pd.DataFrame,
+    max_daily_move: float = 0.30,
+    min_price: float = 0.5,
+    zscore_threshold: float = 4.0,
+    info: Optional[Callable[[str], None]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Clip extreme one-day moves and replace with adjacent prices."""
+
+    if prices.empty:
+        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
+        return prices.copy(), empty
+
+    df = prices.copy()
+    mask = pd.DataFrame(False, index=df.index, columns=df.columns)
+
+    pct = df.pct_change().replace([np.inf, -np.inf], np.nan)
+    large_moves = pct.abs() > max_daily_move
+    low_prices = df < min_price
+    median = df.rolling(window=5, min_periods=1).median()
+    deviation = (df - median).abs() / (median.replace(0, np.nan).abs() + 1e-9)
+    extreme_price = deviation > max_daily_move
+
+    mask |= (large_moves & extreme_price).fillna(False)
+    mask |= low_prices.fillna(False)
+
+    if zscore_threshold is not None and not pct.empty:
+        zscores = (pct - pct.mean()) / (pct.std(ddof=0) + 1e-9)
+        mask |= zscores.abs() > zscore_threshold
+        mask = mask.fillna(False)
+
+    if mask.values.any():
+        cleaned = df.where(~mask)
+        filled = cleaned.ffill().bfill()
+        df = df.where(~mask, filled)
+        fixed = int(mask.values.sum())
+        msg = "🧹 Data cleaning: Fixed {} extreme price moves across all stocks".format(
+            fixed
+        )
+        _emit_info(msg, info)
+
+    return df, mask.astype(bool)
+
+
+def fill_missing_data(
+    prices: pd.DataFrame,
+    max_gap_days: int = 3,
+    info: Optional[Callable[[str], None]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Interpolate short gaps up to ``max_gap_days`` consecutive missing points."""
+
+    if prices.empty:
+        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
+        return prices.copy(), empty
+
+    df = prices.copy()
+    original_na = df.isna()
 
     try:
+        filled = df.interpolate(
+            method="time",
+            limit=max_gap_days,
+            limit_direction="both",
+            limit_area="inside",
+        )
+    except Exception:
+        filled = df.interpolate(
+            method="linear",
+            limit=max_gap_days,
+            limit_direction="both",
+            limit_area="inside",
+        )
+
+    filled = filled.ffill(limit=max_gap_days).bfill(limit=max_gap_days)
+
+    mask = original_na & filled.notna()
+    filled_points = int(mask.values.sum())
+    if filled_points > 0:
+        msg = (
+            "🔧 Data filling: Filled {} missing data points with interpolation".format(
+                filled_points
+            )
+        )
+        _emit_info(msg, info)
+
+    return filled, mask.astype(bool)
+
+
+def validate_and_clean_market_data(
+    prices: pd.DataFrame,
+    max_missing_ratio: float = 0.20,
+    info: Optional[Callable[[str], None]] = None,
+) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
+    """Run the full cleaning pipeline used by cached market data downloads."""
+
+    if prices.empty:
+        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
+        return prices.copy(), [], empty
+
+    df = prices.copy()
+    alerts: List[str] = []
+
+    missing_ratio = df.isna().mean()
+    drop_cols = missing_ratio[missing_ratio > max_missing_ratio].index.tolist()
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+        alerts.append(
+            f"Removed {len(drop_cols)} stocks with >{int(max_missing_ratio * 100)}% missing data"
+        )
+
+    if df.empty:
+        alerts.append(f"Data shape: {prices.shape} → {df.shape}")
+        empty_mask = pd.DataFrame(False, index=df.index, columns=df.columns)
+        return df, alerts, empty_mask
+
+    cleaned, clean_mask = clean_extreme_moves(df, info=info)
+    filled, fill_mask = fill_missing_data(cleaned, info=info)
+    combined_mask = clean_mask.reindex_like(filled).fillna(False) | fill_mask
+
+    if df.shape != prices.shape or drop_cols:
+        alerts.append(f"Data shape: {prices.shape} → {filled.shape}")
+
+    return filled, alerts, combined_mask.astype(bool)
+
+
+# =========================
+# Data fetching (cache) - Enhanced with validation
+# =========================
+from typing import List, Tuple
+
+@st.cache_data(ttl=43200)
+def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
+    cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
+
+    # Try local disk cache first (Parquet -> Pickle)
+    cached = _read_cached_dataframe(cache_path)
+    if cached is not None:
+        return cached
+
+    try:
+        # Pull an extended window to help with MA/breadth calcs downstream
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+
         frames: List[pd.DataFrame] = []
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(
-                batch,
-                start=fetch_start,
-                end=end_date,
-            )["Close"]
+            df = _yf_download(batch, start=fetch_start, end=end_date)["Close"]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
@@ -1435,72 +1589,67 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         data = pd.concat(frames, axis=1)
         result = data.dropna(axis=1, how="all")
 
-        # Enhanced data cleaning pipeline
+        # Enhanced data cleaning pipeline (true linear interpolation on short gaps, etc.)
         if not result.empty:
             cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(result, info=logging.info)
 
-            # Show cleaning summary
+            # Log a brief cleaning summary (top 2 alerts)
             if cleaning_alerts:
-                for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
+                for alert in cleaning_alerts[:2]:
                     logging.info("Data cleaning: %s", alert)
 
-            try:
-                cleaned_result.to_parquet(cache_path)
-            except Exception:
-                pass
+            _write_cached_dataframe(cleaned_result, cache_path)
             return cleaned_result
 
-        try:
-            result.to_parquet(cache_path)
-        except Exception:
-            pass
+        # Fallback: write whatever we got
+        _write_cached_dataframe(result, cache_path)
         return result
 
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
         return pd.DataFrame()
 
+
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit."""
     cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
-    if cache_path.exists():
-        try:
-            combined = pd.read_parquet(cache_path)
-            if isinstance(combined.columns, pd.MultiIndex):
-                needed = {"Close", "Volume"}
-                have = set(combined.columns.get_level_values(0))
-                if needed.issubset(have):
-                    return combined["Close"], combined["Volume"]
-            else:
-                if {"Close", "Volume"}.issubset(combined.columns):
-                    return combined["Close"], combined["Volume"]
-        except Exception:
-            pass
+
+    # Try local disk cache first (Parquet -> Pickle)
+    combined = _read_cached_dataframe(cache_path)
+    if combined is not None:
+        if isinstance(combined.columns, pd.MultiIndex):
+            needed = {"Close", "Volume"}
+            have = set(combined.columns.get_level_values(0))
+            if needed.issubset(have):
+                return combined["Close"], combined["Volume"]
+        else:
+            if {"Close", "Volume"}.issubset(combined.columns):
+                return combined["Close"], combined["Volume"]
 
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
+
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(
-                batch,
-                start=fetch_start,
-                end=end_date,
-            )[["Close", "Volume"]]
+            df = _yf_download(batch, start=fetch_start, end=end_date)[["Close", "Volume"]]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
+
             if isinstance(df.columns, pd.MultiIndex):
                 close_part = df["Close"]
                 vol_part = df["Volume"]
             else:
-                if "Close" in df.columns and "Volume" in df.columns:
-                    close_part = df[["Close"]].copy()
-                    vol_part = df[["Volume"]].copy()
-                    if len(batch) == 1:
-                        close_part.columns = [batch[0]]
-                        vol_part.columns = [batch[0]]
-                else:
+                if "Close" not in df.columns or "Volume" not in df.columns:
                     continue
+                close_part = df[["Close"]].copy()
+                vol_part = df[["Volume"]].copy()
+                if len(batch) == 1:
+                    close_part.columns = [batch[0]]
+                    vol_part.columns = [batch[0]]
+
             close_frames.append(close_part)
             vol_frames.append(vol_part)
 
@@ -1511,11 +1660,11 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         vol = pd.concat(vol_frames, axis=1)
         vol = vol.reindex_like(close).fillna(0)
 
-        # Enhanced data cleaning for prices
+        # Enhanced cleaning for prices
         if not close.empty:
             cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
 
-            # Clean volume data (less aggressive)
+            # Mild cleaning for volume: align and clip extreme spikes (99th pct)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
             for col in vol_aligned.columns:
                 col_data = vol_aligned[col]
@@ -1524,25 +1673,20 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     vol_aligned[col] = col_data.clip(lower=0, upper=q99)
 
             if close_alerts:
-                for alert in close_alerts[:1]:  # Show top cleaning action
+                for alert in close_alerts[:1]:
                     logging.info("Price/Volume cleaning: %s", alert)
 
-            try:
-                pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1).to_parquet(cache_path)
-            except Exception:
-                pass
+            _write_cached_dataframe(pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1), cache_path)
             return cleaned_close, vol_aligned
 
-        try:
-            pd.concat({"Close": close, "Volume": vol}, axis=1).to_parquet(cache_path)
-        except Exception:
-            pass
+        # Fallback: cache raw combined
+        _write_cached_dataframe(pd.concat({"Close": close, "Volume": vol}, axis=1), cache_path)
         return close, vol
 
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()
-        
+      
 # =========================
 # Persistence (Gist + Local) - Unchanged
 # =========================
@@ -2247,6 +2391,14 @@ def generate_live_portfolio_isa_monthly(
     # Expose the price index for downstream processes (e.g. save gating)
     st.session_state["latest_price_index"] = close.index
 
+    regime_metrics: Dict[str, float] = {}
+    if len(close) > 0:
+        try:
+            regime_metrics = compute_regime_metrics(close)
+        except Exception:
+            logging.warning("R02 regime metric calculation failed in allocation", exc_info=True)
+            regime_metrics = {}
+
     # Monthly lock check – always compute new weights
     is_monthly = is_rebalance_today(today, close.index)
     decision = "Preview only – portfolio not saved" if not is_monthly else ""
@@ -2259,10 +2411,9 @@ def generate_live_portfolio_isa_monthly(
     # Apply regime-based exposure scaling to final weights
     if use_enhanced_features and len(close) > 0 and len(new_w) > 0:
         try:
-            regime_metrics = compute_regime_metrics(close)
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
             new_w = new_w * float(regime_exposure)
-        except Exception as e:
+        except Exception:
             logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
     # Validate and re-enforce caps if scaling introduced violations
@@ -2296,6 +2447,32 @@ def generate_live_portfolio_isa_monthly(
                     f"Constraint violations after re-enforcing caps: {violations}"
                 )
 
+    hedge_weight = 0.0
+    corr = np.nan
+    portfolio_recent = pd.Series(dtype=float)
+    try:
+        cfg_live = HybridConfig(
+            momentum_top_n=int(params["mom_topn"]),
+            momentum_cap=float(params["mom_cap"]),
+            mr_top_n=int(params["mr_topn"]),
+            mom_weight=float(params["mom_w"]),
+            mr_weight=float(params["mr_w"]),
+            mr_lookback_days=int(params["mr_lb"]),
+            mr_long_ma_days=int(params["mr_ma"]),
+        )
+        bt_res = strategy_core.run_hybrid_backtest(close, cfg_live)
+        portfolio_recent = bt_res.get("hybrid_rets", pd.Series(dtype=float)).tail(6)
+        hedge_size = (
+            st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
+            if _HAS_ST else HEDGE_MAX_DEFAULT
+        )
+        hedge_weight = build_hedge_weight(portfolio_recent, regime_metrics, hedge_size)
+        corr = calculate_portfolio_correlation_to_market(portfolio_recent)
+    except Exception:
+        logging.warning("H02 hedge overlay failed in allocation", exc_info=True)
+
+    final_weights = new_w.astype(float) if len(new_w) > 0 else new_w
+
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("M").last()
@@ -2304,6 +2481,7 @@ def generate_live_portfolio_isa_monthly(
             top_m = mom_scores.nlargest(params["mom_topn"])
             top_score = float(top_m.iloc[0]) if len(top_m) > 0 else 1e-9
             prev_w = prev_portfolio["Weight"].astype(float)
+            prev_w = prev_w.drop(index=HEDGE_TICKER_LABEL, errors="ignore")
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
@@ -2322,8 +2500,7 @@ def generate_live_portfolio_isa_monthly(
                 )
                 if not violations:
                     decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
-                    disp, raw = _format_display(prev_w)
-                    return disp, raw, decision
+                    final_weights = prev_w.astype(float)
                 decision = (
                     f"Health {health:.2f} ≥ trigger {params['trigger']:.2f}"
                     " — constraints violated, rebalancing to new targets."
@@ -2331,7 +2508,33 @@ def generate_live_portfolio_isa_monthly(
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
-    disp, raw = _format_display(new_w)
+    def _inject_hedge(weights: pd.Series) -> pd.Series:
+        w = weights.copy() if weights is not None else pd.Series(dtype=float)
+        if not isinstance(w, pd.Series):
+            w = pd.Series(dtype=float)
+        w = w.drop(index=HEDGE_TICKER_LABEL, errors="ignore")
+        if hedge_weight > 0:
+            w.loc[HEDGE_TICKER_LABEL] = -hedge_weight
+        return w.astype(float)
+
+    final_weights = _inject_hedge(final_weights if isinstance(final_weights, pd.Series) else pd.Series(dtype=float))
+
+    state = "active" if hedge_weight > 0 else "inactive"
+    corr_txt = "n/a" if pd.isna(corr) else f"{corr:.2f}"
+    _emit_info(
+        f"Live allocation QQQ hedge {state} (weight={hedge_weight:.1%}, corr={corr_txt})"
+    )
+    _record_hedge_state("live", hedge_weight, corr, regime_metrics)
+
+    hedge_note = (
+        f"QQQ hedge active at {hedge_weight:.1%} short."
+        if hedge_weight > 0
+        else "QQQ hedge inactive."
+    )
+    decision = (decision or "").strip()
+    decision = f"{decision}\n{hedge_note}" if decision else hedge_note
+
+    disp, raw = _format_display(final_weights)
     return disp, raw, decision
 
 
@@ -2405,6 +2608,8 @@ def run_backtest_isa_dynamic(
     mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
     apply_quality_filter: bool = False,
+    target_vol_annual: Optional[float] = None,
+    apply_vol_target: bool = False,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
     Enhanced ISA-Dynamic hybrid backtest with new features.
@@ -2414,6 +2619,12 @@ def run_backtest_isa_dynamic(
     apply_quality_filter: bool, optional
         If True, filter the universe using *current* fundamentals. Leave False
         during historical backtests to avoid look-ahead bias.
+    target_vol_annual: float, optional
+        Annualized volatility target (e.g., 0.15 for 15%) applied when
+        ``apply_vol_target`` is True.
+    apply_vol_target: bool, optional
+        If True, scale returns using the volatility targeting helper from
+        ``strategy_core``.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -2468,28 +2679,61 @@ def run_backtest_isa_dynamic(
         mr_weight=mr_weight,
         mr_lookback_days=21,
         mr_long_ma_days=200,
+        target_vol_annual=target_vol_annual if apply_vol_target else None,
     )
 
-    res = strategy_core.run_hybrid_backtest(daily, cfg)
+    res = strategy_core.run_hybrid_backtest(daily, cfg, apply_vol_target=apply_vol_target)
     hybrid_gross = res["hybrid_rets"]
     hybrid_tno = (
         cfg.mom_weight * res["mom_turnover"].reindex(hybrid_gross.index).fillna(0)
         + cfg.mr_weight * res["mr_turnover"].reindex(hybrid_gross.index).fillna(0)
     )
 
+    qqq_monthly = qqq.resample("M").last().pct_change()
+
     # Apply drawdown-based exposure adjustment (walk-forward)
     if use_enhanced_features:
-        qqq_monthly = qqq.resample("M").last().pct_change()
         hybrid_gross = apply_dynamic_drawdown_scaling(
             hybrid_gross, qqq_monthly, threshold_fraction=0.8
         )
+
+    hedge_weight = 0.0
+    corr = np.nan
+    regime_metrics: Dict[str, float] = {}
+    portfolio_recent = hybrid_gross.tail(6)
+
+    try:
+        lookback_daily = daily.iloc[-252:] if len(daily) > 252 else daily
+        if not lookback_daily.empty:
+            regime_metrics = compute_regime_metrics(lookback_daily)
+
+        hedge_size = (
+            st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
+            if _HAS_ST else HEDGE_MAX_DEFAULT
+        )
+        hedge_weight = build_hedge_weight(portfolio_recent, regime_metrics, hedge_size)
+        corr = calculate_portfolio_correlation_to_market(portfolio_recent)
+
+        if hedge_weight > 0 and not qqq_monthly.empty:
+            qqq_aligned = qqq_monthly.reindex(hybrid_gross.index).fillna(0.0)
+            hedge_returns = -hedge_weight * qqq_aligned
+            hybrid_gross = hybrid_gross.add(hedge_returns, fill_value=0.0)
+    except Exception:
+        logging.warning("H01 hedge overlay failed in backtest", exc_info=True)
+
+    state = "active" if hedge_weight > 0 else "inactive"
+    corr_txt = "n/a" if pd.isna(corr) else f"{corr:.2f}"
+    _emit_info(
+        f"Backtest QQQ hedge {state} (weight={hedge_weight:.1%}, corr={corr_txt})"
+    )
+    _record_hedge_state("backtest", hedge_weight, corr, regime_metrics)
 
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     # Cum curves
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
     strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
-    qqq_cum = (1 + qqq.resample("M").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
+    qqq_cum = (1 + qqq_monthly).cumprod().reindex(strat_cum_gross.index, method="ffill")
 
     return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
     
