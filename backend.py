@@ -126,195 +126,80 @@ def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
 # =========================
-def clean_extreme_moves(
-    prices_df: pd.DataFrame,
-    max_daily_move: float = 0.30,
-    min_price: float = 1.0,
-    zscore_threshold: float = 5.0,
-    info: Callable[[str], None] | None = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Clean extreme price moves that are likely data errors.
+import numpy as np
+import pandas as pd
 
-    Returns the cleaned prices and a mask indicating which points were
-    replaced so downstream analysis can optionally exclude them.
+def linear_interpolate_short_gaps(
+    prices: pd.DataFrame,
+    max_gap: int = 3,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    if prices_df.empty:
-        return prices_df, pd.DataFrame(index=prices_df.index, columns=prices_df.columns)
+    Linearly interpolate gaps up to `max_gap` consecutive business days per column.
 
-    cleaned_df = prices_df.copy()
-    replaced_mask = pd.DataFrame(False, index=prices_df.index, columns=prices_df.columns)
-    total_corrections = 0
+    Parameters
+    ----------
+    prices : DataFrame
+        Price DataFrame indexed by date, columns are tickers.
+    max_gap : int
+        Maximum consecutive NaNs to fill per gap (gaps longer than this are left as NaN).
 
-    for column in cleaned_df.columns:
-        series = pd.to_numeric(cleaned_df[column].copy(), errors="coerce")
+    Returns
+    -------
+    filled : DataFrame
+        Copy of `prices` with short gaps linearly imputed.
+    imputed_mask : DataFrame[bool]
+        True where values were imputed by this routine.
+    """
+    if prices is None or prices.empty:
+        return prices, pd.DataFrame(index=getattr(prices, "index", []),
+                                    columns=getattr(prices, "columns", []))
 
-        if series.dropna().empty:
-            cleaned_df[column] = series
+    filled = prices.copy()
+    imputed_mask = pd.DataFrame(False, index=filled.index, columns=filled.columns)
+
+    for column in filled.columns:
+        series = filled[column]
+        na_flags = series.isna()
+        if not na_flags.any():
             continue
 
-        # Remove prices below minimum (likely stock splits not handled)
-        low_price_mask = series < min_price
-        if low_price_mask.any():
-            series = series.where(~low_price_mask)
-            series = series.ffill().bfill()
-            replaced_mask.loc[low_price_mask, column] = True
-            total_corrections += int(low_price_mask.sum())
+        # Find runs of consecutive NaNs
+        gaps: list[tuple[int, int]] = []
+        start = None
+        for i, is_na in enumerate(na_flags.values):
+            if is_na and start is None:
+                start = i
+            elif (not is_na) and start is not None:
+                gaps.append((start, i - 1))
+                start = None
+        if start is not None:
+            gaps.append((start, len(series) - 1))
 
-        for _ in range(50):
-            daily_returns = series.pct_change().abs()
-            log_returns = np.log(series).diff()
-            rolling_mean = log_returns.shift(1).rolling(window=20, min_periods=1).mean()
-            rolling_std = log_returns.shift(1).rolling(window=20, min_periods=1).std(ddof=0)
-            z_scores = (log_returns - rolling_mean) / rolling_std
+        # Fill short gaps using linear interpolation between surrounding points
+        for s, e in gaps:
+            gap_len = e - s + 1
+            if gap_len > max_gap:
+                continue
 
-            extreme_mask = (daily_returns > max_daily_move) & (z_scores.abs() > zscore_threshold)
-            extreme_dates = extreme_mask[extreme_mask].index
-            if len(extreme_dates) == 0:
-                break
+            left = s - 1
+            right = e + 1
+            # Need valid endpoints on both sides to interpolate
+            if left < 0 or right >= len(series):
+                continue
+            left_val = series.iat[left]
+            right_val = series.iat[right]
+            if pd.isna(left_val) or pd.isna(right_val):
+                continue
 
-            date = extreme_dates[0]
-            total_corrections += 1
-            date_idx = series.index.get_loc(date)
+            idx_slice = series.index[s : e + 1]
+            # Linear ramp from left_val to right_val (exclude endpoints)
+            steps = np.arange(1, gap_len + 1, dtype=float) / (gap_len + 1)
+            vals = float(left_val) + steps * (float(right_val) - float(left_val))
 
-            if 0 < date_idx < len(series) - 1:
-                prev_price = series.iloc[date_idx - 1]
-                next_price = series.iloc[date_idx + 1]
+            filled.loc[idx_slice, column] = vals
+            imputed_mask.loc[idx_slice, column] = True
 
-                if pd.notna(prev_price) and pd.notna(next_price):
-                    series.iloc[date_idx] = (prev_price + next_price) / 2
-                elif pd.notna(prev_price):
-                    series.iloc[date_idx] = prev_price
-                elif pd.notna(next_price):
-                    series.iloc[date_idx] = next_price
-            elif date_idx > 0:
-                series.iloc[date_idx] = series.iloc[date_idx - 1]
-
-            replaced_mask.at[date, column] = True
-
-        cleaned_df[column] = series
-
-    if total_corrections > 0:
-        msg = f"🧹 Data cleaning: Fixed {total_corrections} extreme price moves across all stocks"
-        _emit_info(msg, info)
-
-    return cleaned_df, replaced_mask
-
-
-def fill_missing_data(
-    prices_df: pd.DataFrame,
-    max_gap_days: int = 5,
-    info: Callable[[str], None] | None = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Fill missing data gaps with interpolation limited to each gap.
-
-    Returns the filled prices and a mask indicating which entries were
-    imputed so they can be excluded if desired.
-    """
-    if prices_df.empty:
-        empty_mask = pd.DataFrame(index=prices_df.index, columns=prices_df.columns)
-        return prices_df, empty_mask
-
-    filled_df = prices_df.copy()
-    imputed_mask = pd.DataFrame(False, index=prices_df.index, columns=prices_df.columns)
-    total_filled = 0
-
-    for column in filled_df.columns:
-        series = filled_df[column].copy()
-        missing_mask = series.isna()
-
-        if missing_mask.any():
-            # Identify consecutive missing groups
-            groups = (missing_mask != missing_mask.shift()).cumsum()
-            group_sizes = missing_mask.groupby(groups).sum()
-            gap_ids = group_sizes[(group_sizes > 0) & (group_sizes <= max_gap_days)].index
-
-            for gid in gap_ids:
-                gap_mask = (groups == gid) & missing_mask
-                gap_indices = series.index[gap_mask]
-
-                if len(gap_indices) == 0:
-                    continue
-
-                start_idx = series.index.get_loc(gap_indices[0])
-                end_idx = series.index.get_loc(gap_indices[-1])
-
-                seg = series.iloc[max(0, start_idx - 1) : min(len(series), end_idx + 2)]
-                seg = seg.interpolate(method="linear", limit_direction="both")
-series.loc[gap_indices] = seg.loc[gap_indices]
-
-                imputed_mask.loc[gap_indices, column] = filled_values.notna().values
-                total_filled += int(filled_values.notna().sum())
-
-        filled_df[column] = series
-
-    if total_filled > 0:
-        msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-_emit_info(msg, info)
-
-    return filled_df, imputed_mask
-
-
-def validate_and_clean_market_data(
-    prices_df: pd.DataFrame,
-    max_daily_move: float = 0.25,
-    min_price: float = 0.50,
-    max_gap_days: int = 3,
-    info: Callable[[str], None] | None = None,
-) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
-    """Comprehensive data validation and cleaning pipeline.
-
-    Returns the cleaned data, a list of alerts, and a boolean mask
-    indicating which observations were imputed (either from extreme
-    move fixes or gap filling).
-    """
-    if prices_df.empty:
-        empty_mask = pd.DataFrame(index=prices_df.index, columns=prices_df.columns)
-        return prices_df, ["No data to clean"], empty_mask
-
-    original_shape = prices_df.shape
-    alerts: List[str] = []
-
-    # Step 1: Clean extreme moves
-    cleaned_df, replaced_mask = clean_extreme_moves(
-        prices_df, max_daily_move=max_daily_move, min_price=min_price, info=info
-    )
-
-    # Step 2: Fill missing data gaps
-    filled_df, fill_mask = fill_missing_data(
-        cleaned_df, max_gap_days=max_gap_days, info=info
-    )
-
-    imputed_mask = replaced_mask | fill_mask
-
-    # Step 3: Remove columns with too much missing data
-    missing_pct = filled_df.isnull().sum() / len(filled_df)
-    good_columns = missing_pct[missing_pct < 0.20].index  # Keep columns with <20% missing
-
-    if len(good_columns) < len(filled_df.columns):
-        removed = len(filled_df.columns) - len(good_columns)
-        alerts.append(f"Removed {removed} stocks with >20% missing data")
-        filled_df = filled_df[good_columns]
-        imputed_mask = imputed_mask[good_columns]
-
-    # Step 4: Final validation
-    remaining_missing = filled_df.isnull().sum().sum()
-    total_points = filled_df.shape[0] * filled_df.shape[1]
-    final_missing_pct = (remaining_missing / total_points) * 100 if total_points > 0 else 0
-
-    if final_missing_pct > 0:
-        alerts.append(f"Final missing data: {final_missing_pct:.1f}%")
-
-    # Step 5: Check for remaining extreme moves
-    for col in filled_df.columns:
-        daily_rets = filled_df[col].pct_change().abs()
-        extreme_count = (daily_rets > 0.25).sum()
-        if extreme_count > 0:
-            alerts.append(f"{col}: {extreme_count} remaining extreme moves")
-
-    final_shape = filled_df.shape
-    alerts.append(f"Data shape: {original_shape} → {final_shape}")
-
-    return filled_df, alerts, imputed_mask
+    return filled, imputed_mask
 
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
