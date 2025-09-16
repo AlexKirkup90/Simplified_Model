@@ -9,7 +9,7 @@ import requests
 from io import StringIO
 import streamlit as st
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
@@ -103,6 +103,17 @@ PARAM_MAP_DEFAULTS = {
     "sector_cap_low": 0.35,
     "sector_cap_mid": 0.30,
     "sector_cap_high": 0.25,
+}
+
+_YF_BATCH_SIZE = 200
+
+PERF: Dict[str, Any] = {
+    "fast_io": True,
+    "use_polars": False,
+    "parallel_grid": False,
+    "n_jobs": 4,
+    "yf_batch": _YF_BATCH_SIZE,
+    "cache_days": 365,
 }
 
 
@@ -1138,12 +1149,12 @@ def _safe_series(obj):
 def to_yahoo_symbol(sym: str) -> str:
     return str(sym).strip().upper().replace(".", "-")
 
-_YF_BATCH_SIZE = 200
-
-
-def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
-    for i in range(0, len(tickers), size):
-        yield tickers[i : i + size]
+def _chunk_tickers(tickers: List[str], size: Optional[int] = None):
+    chunk_size = int(size) if size else int(PERF["yf_batch"])
+    if chunk_size <= 0:
+        chunk_size = 1
+    for i in range(0, len(tickers), chunk_size):
+        yield tickers[i : i + chunk_size]
 
 
 def _yf_download(tickers, **kwargs):
@@ -1254,36 +1265,61 @@ def _parquet_cache_path(prefix: str, tickers: List[str], start_date: str, end_da
 
 
 def _read_cached_dataframe(path: Path) -> Optional[pd.DataFrame]:
-    """Read a cached DataFrame with graceful fallback.
-
-    The primary format is parquet, but when pyarrow/fastparquet is unavailable
-    (common in lightweight test environments) we transparently fall back to
-    :func:`pandas.read_pickle`. The helper returns ``None`` if the cache is
-    missing or unreadable so callers can re-fetch the data.
-    """
+    """Read a cached DataFrame with graceful fallback respecting ``PERF`` toggles."""
 
     if not path.exists():
         return None
 
-    try:
-        return pd.read_parquet(path)
-    except Exception:
+    cache_days = int(PERF.get("cache_days", 0) or 0)
+    if cache_days > 0:
         try:
-            return pd.read_pickle(path)
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            if datetime.utcnow() - mtime > timedelta(days=cache_days):
+                return None
         except Exception:
             return None
 
+    if PERF.get("fast_io", True):
+        if PERF.get("use_polars", False):
+            try:
+                import polars as pl  # type: ignore
 
-def _write_cached_dataframe(df: pd.DataFrame, path: Path) -> None:
-    """Persist ``df`` to ``path`` using parquet with pickle fallback."""
-
-    try:
-        df.to_parquet(path)
-    except Exception:
+                return pl.read_parquet(path).to_pandas()
+            except Exception:
+                pass
         try:
-            df.to_pickle(path)
+            return pd.read_parquet(path)
         except Exception:
             pass
+
+    try:
+        return pd.read_pickle(path)
+    except Exception:
+        return None
+
+
+def _write_cached_dataframe(df: pd.DataFrame, path: Path) -> None:
+    """Persist ``df`` to ``path`` honouring ``PERF`` hints for the storage backend."""
+
+    if PERF.get("fast_io", True):
+        if PERF.get("use_polars", False):
+            try:
+                import polars as pl  # type: ignore
+
+                pl.from_pandas(df).write_parquet(path)
+                return
+            except Exception:
+                pass
+        try:
+            df.to_parquet(path)
+            return
+        except Exception:
+            pass
+
+    try:
+        df.to_pickle(path)
+    except Exception:
+        pass
 
 
 def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
