@@ -10,7 +10,7 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 import backend
 
 
-def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
+def test_run_backtest_isa_dynamic_uses_bayesian_optimizer(monkeypatch):
     dates = pd.date_range("2020-01-01", periods=10, freq="D")
     close = pd.DataFrame({
         "AAA": np.linspace(100, 110, len(dates)),
@@ -32,7 +32,7 @@ def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
 
     monkeypatch.setattr(backend, "fetch_fundamental_metrics", lambda tickers: fdf.reindex(tickers))
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     import strategy_core
 
@@ -47,22 +47,48 @@ def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
 
     monkeypatch.setattr(strategy_core, "run_hybrid_backtest", fake_run_hybrid_backtest)
 
-    class DummyCfg:
-        momentum_top_n = 2
-        momentum_cap = 0.4
-        mom_weight = 0.6
-        mr_weight = 0.4
+    dummy_cfg = backend.HybridConfig(
+        momentum_top_n=2,
+        momentum_cap=0.4,
+        mr_top_n=4,
+        mom_weight=0.6,
+        mr_weight=0.4,
+    )
+    diagnostics = pd.DataFrame(
+        [
+            {"momentum_top_n": 2, "mom_weight": 0.6, "mr_weight": 0.4, "sharpe": 1.23},
+            {"momentum_top_n": 5, "mom_weight": 0.7, "mr_weight": 0.3, "sharpe": 0.9},
+        ]
+    )
 
-    monkeypatch.setattr(backend, "optimize_hybrid_strategy", lambda prices: (DummyCfg(), 0.33))
+    def fake_bayes_opt(prices, **kwargs):
+        captured["optimizer_kwargs"] = kwargs
+        return dummy_cfg, diagnostics
+
+    monkeypatch.setattr(backend.optimizer, "bayesian_optimize_hybrid", fake_bayes_opt)
 
     st.session_state["min_profitability"] = 0.0
     st.session_state["max_leverage"] = 10.0
 
-    backend.run_backtest_isa_dynamic()
+    (
+        _,
+        _,
+        _,
+        _,
+        best_cfg,
+        search_diag,
+    ) = backend.run_backtest_isa_dynamic(auto_optimize=True, roundtrip_bps=15.0)
 
     cfg = captured["cfg"]
-    assert cfg.momentum_top_n == 2
-    assert cfg.momentum_cap == 0.4
-    assert cfg.mr_top_n == 3
-    assert cfg.mom_weight == 0.6
-    assert cfg.mr_weight == 0.4
+    assert cfg.momentum_top_n == dummy_cfg.momentum_top_n
+    assert cfg.momentum_cap == dummy_cfg.momentum_cap
+    assert cfg.mr_top_n == dummy_cfg.mr_top_n
+    assert cfg.mom_weight == dummy_cfg.mom_weight
+    assert cfg.mr_weight == dummy_cfg.mr_weight
+
+    assert isinstance(best_cfg, backend.HybridConfig)
+    assert best_cfg == dummy_cfg
+    pd.testing.assert_frame_equal(search_diag, diagnostics)
+
+    kwargs = captured.get("optimizer_kwargs", {})
+    assert kwargs.get("tc_bps") == 15.0

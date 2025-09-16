@@ -1,6 +1,7 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
 import os, io, warnings, json, hashlib
 from typing import Optional, Tuple, Dict, List, Any, Callable
+from dataclasses import replace
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -2124,15 +2125,40 @@ def run_backtest_isa_dynamic(
     mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
     apply_quality_filter: bool = False,
-) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+    auto_optimize: bool = False,
+) -> Tuple[
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[HybridConfig],
+    pd.DataFrame,
+]:
     """
     Enhanced ISA-Dynamic hybrid backtest with new features.
 
     Parameters
     ----------
+    auto_optimize : bool, optional
+        When ``True`` the new Bayesian/evolutionary optimiser is used to search
+        across ``HybridConfig`` parameters.  The best configuration and the
+        optimisation diagnostics table are returned alongside the backtest
+        outputs.
     apply_quality_filter: bool, optional
         If True, filter the universe using *current* fundamentals. Leave False
         during historical backtests to avoid look-ahead bias.
+
+    Returns
+    -------
+    strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno : Series or None
+        Primary backtest curves (gross/net strategy equity, benchmark equity
+        and turnover).  These match the legacy return values.
+    best_config : HybridConfig or None
+        The best configuration returned by :func:`optimizer.bayesian_optimize_hybrid`
+        when ``auto_optimize`` is enabled; otherwise ``None``.
+    search_diagnostics : DataFrame
+        Tabular record of the optimiser evaluations.  Empty when optimisation is
+        disabled.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -2140,7 +2166,7 @@ def run_backtest_isa_dynamic(
     # Universe & data (helper)
     close, vol, sectors_map, label = _prepare_universe_for_backtest(universe_choice, start_date, end_date)
     if close.empty or "QQQ" not in close.columns:
-        return None, None, None, None
+        return None, None, None, None, None, pd.DataFrame()
 
     # Liquidity floor (optional)
     if min_dollar_volume > 0:
@@ -2151,7 +2177,7 @@ def run_backtest_isa_dynamic(
         )
         keep_cols = [c for c in keep if c in close.columns]
         if not keep_cols:
-            return None, None, None, None
+            return None, None, None, None, None, pd.DataFrame()
         close = close[keep_cols + ["QQQ"]]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep_cols}
 
@@ -2167,11 +2193,50 @@ def run_backtest_isa_dynamic(
             fundamentals, min_profitability=min_prof, max_leverage=max_lev
         )
         if not keep:
-            return None, None, None, None
+            return None, None, None, None, None, pd.DataFrame()
         daily = daily[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
 
-    if any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
+    optimization_cfg: Optional[HybridConfig] = None
+    search_diagnostics = pd.DataFrame()
+
+    if auto_optimize:
+        base_defaults = HybridConfig()
+        base_cfg = HybridConfig(
+            momentum_lookback_m=base_defaults.momentum_lookback_m,
+            momentum_top_n=top_n or base_defaults.momentum_top_n,
+            momentum_cap=name_cap or base_defaults.momentum_cap,
+            mr_lookback_days=base_defaults.mr_lookback_days,
+            mr_top_n=mr_topn or base_defaults.mr_top_n,
+            mr_long_ma_days=base_defaults.mr_long_ma_days,
+            mom_weight=mom_weight or base_defaults.mom_weight,
+            mr_weight=mr_weight or base_defaults.mr_weight,
+            predictive_weight=0.0,
+            target_vol_annual=base_defaults.target_vol_annual,
+        )
+        search_space = {
+            "momentum_top_n": range(6, 21),
+            "momentum_cap": [0.15, 0.2, 0.25, 0.3, 0.35],
+            "momentum_lookback_m": [3, 6, 9, 12],
+            "mr_top_n": [2, 3, 4, 5, 6],
+            "mr_lookback_days": [10, 15, 21, 30],
+            "mr_long_ma_days": [150, 180, 200, 220, 250],
+            "mom_weight": [0.55, 0.65, 0.75, 0.85, 0.9],
+            "mr_weight": [0.05, 0.15, 0.25, 0.35, 0.45],
+        }
+        optimization_cfg, search_diagnostics = optimizer.bayesian_optimize_hybrid(
+            daily,
+            search_space=search_space,
+            base_cfg=base_cfg,
+            tc_bps=roundtrip_bps if show_net else 0.0,
+            apply_vol_target=False,
+        )
+        top_n = optimization_cfg.momentum_top_n
+        name_cap = optimization_cfg.momentum_cap
+        mr_topn = optimization_cfg.mr_top_n
+        mom_weight = optimization_cfg.mom_weight
+        mr_weight = optimization_cfg.mr_weight
+    elif any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
         cfg, opt_sector_cap = optimize_hybrid_strategy(daily)
         top_n = top_n or cfg.momentum_top_n
         name_cap = name_cap or cfg.momentum_cap
@@ -2179,15 +2244,19 @@ def run_backtest_isa_dynamic(
         mr_weight = mr_weight or cfg.mr_weight
         sector_cap = sector_cap or opt_sector_cap
 
-    cfg = HybridConfig(
-        momentum_top_n=top_n,
-        momentum_cap=name_cap,
-        mr_top_n=mr_topn,
-        mom_weight=mom_weight,
-        mr_weight=mr_weight,
-        mr_lookback_days=21,
-        mr_long_ma_days=200,
-    )
+    if optimization_cfg is not None:
+        cfg = replace(optimization_cfg, tc_bps=roundtrip_bps if show_net else 0.0)
+    else:
+        cfg = HybridConfig(
+            momentum_top_n=top_n,
+            momentum_cap=name_cap,
+            mr_top_n=mr_topn,
+            mom_weight=mom_weight,
+            mr_weight=mr_weight,
+            mr_lookback_days=21,
+            mr_long_ma_days=200,
+            tc_bps=roundtrip_bps if show_net else 0.0,
+        )
 
     res = strategy_core.run_hybrid_backtest(daily, cfg)
     hybrid_gross = res["hybrid_rets"]
@@ -2210,7 +2279,14 @@ def run_backtest_isa_dynamic(
     strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
     qqq_cum = (1 + qqq.resample("M").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
 
-    return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
+    return (
+        strat_cum_gross,
+        strat_cum_net,
+        qqq_cum,
+        hybrid_tno,
+        optimization_cfg,
+        search_diagnostics,
+    )
     
 # =========================
 # Diff engine (for Plan tab) - Unchanged

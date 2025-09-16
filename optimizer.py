@@ -19,8 +19,9 @@ Example
 from __future__ import annotations
 
 import itertools
+import random
 from dataclasses import replace, fields
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Tuple, Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -115,3 +116,256 @@ def grid_search_hybrid(
     if not results.empty and "sharpe" in results.columns:
         results = results.sort_values("sharpe", ascending=False).reset_index(drop=True)
     return best_cfg, results
+
+
+def _normalize_domain(name: str, values: Iterable[Any] | range | tuple[Any, ...] | None, base_value: Any) -> list[Any]:
+    """Normalize a parameter domain to a list of python scalars."""
+    if values is None:
+        domain: list[Any] = []
+    elif isinstance(values, range):
+        domain = list(values)
+    elif isinstance(values, tuple) and len(values) in (2, 3):
+        lo, hi = values[:2]
+        if len(values) == 3:
+            step = values[2]
+            if step == 0:
+                domain = [lo]
+            else:
+                # ``np.arange`` handles float steps gracefully
+                domain = list(np.arange(lo, hi + (step if step > 0 else -step), step))
+        elif isinstance(lo, int) and isinstance(hi, int):
+            step = 1 if hi >= lo else -1
+            domain = list(range(lo, hi + step, step))
+        else:
+            num = max(int(abs(float(hi) - float(lo)) // 0.05), 5)
+            domain = list(np.linspace(lo, hi, num=num))
+    else:
+        domain = list(values)
+
+    if not domain:
+        domain = [base_value]
+
+    cleaned: list[Any] = []
+    for val in domain:
+        if isinstance(base_value, bool):
+            cleaned.append(bool(val))
+        elif isinstance(base_value, int) and not isinstance(base_value, bool):
+            cleaned.append(int(round(float(val))))
+        elif base_value is None:
+            cleaned.append(val)
+        else:
+            cleaned.append(float(val))
+
+    if base_value not in cleaned:
+        cleaned.append(base_value)
+
+    # preserve insertion order but drop duplicates
+    seen: set[Any] = set()
+    unique: list[Any] = []
+    for val in cleaned:
+        key = val if isinstance(val, (int, float, str)) or val is None else repr(val)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(val)
+    return unique
+
+
+def bayesian_optimize_hybrid(
+    daily_prices: pd.DataFrame,
+    search_space: Dict[str, Iterable[Any] | range | tuple[Any, ...]] | None = None,
+    base_cfg: HybridConfig | None = None,
+    tc_bps: float = 0.0,
+    apply_vol_target: bool = False,
+    population_size: int = 12,
+    n_iter: int = 30,
+    elite_fraction: float = 0.3,
+    seed: int | None = None,
+) -> Tuple[HybridConfig, pd.DataFrame]:
+    """Evolutionary search for a Sharpe-maximising ``HybridConfig``.
+
+    Parameters
+    ----------
+    daily_prices : DataFrame
+        Daily price history used for backtesting the candidate configurations.
+    search_space : dict, optional
+        Mapping of ``HybridConfig`` field names to candidate values.  Values may
+        be iterables, ranges, or ``(low, high[, step])`` tuples.  When omitted a
+        sensible default search space spanning the key hybrid parameters is used.
+    base_cfg : HybridConfig, optional
+        Configuration providing defaults for unspecified fields.  By default the
+        vanilla :class:`HybridConfig` is used.
+    tc_bps : float, optional
+        Trading cost applied during optimisation (per rebalance in basis points).
+    apply_vol_target : bool, optional
+        Whether to apply volatility targeting within ``run_hybrid_backtest``
+        during evaluation.  Mirrors the behaviour of :func:`grid_search_hybrid`.
+    population_size : int, optional
+        Number of candidates maintained in the evolutionary population.
+    n_iter : int, optional
+        Number of evolutionary iterations to perform after the initial
+        population has been evaluated.
+    elite_fraction : float, optional
+        Fraction of the population treated as the elite pool when generating
+        offspring (default 30%).
+    seed : int, optional
+        Optional random seed for reproducibility.
+
+    Returns
+    -------
+    best_cfg : HybridConfig
+        The best performing configuration discovered.
+    diagnostics : DataFrame
+        Table containing the evaluated candidates, Sharpe scores and metadata.
+    """
+
+    base_cfg = replace(base_cfg or HybridConfig(), tc_bps=tc_bps)
+
+    if daily_prices is None or daily_prices.empty:
+        return base_cfg, pd.DataFrame()
+
+    cfg_fields = {f.name for f in fields(HybridConfig)}
+    default_space: Dict[str, Sequence[Any]] = {
+        "momentum_top_n": range(6, 21),
+        "momentum_cap": [0.15, 0.2, 0.25, 0.3, 0.35],
+        "momentum_lookback_m": [3, 6, 9, 12],
+        "mr_top_n": [2, 3, 4, 5, 6],
+        "mr_lookback_days": [10, 15, 21, 30],
+        "mr_long_ma_days": [150, 180, 200, 220, 250],
+        "mom_weight": [0.55, 0.65, 0.75, 0.85, 0.9],
+        "mr_weight": [0.05, 0.15, 0.25, 0.35, 0.45],
+        "target_vol_annual": [base_cfg.target_vol_annual] if base_cfg.target_vol_annual is not None else [None],
+        "predictive_weight": [0.0],
+    }
+
+    raw_space = default_space.copy()
+    if search_space:
+        for key, domain in search_space.items():
+            if key not in cfg_fields:
+                continue
+            raw_space[key] = domain
+
+    normalized_space: Dict[str, list[Any]] = {}
+    for name, domain in raw_space.items():
+        if name not in cfg_fields:
+            continue
+        normalized_space[name] = _normalize_domain(name, domain, getattr(base_cfg, name))
+
+    # Ensure every optimised field includes at least the base value
+    for name in cfg_fields:
+        if name not in normalized_space:
+            normalized_space[name] = [getattr(base_cfg, name)]
+
+    variable_fields = [name for name, domain in normalized_space.items() if len(domain) > 1]
+    if not variable_fields:
+        return base_cfg, pd.DataFrame()
+
+    rng = random.Random(seed)
+    elite_size = max(1, int(population_size * elite_fraction))
+
+    evaluated: Dict[Tuple[Tuple[str, Any], ...], float] = {}
+    history: list[dict[str, Any]] = []
+    best_score = float("-inf")
+    best_cfg = base_cfg
+
+    def _evaluate(params: Dict[str, Any], iteration: int, origin: str) -> float:
+        nonlocal best_score, best_cfg
+        key = tuple(sorted(params.items()))
+        if key in evaluated:
+            return evaluated[key]
+
+        cfg = replace(base_cfg, **params)
+        try:
+            res = run_hybrid_backtest(daily_prices, cfg, apply_vol_target=apply_vol_target)
+            rets = res.get("hybrid_rets_net") or res.get("hybrid_rets")
+            if rets is None:
+                raise ValueError("run_hybrid_backtest returned no returns")
+            rets = pd.Series(rets).dropna()
+            if rets.empty:
+                raise ValueError("No returns to evaluate")
+            periods_per_year = _infer_periods_per_year(pd.Index(rets.index))
+            score = _annualized_sharpe(rets, periods_per_year=periods_per_year)
+            error = None
+        except Exception as exc:  # pragma: no cover - handled gracefully
+            periods_per_year = float("nan")
+            score = float("-inf")
+            error = str(exc)
+
+        row = {name: params.get(name, getattr(base_cfg, name)) for name in variable_fields}
+        row.update(
+            {
+                "iteration": iteration,
+                "origin": origin,
+                "evaluation": len(history) + 1,
+                "sharpe": score,
+                "periods_per_year": periods_per_year,
+                "error": error,
+            }
+        )
+        history.append(row)
+
+        evaluated[key] = score
+        if score > best_score:
+            best_score = score
+            best_cfg = cfg
+        return score
+
+    def _sample_candidate(source: Sequence[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        for name in variable_fields:
+            domain = normalized_space[name]
+            if source and rng.random() < 0.5:
+                choice = rng.choice(source)[name]
+            else:
+                choice = rng.choice(domain)
+            params[name] = choice
+        return params
+
+    population: list[Dict[str, Any]] = []
+    scores: list[float] = []
+
+    # Initial random population
+    while len(population) < population_size:
+        candidate = _sample_candidate()
+        score = _evaluate(candidate, iteration=0, origin="init")
+        population.append(candidate)
+        scores.append(score)
+
+    # Evolutionary loop
+    for iteration in range(1, n_iter + 1):
+        # Sort population by score descending
+        order = np.argsort(scores)[::-1]
+        population = [population[i] for i in order]
+        scores = [scores[i] for i in order]
+        elite = population[:elite_size]
+
+        parent_pool = elite if elite else population
+        parent_a = rng.choice(parent_pool)
+        parent_b = rng.choice(parent_pool)
+        offspring = {}
+        for name in variable_fields:
+            domain = normalized_space[name]
+            if rng.random() < 0.45:
+                offspring[name] = parent_a[name]
+            elif rng.random() < 0.9:
+                offspring[name] = parent_b[name]
+            else:
+                offspring[name] = rng.choice(domain)
+
+            # Occasional mutation
+            if rng.random() < 0.2:
+                offspring[name] = rng.choice(domain)
+
+        score = _evaluate(offspring, iteration=iteration, origin="evolve")
+        population.append(offspring)
+        scores.append(score)
+        # Keep population bounded
+        if len(population) > population_size:
+            worst = int(np.argmin(scores))
+            population.pop(worst)
+            scores.pop(worst)
+
+    diagnostics = pd.DataFrame(history)
+    if not diagnostics.empty:
+        diagnostics = diagnostics.sort_values("evaluation").reset_index(drop=True)
+    return best_cfg, diagnostics
