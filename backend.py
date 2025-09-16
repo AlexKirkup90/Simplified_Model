@@ -2753,31 +2753,31 @@ def run_backtest_isa_dynamic(
         mr_weight = mr_weight or cfg.mr_weight
         sector_cap = sector_cap or opt_sector_cap
 
-# --- Build HybridConfig (works with/without an optimizer-provided cfg) ---
-tc_for_sim = roundtrip_bps if show_net else 0.0
+    # --- Build HybridConfig (works with/without an optimizer-provided cfg) ---
+    tc_for_sim = roundtrip_bps if show_net else 0.0
 
-# Only pass non-None overrides so dataclass defaults remain intact
-base_kwargs = {
-    "momentum_top_n": top_n,
-    "momentum_cap": name_cap,
-    "mr_top_n": mr_topn,
-    "mom_weight": mom_weight,
-    "mr_weight": mr_weight,
-    "mr_lookback_days": 21,
-    "mr_long_ma_days": 200,
-    "tc_bps": tc_for_sim,
-    # apply vol target only if requested
-    "target_vol_annual": (target_vol_annual if apply_vol_target else None),
-}
+    # Only pass non-None overrides so dataclass defaults remain intact
+    base_kwargs = {
+        "momentum_top_n": top_n,
+        "momentum_cap": name_cap,
+        "mr_top_n": mr_topn,
+        "mom_weight": mom_weight,
+        "mr_weight": mr_weight,
+        "mr_lookback_days": 21,
+        "mr_long_ma_days": 200,
+        "tc_bps": tc_for_sim,
+        # apply vol target only if requested
+        "target_vol_annual": (target_vol_annual if apply_vol_target else None),
+    }
 
-# Drop keys whose values are None to avoid overriding dataclass defaults
-base_kwargs = {k: v for k, v in base_kwargs.items() if v is not None}
+    # Drop keys whose values are None to avoid overriding dataclass defaults
+    base_kwargs = {k: v for k, v in base_kwargs.items() if v is not None}
 
-# If an optimisation step produced a config, start from it and overlay overrides
-if "optimization_cfg" in locals() and optimization_cfg is not None:
-    cfg = replace(optimization_cfg, **base_kwargs)
-else:
-    cfg = HybridConfig(**base_kwargs)
+    # If an optimisation step produced a config, start from it and overlay overrides
+    if "optimization_cfg" in locals() and optimization_cfg is not None:
+        cfg = replace(optimization_cfg, **base_kwargs)
+    else:
+        cfg = HybridConfig(**base_kwargs)
 
     res = strategy_core.run_hybrid_backtest(daily, cfg, apply_vol_target=apply_vol_target)
     hybrid_gross = res["hybrid_rets"]
