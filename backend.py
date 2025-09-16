@@ -22,8 +22,34 @@ warnings.filterwarnings("ignore")
 # =========================
 # Config & Secrets
 # =========================
-GIST_ID = st.secrets.get("GIST_ID")
-GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
+import os
+import logging
+from typing import Callable, Optional
+
+# Streamlit might not be available (e.g., non-UI contexts)
+try:
+    import streamlit as st  # type: ignore
+    _HAS_ST = True
+except Exception:
+    st = None  # type: ignore
+    _HAS_ST = False
+
+
+def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Try Streamlit secrets first; fall back to environment variables."""
+    if _HAS_ST:
+        try:
+            # st.secrets behaves like a dict
+            val = st.secrets.get(key)  # type: ignore[attr-defined]
+            if val not in (None, ""):
+                return str(val)
+        except Exception:
+            pass
+    return os.getenv(key, default)
+
+
+GIST_ID = _get_secret("GIST_ID")
+GITHUB_TOKEN = _get_secret("GITHUB_TOKEN")
 GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}" if GIST_ID else None
 HEADERS = (
     {
@@ -35,14 +61,14 @@ HEADERS = (
     else {}
 )
 
-GIST_PORTF_FILE = "portfolio.json"
-LIVE_PERF_FILE  = "live_perf.csv"
-LOCAL_PORTF_FILE = "last_portfolio.csv"
-ASSESS_LOG_FILE = "assess_log.csv"
+GIST_PORTF_FILE   = "portfolio.json"
+LIVE_PERF_FILE    = "live_perf.csv"
+LOCAL_PORTF_FILE  = "last_portfolio.csv"
+ASSESS_LOG_FILE   = "assess_log.csv"
 
-ROUNDTRIP_BPS_DEFAULT = 20
-REGIME_MA = 200
-AVG_TRADE_SIZE_DEFAULT = 0.02  # 2% avg single-leg trade size
+ROUNDTRIP_BPS_DEFAULT   = 20
+REGIME_MA               = 200
+AVG_TRADE_SIZE_DEFAULT  = 0.02  # 2% avg single-leg trade size
 
 # Defaults for regime-based exposure adjustments
 VIX_TS_THRESHOLD_DEFAULT = 1.0   # VIX3M / VIX ratio; <1 implies stress
@@ -60,8 +86,7 @@ STRATEGY_PRESETS = {
     }
 }
 
-# Default mapping from regime metrics to strategy parameters. These
-# values are recalibrated periodically by ``update_parameter_mapping``.
+# Default mapping from regime metrics to strategy parameters.
 PARAM_MAP_DEFAULTS = {
     "low_vol": 0.02,
     "high_vol": 0.04,
@@ -77,22 +102,25 @@ PARAM_MAP_DEFAULTS = {
 }
 
 
-def _emit_info(msg: str, info: Callable[[str], None] | None = None) -> None:
-    """Prefer provided info callback, then Streamlit, else logging."""
+def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
+    """Prefer provided info callback, then Streamlit (if available), else logging."""
+    # 1) Caller-provided callback
     if callable(info):
-        info(msg)
-        return
-    try:
-    import streamlit as st  # type: ignore
-except ImportError:
-    st = None
+        try:
+            info(msg)
+            return
+        except Exception:
+            pass
 
-try:
-    if st is not None:
-        st.info(msg)
-    else:
-        logging.info(msg)
-except Exception:
+    # 2) Streamlit info (if we're running under Streamlit)
+    if _HAS_ST:
+        try:
+            st.info(msg)
+            return
+        except Exception:
+            pass
+
+    # 3) Fallback to logging
     logging.info(msg)
 
 # =========================
