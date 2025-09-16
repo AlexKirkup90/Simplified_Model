@@ -577,7 +577,14 @@ def enforce_caps_iteratively(
 
     # Vectorized helpers
     ser_sector = pd.Series({k: sector_labels.get(k, "Unknown") for k in w.index})
+    idx_sector = pd.Index(ser_sector.values)
     ser_top = ser_sector.map(lambda s: s.split(":")[0])
+    idx_top = pd.Index(ser_top.values)
+    parent_labels = (
+        [k for k in group_caps.keys() if ":" not in k]
+        if group_caps
+        else []
+    )
 
     def _apply_name_caps(w: pd.Series) -> tuple[pd.Series, bool]:
         over = w[w > name_cap]
@@ -588,29 +595,26 @@ def enforce_caps_iteratively(
 
     def _apply_sector_caps(w: pd.Series) -> tuple[pd.Series, bool]:
         changed = False
-        sums = w.groupby(ser_sector).sum()
+        sums = w.groupby(idx_sector).sum()
         for sec, s in sums.items():
             cap = (group_caps.get(sec) if group_caps and sec in group_caps else sector_cap)
             if s > cap + 1e-12:
                 f = cap / s
-                idx = ser_sector[ser_sector == sec].index
-                w.loc[idx] = w.loc[idx] * f
+                mask = idx_sector == sec
+                w.loc[mask] = w.loc[mask] * f
                 changed = True
         return w, changed
 
     def _apply_parent_caps(w: pd.Series) -> tuple[pd.Series, bool]:
-        if not group_caps:
-            return w, False
-        changed = False
-        parent_labels = [k for k in group_caps.keys() if ":" not in k]
         if not parent_labels:
             return w, False
-        sums = w.groupby(ser_top).sum()
+        changed = False
+        sums = w.groupby(idx_top).sum()
         for parent in parent_labels:
             if parent in sums.index and sums[parent] > group_caps[parent] + 1e-12:
                 f = group_caps[parent] / sums[parent]
-                idx = ser_top[ser_top == parent].index
-                w.loc[idx] = w.loc[idx] * f
+                mask = idx_top == parent
+                w.loc[mask] = w.loc[mask] * f
                 changed = True
         return w, changed
 
