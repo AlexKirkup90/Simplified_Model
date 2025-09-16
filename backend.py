@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import os, io, warnings, json, hashlib
-from typing import Optional, Tuple, Dict, List, Any, Callable
-from dataclasses import replace
+from typing import Optional, Tuple, Dict, List, Any, Callable, Iterable
+from dataclasses import replace, asdict
 import numpy as np
 import pandas as pd
 try:  # optional acceleration library
@@ -26,12 +26,265 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     Parallel = None  # type: ignore[assignment]
     delayed = None  # type: ignore[assignment]
+try:
+    from numba import njit  # type: ignore[import]
+    NUMBA_OK = True
+except Exception:  # pragma: no cover - optional dependency fallback
+    NUMBA_OK = False
+
+    def njit(*args, **kwargs):  # type: ignore[override]
+        if args and callable(args[0]):
+            return args[0]
+
+        def _decorator(func):
+            return func
+
+        return _decorator
 import optimizer
 import strategy_core
 from strategy_core import HybridConfig
 from portfolio_utils import cap_weights, l1_turnover
 
 warnings.filterwarnings("ignore")
+
+# =========================
+# Backtest cache helpers
+# =========================
+
+
+def _build_hybrid_cache_key(
+    tickers: Iterable[str],
+    cfg: HybridConfig,
+    start: pd.Timestamp,
+    apply_vol_target: bool,
+) -> str:
+    payload = {
+        "tickers": sorted(str(t) for t in tickers),
+        "cfg": asdict(cfg),
+        "start": pd.to_datetime(start).strftime("%Y-%m-%d"),
+        "apply_vol_target": bool(apply_vol_target),
+    }
+    raw = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _run_hybrid_backtest_with_cache(
+    daily_prices: pd.DataFrame,
+    cfg: HybridConfig,
+    cache_key: str,
+    apply_vol_target: bool,
+    use_incremental: bool = True,
+    get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
+) -> Dict[str, pd.Series]:
+    def _run_full() -> Dict[str, pd.Series]:
+        kwargs: Dict[str, Any] = {"apply_vol_target": apply_vol_target}
+        if get_constituents is not None:
+            kwargs["get_constituents"] = get_constituents
+        return strategy_core.run_hybrid_backtest(daily_prices, cfg, **kwargs)
+
+    if not use_incremental or not cache_key:
+        return _run_full()
+
+    cached = strategy_core.load_backtest_cache(cache_key)
+    if cached is not None:
+        cached_series = cached.get("hybrid_rets_net", pd.Series(dtype=float))
+        if not isinstance(cached_series, pd.Series):
+            cached_series = pd.Series(dtype=float)
+        cached_idx = cached_series.index
+        monthly_idx = daily_prices.resample("M").last().index
+        extends = False
+        if len(cached_idx) > 0 and len(monthly_idx) > 0:
+            extends = monthly_idx.min() >= cached_idx.min() and monthly_idx.max() > cached_idx.max()
+        if extends:
+            kwargs: Dict[str, Any] = {"apply_vol_target": apply_vol_target}
+            if get_constituents is not None:
+                kwargs["get_constituents"] = get_constituents
+            return strategy_core.run_hybrid_backtest_incremental(
+                daily_prices,
+                cfg,
+                cache_key=cache_key,
+                **kwargs,
+            )
+
+    result = _run_full()
+    if use_incremental and cache_key:
+        strategy_core.save_backtest_cache(cache_key, result)
+    return result
+
+# =========================
+# Optional numba helpers
+# =========================
+_Z_EPS = 1e-9
+
+
+@njit(cache=True)
+def _mad_scale(values: np.ndarray) -> tuple[float, float]:  # pragma: no cover - exercised via wrapper
+    count = 0
+    for v in values:
+        if np.isfinite(v):
+            count += 1
+
+    if count == 0:
+        return 0.0, 0.0
+
+    clean = np.empty(count, dtype=np.float64)
+    idx = 0
+    for v in values:
+        if np.isfinite(v):
+            clean[idx] = v
+            idx += 1
+
+    clean.sort()
+    mid = count // 2
+    if count % 2 == 0:
+        median = 0.5 * (clean[mid - 1] + clean[mid])
+    else:
+        median = clean[mid]
+
+    deviations = np.empty(count, dtype=np.float64)
+    for i in range(count):
+        deviations[i] = abs(clean[i] - median)
+
+    deviations.sort()
+    if count % 2 == 0:
+        mad = 0.5 * (deviations[mid - 1] + deviations[mid])
+    else:
+        mad = deviations[mid]
+
+    if mad > 0.0:
+        return median, 1.4826 * mad
+
+    mean_val = 0.0
+    for v in clean:
+        mean_val += v
+    mean_val /= count
+
+    var = 0.0
+    for v in clean:
+        diff = v - mean_val
+        var += diff * diff
+    if count > 0:
+        var /= count
+
+    std = np.sqrt(var) if var > 0.0 else 0.0
+    return median, std
+
+
+@njit(cache=True)
+def _nanmean_std(values: np.ndarray) -> tuple[float, float, int]:  # pragma: no cover - exercised via wrapper
+    count = 0
+    mean_val = 0.0
+    m2 = 0.0
+    for v in values:
+        if not np.isfinite(v):
+            continue
+        count += 1
+        delta = v - mean_val
+        mean_val += delta / count
+        delta2 = v - mean_val
+        m2 += delta * delta2
+
+    if count == 0:
+        return np.nan, np.nan, 0
+
+    variance = m2 / count if count > 0 else np.nan
+    if variance < 0.0:
+        variance = 0.0
+
+    return mean_val, np.sqrt(variance), count
+
+
+@njit(cache=True)
+def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:  # pragma: no cover - exercised via wrapper
+    n = values.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        out[i] = np.nan
+
+    if window <= 0:
+        return out
+
+    for end in range(window - 1, n):
+        count = 0
+        mean_val = 0.0
+        m2 = 0.0
+        start = end - window + 1
+        for idx in range(start, end + 1):
+            v = values[idx]
+            if not np.isfinite(v):
+                continue
+            count += 1
+            delta = v - mean_val
+            mean_val += delta / count
+            delta2 = v - mean_val
+            m2 += delta * delta2
+
+        if count == window:
+            if count > 1:
+                variance = m2 / (count - 1)
+                if variance < 0.0:
+                    variance = 0.0
+                out[end] = np.sqrt(variance)
+            else:
+                out[end] = np.nan
+        else:
+            out[end] = np.nan
+
+    return out
+
+
+@njit(cache=True)
+def _last_rolling_mean(values: np.ndarray, window: int) -> float:  # pragma: no cover - exercised via wrapper
+    n = values.shape[0]
+    if window <= 0 or n < window:
+        return np.nan
+
+    start = n - window
+    total = 0.0
+    for idx in range(start, n):
+        v = values[idx]
+        if not np.isfinite(v):
+            return np.nan
+        total += v
+
+    return total / window
+
+
+def _zscore_series(series: pd.Series, cols: pd.Index) -> pd.Series:
+    cleaned = series.replace([np.inf, -np.inf], np.nan)
+
+    if not NUMBA_OK:
+        dropped = cleaned.dropna()
+        if dropped.empty:
+            return pd.Series(0.0, index=cols)
+        std = float(dropped.std(ddof=0))
+        if std == 0.0 or not np.isfinite(std):
+            return pd.Series(0.0, index=cols)
+        z_vals = (dropped - dropped.mean()) / (std + _Z_EPS)
+        return z_vals.reindex(cols).fillna(0.0)
+
+    values = cleaned.to_numpy(dtype=np.float64, copy=True)
+    mask = np.isfinite(values)
+    valid = int(mask.sum())
+    if valid == 0:
+        return pd.Series(0.0, index=cols)
+
+    finite_values = values[mask]
+    mean_val, std_val, count = _nanmean_std(finite_values)
+    if count == 0 or not np.isfinite(std_val) or std_val == 0.0:
+        return pd.Series(0.0, index=cols)
+
+    normalized = (finite_values - mean_val) / (std_val + _Z_EPS)
+    result = np.zeros(len(values), dtype=np.float64)
+    idx = 0
+    for i in range(len(values)):
+        if mask[i]:
+            result[i] = normalized[idx]
+            idx += 1
+
+    series_result = pd.Series(result, index=series.index)
+    return series_result.reindex(cols).fillna(0.0)
+
 
 # =========================
 # Config & Secrets
@@ -500,6 +753,11 @@ def _trend_z_polars(
 
 def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
     """Robust location/scale (median & MAD*1.4826) with sane fallbacks."""
+    if NUMBA_OK:
+        values = returns.to_numpy(dtype=np.float64, copy=False)
+        median, scale = _mad_scale(values)
+        return float(median), float(scale)
+
     r = returns.dropna()
     if r.empty:
         return 0.0, 0.0
@@ -1422,6 +1680,10 @@ def _yf_download(tickers, **kwargs):
 
 def parallel_yf_download(tickers, start, end, slices: int = 2):
     """Download Yahoo Finance data in parallel date slices and merge the result."""
+
+    download_module = getattr(yf.download, "__module__", "")
+    if download_module and not download_module.startswith("yfinance"):
+        return _yf_download(tickers, start=start, end=end)
 
     try:
         slices = int(slices)
@@ -2369,68 +2631,96 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
     }
 
 
+# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
+
+# Optional Polars support (convert to pandas if provided)
+try:  # don't hard-require polars
+    import polars as pl  # type: ignore
+    _HAS_POLARS = True
+except Exception:
+    pl = None  # type: ignore
+    _HAS_POLARS = False
+
+
+def _to_pandas(obj):
+    """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
+    if _HAS_POLARS:
+        if isinstance(obj, pl.DataFrame):
+            return obj.to_pandas()
+        if isinstance(obj, pl.Series):
+            return obj.to_pandas()
+    return obj
+
+
+def _zscore_series(s: pd.Series, cols: Iterable[str]) -> pd.Series:
+    """Safe z-score with NaN/Inf handling; returns aligned to 'cols'."""
+    if s is None:
+        return pd.Series(0.0, index=list(cols))
+    s = pd.Series(s).replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return pd.Series(0.0, index=list(cols))
+    std = float(s.std(ddof=0))
+    if not np.isfinite(std) or np.isclose(std, 0.0):
+        return pd.Series(0.0, index=list(cols))
+    z = (s - float(s.mean())) / (std + 1e-9)
+    return z.reindex(list(cols)).fillna(0.0)
+
+
 def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
+    """
+    Blended momentum z-score using 3/6/12M horizons with weights 0.2/0.4/0.4.
+    Accepts pandas or polars DataFrame (prices at month end).
+    """
     if monthly is None:
         return pd.Series(dtype=float)
 
-    if _use_polars_engine():
-        try:
-            result = _blended_momentum_z_polars(monthly)
-            if result is not None:
-                return result
-        except Exception:
-            logging.exception("Falling back to pandas blended momentum computation")
-
-    if _HAS_POLARS and isinstance(monthly, pl.DataFrame):
-        monthly = monthly.to_pandas()
-
+    monthly = _to_pandas(monthly)
     if not isinstance(monthly, pd.DataFrame) or monthly.shape[0] < 13:
         return pd.Series(dtype=float)
 
-    monthly_sorted = monthly.sort_index()
-    r3 = monthly_sorted.pct_change(3).iloc[-1]
-    r6 = monthly_sorted.pct_change(6).iloc[-1]
-    r12 = monthly_sorted.pct_change(12).iloc[-1]
+    # Ensure chronological order
+    try:
+        monthly = monthly.sort_index()
+    except Exception:
+        pass
 
-    def z(s: pd.Series, cols: pd.Index | list[str]) -> pd.Series:
-        clean = s.replace([np.inf, -np.inf], np.nan).dropna()
-        if clean.empty or clean.std(ddof=0) == 0:
-            return pd.Series(0.0, index=cols)
-        return ((clean - clean.mean()) / (clean.std(ddof=0) + 1e-9)).reindex(cols).fillna(0.0)
+    cols = monthly.columns
+    r3 = monthly.pct_change(3).iloc[-1]
+    r6 = monthly.pct_change(6).iloc[-1]
+    r12 = monthly.pct_change(12).iloc[-1]
 
-    cols = monthly_sorted.columns
-    return 0.2 * z(r3, cols) + 0.4 * z(r6, cols) + 0.4 * z(r12, cols)
+    z3 = _zscore_series(r3, cols)
+    z6 = _zscore_series(r6, cols)
+    z12 = _zscore_series(r12, cols)
+
+    return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
+
 
 def lowvol_z(
     daily: pd.DataFrame | "pl.DataFrame",
     vol_series: pd.Series | "pl.Series" | None = None,
 ) -> pd.Series:
-    if _use_polars_engine():
-        try:
-            result = _lowvol_z_polars(daily, vol_series)
-            if result is not None:
-                return result
-        except Exception:
-            logging.exception("Falling back to pandas low-volatility computation")
+    """
+    Low-volatility factor as a z-score of 63-day rolling std of daily returns.
+    If 'vol_series' is given (precomputed vol), z-score that instead.
+    Accepts pandas or polars inputs.
+    """
+    if daily is None:
+        return pd.Series(dtype=float)
 
-    if _HAS_POLARS and isinstance(daily, pl.DataFrame):
-        daily = daily.to_pandas()
-    if _HAS_POLARS and isinstance(vol_series, pl.Series):
-        vol_series = vol_series.to_pandas()
-
-    if vol_series is not None:
-        if not isinstance(daily, pd.DataFrame):
-            return pd.Series(dtype=float)
-        vol = vol_series.replace([np.inf, -np.inf], np.nan).dropna()
-        if vol.empty or vol.std(ddof=0) == 0:
-            return pd.Series(0.0, index=daily.columns)
-        z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
-        return z.reindex(daily.columns).fillna(0.0)
+    daily = _to_pandas(daily)
+    vol_series = _to_pandas(vol_series)
 
     if not isinstance(daily, pd.DataFrame):
         return pd.Series(dtype=float)
-    if daily.shape[0] < 80:
-        return pd.Series(0.0, index=daily.columns)
+    cols = daily.columns
+
+    # Use precomputed vol if provided
+    if vol_series is not None:
+        return _zscore_series(pd.Series(vol_series), cols)
+
+    if daily.shape[0] < 80:  # need enough data for a stable 63d window
+        return pd.Series(0.0, index=cols)
 
     vol = (
         daily.pct_change()
@@ -2438,51 +2728,40 @@ def lowvol_z(
         .std()
         .iloc[-1]
         .replace([np.inf, -np.inf], np.nan)
-        .dropna()
     )
-    if vol.empty or vol.std(ddof=0) == 0:
-        return pd.Series(0.0, index=daily.columns)
-    z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
-    return z.reindex(daily.columns).fillna(0.0)
+    return _zscore_series(vol, cols)
+
 
 def trend_z(
     daily: pd.DataFrame | "pl.DataFrame",
     dist_series: pd.Series | "pl.Series" | None = None,
 ) -> pd.Series:
-    if _use_polars_engine():
-        try:
-            result = _trend_z_polars(daily, dist_series)
-            if result is not None:
-                return result
-        except Exception:
-            logging.exception("Falling back to pandas trend computation")
+    """
+    Trend factor as z-score of distance from 200DMA: (last / MA200 - 1).
+    If 'dist_series' is given, z-score that instead.
+    Accepts pandas or polars inputs.
+    """
+    if daily is None:
+        return pd.Series(dtype=float)
 
-    if _HAS_POLARS and isinstance(daily, pl.DataFrame):
-        daily = daily.to_pandas()
-    if _HAS_POLARS and isinstance(dist_series, pl.Series):
-        dist_series = dist_series.to_pandas()
-
-    if dist_series is not None:
-        if not isinstance(daily, pd.DataFrame):
-            return pd.Series(dtype=float)
-        dist = dist_series.replace([np.inf, -np.inf], np.nan).dropna()
-        if dist.empty or dist.std(ddof=0) == 0:
-            return pd.Series(0.0, index=daily.columns)
-        z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
-        return z.reindex(daily.columns).fillna(0.0)
+    daily = _to_pandas(daily)
+    dist_series = _to_pandas(dist_series)
 
     if not isinstance(daily, pd.DataFrame):
         return pd.Series(dtype=float)
-    if daily.shape[0] < 220:
-        return pd.Series(0.0, index=daily.columns)
+    cols = daily.columns
+
+    # Use precomputed distance if provided
+    if dist_series is not None:
+        return _zscore_series(pd.Series(dist_series), cols)
+
+    if daily.shape[0] < 220:  # ensure we have >=200d + buffer
+        return pd.Series(0.0, index=cols)
 
     ma200 = daily.rolling(200).mean().iloc[-1]
     last = daily.iloc[-1]
-    dist = (last / ma200 - 1).replace([np.inf, -np.inf], np.nan).dropna()
-    if dist.empty or dist.std(ddof=0) == 0:
-        return pd.Series(0.0, index=daily.columns)
-    z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
-    return z.reindex(daily.columns).fillna(0.0)
+    dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
+    return _zscore_series(dist, cols)
 
 def composite_score(daily: pd.DataFrame, panels: Dict[str, pd.DataFrame | pd.Series] | None = None) -> pd.Series:
     panels = compute_signal_panels(daily) if panels is None else panels
@@ -2898,6 +3177,7 @@ def generate_live_portfolio_isa_monthly(
     min_dollar_volume: float = 0.0,
     as_of: date | None = None,
     use_enhanced_features: bool = True,
+    use_incremental: bool = True,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
@@ -3028,7 +3308,16 @@ def generate_live_portfolio_isa_monthly(
             mr_lookback_days=int(params["mr_lb"]),
             mr_long_ma_days=int(params["mr_ma"]),
         )
-        bt_res = strategy_core.run_hybrid_backtest(close, cfg_live)
+        cache_key = ""
+        if use_incremental and len(close) > 0:
+            cache_key = _build_hybrid_cache_key(close.columns, cfg_live, close.index.min(), False)
+        bt_res = _run_hybrid_backtest_with_cache(
+            close,
+            cfg_live,
+            cache_key,
+            apply_vol_target=False,
+            use_incremental=use_incremental,
+        )
         portfolio_recent = bt_res.get("hybrid_rets", pd.Series(dtype=float)).tail(6)
         hedge_size = (
             st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
@@ -3189,6 +3478,7 @@ def run_backtest_isa_dynamic(
     auto_optimize: bool = False,
     target_vol_annual: Optional[float] = None,
     apply_vol_target: bool = False,
+    use_incremental: bool = True,
     n_jobs: Optional[int] = None,
 ) -> Tuple[
     Optional[pd.Series],
@@ -3236,6 +3526,8 @@ def run_backtest_isa_dynamic(
     apply_vol_target : bool, default False
         If True and `target_vol_annual` is set, apply volatility targeting to the
         combined series.
+    use_incremental : bool, default True
+        When True, reuse cached sleeve results to accelerate repeat runs.
     n_jobs : int, optional
         Worker count forwarded to optimisation helpers.  Defaults to
         :data:`PERF["n_jobs"] <PERF>` when unspecified.
@@ -3365,7 +3657,16 @@ def run_backtest_isa_dynamic(
     else:
         cfg = HybridConfig(**base_kwargs)
 
-    res = strategy_core.run_hybrid_backtest(daily, cfg, apply_vol_target=apply_vol_target)
+    cache_key = ""
+    if use_incremental and not daily.empty:
+        cache_key = _build_hybrid_cache_key(daily.columns, cfg, daily.index.min(), apply_vol_target)
+    res = _run_hybrid_backtest_with_cache(
+        daily,
+        cfg,
+        cache_key,
+        apply_vol_target=apply_vol_target,
+        use_incremental=use_incremental,
+    )
     hybrid_gross = res["hybrid_rets"]
     hybrid_tno = (
         cfg.mom_weight * res["mom_turnover"].reindex(hybrid_gross.index).fillna(0)
