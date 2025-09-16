@@ -4542,7 +4542,9 @@ def run_trust_checks(
 
     # 3) Health (use the same series you show in Performance tab)
     # Pull what the app saved in session
-    base_cum = st.session_state.get("strategy_cum_net") or st.session_state.get("strategy_cum_gross")
+    base_cum = st.session_state.get("strategy_cum_net")
+    if base_cum is None:
+        base_cum = st.session_state.get("strategy_cum_gross")
     qqq_cum  = st.session_state.get("qqq_cum")
 
     def _to_monthly(series):
