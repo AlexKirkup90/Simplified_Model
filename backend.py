@@ -234,6 +234,125 @@ def linear_interpolate_short_gaps(
     return filled, imputed_mask
 
 
+# =========================
+# Data cleaning helpers (robust capping + interpolation)
+# =========================
+from typing import Optional, Callable, Tuple, List
+
+def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
+    """Robust location/scale (median & MAD*1.4826) with sane fallbacks."""
+    r = returns.dropna()
+    if r.empty:
+        return 0.0, 0.0
+    med = float(r.median())
+    mad = float((r - med).abs().median())
+    if mad and mad > 0:
+        scale = 1.4826 * mad
+    else:
+        std = float(r.std(ddof=0))
+        scale = std if std and std > 0 else 0.0
+    return med, scale
+
+
+def cap_abnormal_returns(
+    prices: pd.DataFrame,
+    *,
+    max_daily_move: float | None = None,
+    zscore_threshold: float | None = 4.0,
+    min_price: float | None = 0.5,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cap abnormal daily returns (robust z-scores and/or hard cap). Returns (cleaned_prices, mask)."""
+    if prices is None or prices.empty:
+        empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
+        return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
+
+    cleaned = prices.copy()
+    mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
+
+    for col in cleaned.columns:
+        series = cleaned[col].astype(float)
+        if series.dropna().shape[0] <= 1:
+            continue
+
+        returns = series.pct_change(fill_method=None)
+        loc, scale = _robust_return_stats(returns)
+
+        if (zscore_threshold is None or scale <= 0) and max_daily_move is None:
+            # nothing to do for this column
+            continue
+
+        if scale > 0 and zscore_threshold is not None:
+            z = (returns - loc) / scale
+            outliers = z.abs() > float(zscore_threshold)
+        else:
+            outliers = pd.Series(False, index=returns.index)
+
+        if max_daily_move is not None:
+            outliers |= returns.abs() > float(max_daily_move)
+
+        if not outliers.any():
+            continue
+
+        col_mask = mask[col]
+
+        for idx in outliers.index[outliers]:
+            # guard on index and NA
+            if idx not in returns.index or pd.isna(returns.loc[idx]):
+                continue
+
+            # position of the outlier point in the level series
+            try:
+                pos = series.index.get_loc(idx)
+            except KeyError:
+                continue
+            if pos <= 0:
+                continue  # need a previous valid price to reconstruct
+
+            # previous valid price
+            prev_values = series.iloc[:pos].dropna()
+            if prev_values.empty:
+                continue
+            prev_price = float(prev_values.iloc[-1])
+            if not np.isfinite(prev_price) or prev_price == 0.0:
+                continue
+
+            # clamp the return value by both z-threshold and hard cap (if provided)
+            ret_val = float(returns.loc[idx])
+            if max_daily_move is not None:
+                ret_val = float(np.clip(ret_val, -max_daily_move, max_daily_move))
+            if zscore_threshold is not None and scale > 0:
+                hi = loc + zscore_threshold * scale
+                lo = loc - zscore_threshold * scale
+                ret_val = float(np.clip(ret_val, lo, hi))
+
+            # reconstruct a new price
+            original_price = float(series.iloc[pos])
+            new_price = prev_price * (1.0 + ret_val)
+            if min_price is not None and np.isfinite(min_price):
+                new_price = max(new_price, float(min_price))
+
+            if not np.isfinite(new_price):
+                continue
+            if np.isclose(new_price, original_price, rtol=1e-9, atol=1e-12):
+                continue
+
+            # apply the change and update masks / neighboring returns
+            series.iloc[pos] = new_price
+            col_mask.loc[idx] = True
+
+            returns.loc[idx] = ret_val
+            if pos + 1 < len(series):
+                nxt_idx = series.index[pos + 1]
+                nxt_val = series.iloc[pos + 1]
+                if nxt_idx in returns.index and pd.notna(nxt_val) and new_price != 0:
+                    returns.loc[nxt_idx] = (nxt_val / new_price) - 1.0
+
+        cleaned[col] = series
+        mask[col] = col_mask
+
+    return cleaned, mask
+
+
 def clean_extreme_moves(
     prices: pd.DataFrame,
     *,
@@ -242,65 +361,31 @@ def clean_extreme_moves(
     zscore_threshold: float | None = 4.0,
     info: Optional[Callable[[str], None]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Clamp implausible price moves and return a mask of the edits made."""
-
+    """Clamp implausible price swings (robust) and return (cleaned, mask)."""
     if prices is None or prices.empty:
         empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
         return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
 
+    # Apply a basic floor first
     cleaned = prices.copy()
-    mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
+    if min_price is not None:
+        floor_mask = (cleaned < min_price) & cleaned.notna()
+        if floor_mask.any().any():
+            cleaned[floor_mask] = float(min_price)
 
-    total_fixes = 0
-    for col in cleaned.columns:
-        col_idx = cleaned.columns.get_loc(col)
-        series = cleaned[col].astype(float)
-        returns = series.pct_change()
-        if zscore_threshold is not None:
-            std = returns.std(skipna=True)
-            if std and not np.isclose(std, 0.0):
-                zscores = (returns - returns.mean(skipna=True)) / std
-            else:
-                zscores = pd.Series(np.nan, index=returns.index)
-        else:
-            zscores = pd.Series(np.nan, index=returns.index)
+    # Robust capping
+    capped, cap_mask = cap_abnormal_returns(
+        cleaned,
+        max_daily_move=max_daily_move,
+        zscore_threshold=zscore_threshold,
+        min_price=min_price,
+    )
 
-        for i, value in enumerate(series.values):
-            if pd.isna(value):
-                continue
+    fixes = int(cap_mask.values.sum())
+    if callable(info) and fixes > 0:
+        info(f"🧹 Data cleaning: Fixed {fixes} extreme price moves across all stocks")
 
-            prev_val = None
-            if i > 0:
-                prev_val = cleaned.iat[i - 1, col_idx]
-            flagged = False
-
-            if min_price is not None and value < min_price:
-                flagged = True
-
-            if prev_val is not None and not pd.isna(prev_val):
-                baseline = max(abs(prev_val), 1e-9)
-                if max_daily_move is not None and abs(value - prev_val) > max_daily_move * baseline:
-                    flagged = True
-                if zscore_threshold is not None:
-                    z_val = zscores.iat[i] if i < len(zscores) else np.nan
-                    if pd.notna(z_val) and abs(float(z_val)) > zscore_threshold:
-                        flagged = True
-
-            if flagged:
-                if prev_val is not None and not pd.isna(prev_val):
-                    replacement = float(prev_val)
-                elif min_price is not None:
-                    replacement = float(max(min_price, value))
-                else:
-                    replacement = float(value)
-                cleaned.iat[i, col_idx] = replacement
-                mask.iat[i, col_idx] = True
-                total_fixes += 1
-
-    if callable(info) and total_fixes > 0:
-        info(f"🧹 Data cleaning: Fixed {total_fixes} extreme price moves across all stocks")
-
-    return cleaned, mask
+    return capped, cap_mask.astype(bool)
 
 
 def fill_missing_data(
@@ -309,16 +394,16 @@ def fill_missing_data(
     max_gap_days: int = 3,
     info: Optional[Callable[[str], None]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fill short gaps via linear interpolation and return a mask of edits."""
-
+    """Fill short gaps via *linear interpolation on the price level* and return (filled, mask)."""
     if prices is None or prices.empty:
         empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
         return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
 
+    # Assumes `linear_interpolate_short_gaps` is defined elsewhere
     filled, mask = linear_interpolate_short_gaps(prices, max_gap=max_gap_days)
-    filled_count = int(mask.to_numpy().sum())
-    if callable(info) and filled_count > 0:
-        info(f"🔧 Data filling: Filled {filled_count} missing data points with interpolation")
+    n = int(mask.to_numpy().sum())
+    if callable(info) and n > 0:
+        info(f"🔧 Data filling: Filled {n} missing data points with interpolation")
     return filled, mask.astype(bool)
 
 
@@ -331,25 +416,30 @@ def validate_and_clean_market_data(
     zscore_threshold: float | None = 4.0,
     max_gap_days: int = 3,
     info: Optional[Callable[[str], None]] = None,
-) -> tuple[pd.DataFrame, list[str], pd.DataFrame]:
-    """Validate raw market data and apply the cleaning pipeline."""
-
+) -> tuple[pd.DataFrame, List[str], pd.DataFrame]:
+    """
+    Full validation + cleaning pipeline:
+      1) Drop tickers with too much missing data
+      2) Cap extreme moves (robust z/MAD + optional hard cap)
+      3) Interpolate short gaps on levels
+    Returns: (cleaned_df, alerts_list, combined_mask)
+    """
     if prices is None or prices.empty:
         empty = pd.DataFrame(index=getattr(prices, "index", []))
         empty_mask = pd.DataFrame(False, index=empty.index, columns=[])
         return empty, [], empty_mask
 
     data = prices.copy()
-    alerts: list[str] = []
+    alerts: List[str] = []
     original_shape = data.shape
 
+    # 1) Drop very sparse tickers
     if max_missing_ratio is not None and data.shape[1] > 0:
-        missing_fraction = data.isna().mean()
-        drop_cols = missing_fraction[missing_fraction > max_missing_ratio].index.tolist()
+        miss_frac = data.isna().mean()
+        drop_cols = miss_frac[miss_frac > max_missing_ratio].index.tolist()
         if drop_cols:
             data = data.drop(columns=drop_cols)
-            threshold_pct = int(round(max_missing_ratio * 100))
-            alerts.append(f"Removed {len(drop_cols)} stocks with >{threshold_pct}% missing data")
+            alerts.append(f"Removed {len(drop_cols)} stocks with >{int(round(max_missing_ratio*100))}% missing data")
 
     if data.shape != original_shape:
         alerts.append(f"Data shape: {original_shape} → {data.shape}")
@@ -358,6 +448,7 @@ def validate_and_clean_market_data(
         mask = pd.DataFrame(False, index=prices.index, columns=data.columns)
         return data, alerts, mask
 
+    # 2) Cap extreme moves
     cleaned, mask_clean = clean_extreme_moves(
         data,
         max_daily_move=max_daily_move,
@@ -365,15 +456,17 @@ def validate_and_clean_market_data(
         zscore_threshold=zscore_threshold,
         info=info,
     )
+
+    # 3) Fill short gaps
     filled, mask_fill = fill_missing_data(
         cleaned,
         max_gap_days=max_gap_days,
         info=info,
     )
+
     combined_mask = (mask_clean | mask_fill).astype(bool)
-
     return filled, alerts, combined_mask
-
+  
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
 # =========================
@@ -1498,7 +1591,7 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
         # Enhanced data cleaning pipeline (true linear interpolation on short gaps, etc.)
         if not result.empty:
-            cleaned_result, cleaning_alerts, _ = validate_and_clean_market_data(result, info=logging.info)
+            cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(result, info=logging.info)
 
             # Log a brief cleaning summary (top 2 alerts)
             if cleaning_alerts:
@@ -1569,7 +1662,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
         # Enhanced cleaning for prices
         if not close.empty:
-            cleaned_close, close_alerts, _ = validate_and_clean_market_data(close, info=logging.info)
+            cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
 
             # Mild cleaning for volume: align and clip extreme spikes (99th pct)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
