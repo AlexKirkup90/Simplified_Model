@@ -228,6 +228,12 @@ if go:
                 use_enhanced_features=st.session_state.get("use_enhanced_features", True),
                 auto_optimize=auto_optimize,
             )
+            if strategy_cum_gross is not None:
+                st.session_state["strategy_cum_gross"] = strategy_cum_gross
+            if strategy_cum_net is not None:
+                st.session_state["strategy_cum_net"] = strategy_cum_net
+            if qqq_cum is not None:
+                st.session_state["qqq_cum"] = qqq_cum
             if auto_cfg is not None:
                 st.session_state["auto_best_config"] = asdict(auto_cfg)
             if auto_diag is not None and not auto_diag.empty:
