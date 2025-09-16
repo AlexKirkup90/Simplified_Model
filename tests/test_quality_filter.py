@@ -48,8 +48,9 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
 
     import strategy_core
 
-    def fake_run_hybrid_backtest(daily_prices, cfg):
+    def fake_run_hybrid_backtest(daily_prices, cfg, apply_vol_target=False):
         captured["cols"] = list(daily_prices.columns)
+        captured["apply_vol_target"] = apply_vol_target
         idx = pd.date_range("2020-01-31", "2020-03-31", freq="M")
         return {
             "hybrid_rets": pd.Series(0.0, index=idx),

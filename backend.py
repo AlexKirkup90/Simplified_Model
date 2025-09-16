@@ -2124,6 +2124,8 @@ def run_backtest_isa_dynamic(
     mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
     apply_quality_filter: bool = False,
+    target_vol_annual: Optional[float] = None,
+    apply_vol_target: bool = False,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
     Enhanced ISA-Dynamic hybrid backtest with new features.
@@ -2133,6 +2135,12 @@ def run_backtest_isa_dynamic(
     apply_quality_filter: bool, optional
         If True, filter the universe using *current* fundamentals. Leave False
         during historical backtests to avoid look-ahead bias.
+    target_vol_annual: float, optional
+        Annualized volatility target (e.g., 0.15 for 15%) applied when
+        ``apply_vol_target`` is True.
+    apply_vol_target: bool, optional
+        If True, scale returns using the volatility targeting helper from
+        ``strategy_core``.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -2187,9 +2195,10 @@ def run_backtest_isa_dynamic(
         mr_weight=mr_weight,
         mr_lookback_days=21,
         mr_long_ma_days=200,
+        target_vol_annual=target_vol_annual if apply_vol_target else None,
     )
 
-    res = strategy_core.run_hybrid_backtest(daily, cfg)
+    res = strategy_core.run_hybrid_backtest(daily, cfg, apply_vol_target=apply_vol_target)
     hybrid_gross = res["hybrid_rets"]
     hybrid_tno = (
         cfg.mom_weight * res["mom_turnover"].reindex(hybrid_gross.index).fillna(0)
