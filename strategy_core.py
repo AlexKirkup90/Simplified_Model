@@ -7,8 +7,8 @@ from here to avoid code drift.
 Key features
 ------------
 - Universe building (NASDAQ-100 + optional extras)
-- Market data fetching with yfinance
-- Weight capping via iterative waterfall
+- Market data fetching with yfinance (cached)
+- Weight capping via iterative waterfall (shared in portfolio_utils)
 - Momentum sleeve (top-N, positive-only)
 - Mean-reversion sleeve (quality filter via long-term MA + worst short-term)
 - Monthly backtest engines for each sleeve and for hybrid portfolios
@@ -30,6 +30,7 @@ import yfinance as yf
 import requests
 from io import StringIO
 
+# Use shared helpers (do NOT reimplement here)
 from portfolio_utils import cap_weights, l1_turnover
 
 # ------------------------------
@@ -44,6 +45,7 @@ def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
     for i in range(0, len(tickers), size):
         yield tickers[i : i + size]
 
+
 _NDX_CONSTITUENT_CACHE: Dict[str, List[str]] = {}
 _NDX_LAST_SUCCESS: List[str] = []
 
@@ -52,6 +54,7 @@ _NDX_LAST_SUCCESS: List[str] = []
 def _fetch_market_data_cached(
     tickers_key: tuple[str, ...], start_key: str, end_key: Optional[str]
 ) -> pd.DataFrame:
+    """Cached yfinance download for adjusted Close."""
     tickers = list(tickers_key)
     if not tickers:
         return pd.DataFrame()
@@ -68,6 +71,7 @@ def _fetch_market_data_cached(
                 group_by="ticker",
             )["Close"]
         except TypeError:
+            # older yfinance versions without group_by arg
             data = yf.download(
                 batch,
                 start=start_key,
@@ -75,9 +79,11 @@ def _fetch_market_data_cached(
                 auto_adjust=True,
                 progress=False,
             )["Close"]
+
         if isinstance(data, pd.Series):
             data = data.to_frame()
             data.columns = [batch[0]]
+
         frames.append(data)
 
     if not frames:
@@ -96,19 +102,6 @@ def get_nasdaq_100_plus_tickers(
 ) -> List[str]:
     """Return NASDAQ-100 constituents for a given date plus optional extras.
 
-    Parameters
-    ----------
-    extras : iterable of str, optional
-        Additional tickers to include regardless of index membership.
-    as_of : str or pandas-compatible date, optional
-        Date for which constituents are requested (``YYYY-MM-DD``).  Defaults to
-        today's date.
-    api_url : str
-        Endpoint for NASDAQ Data Link's datatable providing historical
-        constituents.
-
-    Notes
-    -----
     Results are cached by date to avoid repeated network calls.
     """
     extras = list(extras) if extras else []
@@ -131,92 +124,49 @@ def get_nasdaq_100_plus_tickers(
             df = pd.read_csv(StringIO(resp.text))
             tickers = df["ticker"].astype(str).str.upper().str.strip().tolist()
         except Exception:
-            if _NDX_LAST_SUCCESS:
-                tickers = list(_NDX_LAST_SUCCESS)
-            else:
-                tickers = []
+            # fail-soft: reuse last successful list if available
+            tickers = list(_NDX_LAST_SUCCESS) if _NDX_LAST_SUCCESS else []
         else:
             _NDX_LAST_SUCCESS.clear()
             _NDX_LAST_SUCCESS.extend(tickers)
+
         _NDX_CONSTITUENT_CACHE[date_str] = tickers
 
     tickers = _NDX_CONSTITUENT_CACHE.get(date_str, [])
     if "SQ" in extras:
-        extras = [x for x in extras if x != "SQ"]  # acquired / renamed
+        extras = [x for x in extras if x != "SQ"]  # renamed/acquired
     return sorted(set(tickers + extras))
 
 
 def fetch_market_data(
     tickers: Iterable[str], start_date: str, end_date: Optional[str] = None
 ) -> pd.DataFrame:
-    """Fetch daily split/dividend-adjusted close prices for tickers using yfinance.
-
-    Parameters
-    ----------
-    tickers : list-like of str
-    start_date : YYYY-MM-DD
-    end_date : YYYY-MM-DD or None (None = today)
-
-    Returns
-    -------
-    DataFrame indexed by date (daily), columns=tickers.
-
-    Notes
-    -----
-    Prices are adjusted for splits and dividends via ``auto_adjust=True``.
-    """
-    
-# ------------------------------
-# 1) Market data (cached)
-# ------------------------------
-
-from functools import lru_cache  # (already imported)
-
-@lru_cache(maxsize=32)
-def _fetch_market_data_cached(
-    tickers_key: tuple[str, ...], start_key: str, end_key: Optional[str]
-) -> pd.DataFrame:
-    ...
-    return df.dropna(how="all", axis=1)
-
-def fetch_market_data(
-    tickers: Iterable[str],
-    start_date: str,
-    end_date: Optional[str] = None
-) -> pd.DataFrame:
-    """Fetch daily split/dividend-adjusted close prices for tickers.
-
-    Uses the shared cached downloader so repeated calls are fast and consistent.
-    """
+    """Fetch daily split/dividend-adjusted close prices (cached)."""
     tickers_tuple = tuple(pd.Index(tickers).astype(str)) if tickers else tuple()
     if not tickers_tuple:
         return pd.DataFrame()
 
     start_key = pd.to_datetime(start_date).strftime("%Y-%m-%d")
     end_key = pd.to_datetime(end_date).strftime("%Y-%m-%d") if end_date else None
-
     df = _fetch_market_data_cached(tickers_tuple, start_key, end_key)
-    return df.copy()
+    return df.copy()  # defensive copy so callers can't mutate cache
 
 
 # ------------------------------
 # 2) Portfolio Utilities
 # ------------------------------
 # Intentionally NOT redefining cap/turnover helpers here.
-# These are provided by the shared `portfolio_utils` module and imported at top:
-#   from portfolio_utils import cap_weights, l1_turnover
-# ------------------------------------------------------------------------------
+# They come from `portfolio_utils` (imported above).
 
-def volatility_target(returns: pd.Series,
-                      target_vol_annual: Optional[float] = None,
-                      periods_per_year: int = 12,
-                      min_leverage: float = 0.0,
-                      max_leverage: float = 1.0,
-                      lookback: int = 12) -> pd.Series:
-    """Scale monthly returns to a target annualized volatility using a rolling estimate.
-
-    If `target_vol_annual` is None, returns are unchanged.
-    """
+def volatility_target(
+    returns: pd.Series,
+    target_vol_annual: Optional[float] = None,
+    periods_per_year: int = 12,
+    min_leverage: float = 0.0,
+    max_leverage: float = 1.0,
+    lookback: int = 12,
+) -> pd.Series:
+    """Scale monthly returns to a target annualized volatility using rolling estimate."""
     if target_vol_annual is None:
         return returns
     rolling_vol = returns.rolling(lookback).std() * np.sqrt(periods_per_year)
@@ -227,15 +177,11 @@ def volatility_target(returns: pd.Series,
 
 
 def apply_tc(returns: pd.Series, turnover: pd.Series, tc_bps: float = 10.0) -> pd.Series:
-    """Apply a simple transaction-cost model (bps per 100% turnover per rebalance).
-
-    Turnover is defined as 0.5 * ||w_t - w_{t-1}||_1 at each rebalance.
-    Example: tc_bps=10 means 10 bps * turnover deducted from that period's return.
-    """
+    """Apply simple transaction cost model in basis points per 100% turnover per rebalance."""
     drag = (tc_bps / 1e4) * turnover.fillna(0)
     return returns - drag
-  
-  
+
+
 # ------------------------------
 # 3) Signal Engines (Monthly)
 # ------------------------------
@@ -245,17 +191,15 @@ def _resample_month_end(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 def momentum_signals(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Series:
-    """Return last-available momentum score per ticker at month-end (percentage change over lookback_m)."""
+    """Return last-available momentum score per ticker at month-end (pct change over lookback_m)."""
     mom = monthly_prices.pct_change(periods=lookback_m)
     return mom.iloc[-1].dropna()
 
 
-def build_momentum_weights(monthly_prices: pd.DataFrame, lookback_m: int, top_n: int,
-                           cap: float) -> Tuple[pd.Series, pd.Series]:
-    """Compute momentum weights at the *last* month-end.
-
-    Returns (weights, selected_scores) where weights sum to 1.
-    """
+def build_momentum_weights(
+    monthly_prices: pd.DataFrame, lookback_m: int, top_n: int, cap: float
+) -> Tuple[pd.Series, pd.Series]:
+    """Compute momentum weights at the *last* month-end; returns (weights, selected_scores)."""
     scores = momentum_signals(monthly_prices, lookback_m)
     scores = scores[scores > 0]
     if scores.empty:
@@ -267,19 +211,6 @@ def build_momentum_weights(monthly_prices: pd.DataFrame, lookback_m: int, top_n:
     return final_w, top
 
 
-def l1_turnover(prev_w: pd.Series | None, w: pd.Series) -> float:
-    """0.5 × L1 distance between consecutive weight vectors.
-
-    Aligns on the union of tickers so both additions and deletions are counted.
-    """
-    if prev_w is None:
-        return 0.5 * w.abs().sum()
-    union = w.index.union(prev_w.index)
-    aligned_w = w.reindex(union, fill_value=0.0)
-    aligned_prev = prev_w.reindex(union, fill_value=0.0)
-    return 0.5 * (aligned_w - aligned_prev).abs().sum()
-
-
 def run_backtest_momentum(
     daily_prices: pd.DataFrame,
     lookback_m: int = 6,
@@ -287,21 +218,14 @@ def run_backtest_momentum(
     cap: float = 0.25,
     get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
 ) -> Tuple[pd.Series, pd.Series]:
-    """Monthly backtest for the momentum sleeve.
-
-    Returns
-    -------
-    (monthly_returns, monthly_turnover)
-
-    Turnover uses 0.5 × L1 weight change between rebalances.
-    """
+    """Monthly backtest for the momentum sleeve. Returns (monthly_returns, monthly_turnover)."""
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
     mom = mp.pct_change(periods=lookback_m).shift(1)
 
     rets = pd.Series(index=mp.index, dtype=float)
     tno = pd.Series(index=mp.index, dtype=float)
-    prev_w = None
+    prev_w: Optional[pd.Series] = None
 
     for dt in mp.index:
         scores = mom.loc[dt].dropna()
@@ -309,14 +233,13 @@ def run_backtest_momentum(
             members = set(get_constituents(dt))
             scores = scores.loc[scores.index.intersection(members)]
         scores = scores[scores > 0]
+
         if scores.empty:
             rets.loc[dt] = 0.0
-            if prev_w is not None:
-                tno.loc[dt] = l1_turnover(prev_w, pd.Series(dtype=float))
-            else:
-                tno.loc[dt] = 0.0
+            tno.loc[dt] = 0.0 if prev_w is None else l1_turnover(prev_w, pd.Series(dtype=float))
             prev_w = None
             continue
+
         top = scores.nlargest(top_n)
         raw = top / top.sum()
         w = cap_weights(raw, cap=cap)
@@ -324,37 +247,21 @@ def run_backtest_momentum(
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
-        rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-        tno.loc[dt] = l1_turnover(prev_w, w)
+
+        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
+        tno.loc[dt] = float(l1_turnover(prev_w, w))
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
 
 
 def predictive_signals(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Series:
-    """Predict next-month returns via simple AR(1) on monthly returns.
-
-    For each ticker we estimate ``r_t = a + b * r_{t-1}`` over the
-    ``lookback_m`` most recent returns and use the fitted parameters to
-    forecast the next return.
-
-    Parameters
-    ----------
-    monthly_prices : DataFrame
-        Month-end prices for each ticker.
-    lookback_m : int
-        Number of months of returns to use in the regression.
-
-    Returns
-    -------
-    Series
-        Predicted next-month return for each ticker.  Missing values are
-        omitted from the result.
-    """
+    """Predict next-month returns via simple AR(1) on monthly returns."""
     rets = monthly_prices.pct_change().dropna()
-    preds = {}
+    preds: Dict[str, float] = {}
     if rets.empty:
         return pd.Series(dtype=float)
+
     for col in rets.columns:
         series = rets[col].dropna().iloc[-lookback_m:]
         if len(series) == 0:
@@ -366,19 +273,17 @@ def predictive_signals(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Seri
         X = np.vstack([np.ones(len(x)), x.values]).T
         try:
             a, b = np.linalg.lstsq(X, y.values, rcond=None)[0]
-            preds[col] = a + b * series.iloc[-1]
+            preds[col] = float(a + b * series.iloc[-1])
         except Exception:
             continue
+
     return pd.Series(preds).dropna()
 
 
-def build_predictive_weights(monthly_prices: pd.DataFrame, lookback_m: int,
-                             top_n: int, cap: float) -> Tuple[pd.Series, pd.Series]:
-    """Compute weights based on predicted returns from :func:`predictive_signals`.
-
-    Returns ``(weights, selected_scores)`` where weights sum to 1.
-    Only tickers with positive predicted returns are considered.
-    """
+def build_predictive_weights(
+    monthly_prices: pd.DataFrame, lookback_m: int, top_n: int, cap: float
+) -> Tuple[pd.Series, pd.Series]:
+    """Compute weights from :func:`predictive_signals`; returns (weights, selected_scores)."""
     scores = predictive_signals(monthly_prices, lookback_m)
     scores = scores[scores > 0]
     if scores.empty:
@@ -397,24 +302,13 @@ def run_backtest_predictive(
     cap: float = 0.25,
     get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
 ) -> Tuple[pd.Series, pd.Series]:
-    """Monthly backtest using predictive stock selection.
-
-    At each month-end an AR(1) model is fit for each ticker using the last
-    ``lookback_m`` monthly returns and the top ``top_n`` positive forecasts
-    are selected.  Weights are capped via :func:`cap_weights`.
-
-    Returns
-    -------
-    (monthly_returns, monthly_turnover)
-
-    Turnover uses 0.5 × L1 weight change between rebalances.
-    """
+    """Monthly backtest using predictive selection. Returns (monthly_returns, monthly_turnover)."""
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
 
     rets = pd.Series(index=mp.index, dtype=float)
     tno = pd.Series(index=mp.index, dtype=float)
-    prev_w = None
+    prev_w: Optional[pd.Series] = None
 
     for dt in mp.index:
         hist = mp.loc[:dt]
@@ -423,11 +317,13 @@ def run_backtest_predictive(
             members = set(get_constituents(dt))
             scores = scores.loc[scores.index.intersection(members)]
         scores = scores[scores > 0]
+
         if scores.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         top = scores.nlargest(top_n)
         raw = top / top.sum()
         w = cap_weights(raw, cap=cap)
@@ -436,8 +332,9 @@ def run_backtest_predictive(
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
-        rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-        tno.loc[dt] = l1_turnover(prev_w, w)
+
+        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum()))
+        tno.loc[dt] = float(l1_turnover(prev_w, w))
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -450,11 +347,9 @@ def run_backtest_mean_reversion(
     long_ma_days: int = 200,
     get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
 ) -> Tuple[pd.Series, pd.Series]:
-    """Monthly backtest for the mean-reversion sleeve with long-term uptrend filter.
+    """Monthly backtest for the mean-reversion sleeve with a long-term uptrend filter.
 
-    Returns
-    -------
-    (monthly_returns, monthly_turnover)
+    Returns (monthly_returns, monthly_turnover).
     """
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
@@ -466,17 +361,8 @@ def run_backtest_mean_reversion(
     tno = pd.Series(index=mp.index, dtype=float)
     prev_w: Optional[pd.Series] = None
 
-    # Local fallback if a shared helper isn't available
-    def _l1_turnover(prev_w_: Optional[pd.Series], w_: pd.Series) -> float:
-        if prev_w_ is None or prev_w_.empty:
-            # first rebalance: 0.5 * ||w - 0||_1 = 0.5 * sum(|w|)
-            return float(0.5 * w_.abs().sum())
-        union = w_.index.union(prev_w_.index)
-        a = w_.reindex(union, fill_value=0.0)
-        b = prev_w_.reindex(union, fill_value=0.0)
-        return float(0.5 * (a - b).abs().sum())
-
     for dt in mp.index:
+        # Guard against fully-NaN trend row (early history)
         trend_row = trend.loc[dt]
         if trend_row.isna().all():
             rets.loc[dt] = 0.0
@@ -484,6 +370,7 @@ def run_backtest_mean_reversion(
             prev_w = None
             continue
 
+        # Quality: price above long MA
         quality = mp.loc[dt] > trend_row
         if get_constituents is not None:
             members = set(get_constituents(dt))
@@ -495,6 +382,7 @@ def run_backtest_mean_reversion(
             prev_w = None
             continue
 
+        # Among quality names, pick worst short-term performers
         candidates = short.loc[dt, pool].dropna()
         if candidates.empty:
             rets.loc[dt] = 0.0
@@ -514,18 +402,21 @@ def run_backtest_mean_reversion(
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
-rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
-tno.loc[dt] = float(l1_turnover(prev_w, w))
+
+        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
+        tno.loc[dt] = float(l1_turnover(prev_w, w))
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
+
 
 # ------------------------------
 # 4) Hybrid & Benchmarks
 # ------------------------------
 
-def combine_hybrid(mom_rets: pd.Series, mr_rets: pd.Series,
-                   mom_weight: float = 0.90, mr_weight: float = 0.10) -> pd.Series:
+def combine_hybrid(
+    mom_rets: pd.Series, mr_rets: pd.Series, mom_weight: float = 0.90, mr_weight: float = 0.10
+) -> pd.Series:
     """Linear blend of two monthly return series on a matched index."""
     idx = mom_rets.index.union(mr_rets.index)
     mom = mom_rets.reindex(idx).fillna(0)
@@ -541,16 +432,18 @@ def cumulative_growth(returns: pd.Series) -> pd.Series:
 # 5) Metrics
 # ------------------------------
 
-def get_performance_metrics(returns: pd.Series,
-                            periods_per_year: int = 12,
-                            use_quantstats: bool = True) -> Dict[str, str]:
-    """Compute performance metrics; prefer quantstats if available.
-
-    Returns a dict of formatted strings.
-    """
+def get_performance_metrics(
+    returns: pd.Series, periods_per_year: int = 12, use_quantstats: bool = True
+) -> Dict[str, str]:
+    """Compute performance metrics; prefer quantstats if available."""
     if returns is None or len(returns) < 2 or returns.isna().all():
-        return {"Annual Return": "N/A", "Sharpe Ratio": "N/A", "Sortino Ratio": "N/A",
-                "Calmar Ratio": "N/A", "Max Drawdown": "N/A"}
+        return {
+            "Annual Return": "N/A",
+            "Sharpe Ratio": "N/A",
+            "Sortino Ratio": "N/A",
+            "Calmar Ratio": "N/A",
+            "Max Drawdown": "N/A",
+        }
 
     if use_quantstats:
         try:
@@ -568,27 +461,21 @@ def get_performance_metrics(returns: pd.Series,
                 "Max Drawdown": f"{mdd:.2%}",
             }
         except Exception:
-            # fall back below
-            pass
+            pass  # fall back below
 
-    # Fallback metrics (monthly series expected)
     mean = returns.mean()
     std = returns.std()
     ann_ret = (1 + mean) ** periods_per_year - 1 if pd.notna(mean) else np.nan
     ann_vol = std * np.sqrt(periods_per_year) if pd.notna(std) else np.nan
 
-    # Max drawdown
     curve = cumulative_growth(returns)
     peak = curve.cummax()
     mdd = ((curve - peak) / peak).min()
 
-    # Sortino (downside std)
     downside = returns.copy()
     downside[downside > 0] = 0
     d_std = downside.std()
     sortino = (mean * periods_per_year) / (d_std * np.sqrt(periods_per_year) + 1e-9) if pd.notna(d_std) else np.nan
-
-    # Calmar (ann ret / |mdd|)
     calmar = (ann_ret / abs(mdd)) if (pd.notna(ann_ret) and pd.notna(mdd) and mdd != 0) else np.nan
 
     return {
@@ -603,6 +490,7 @@ def get_performance_metrics(returns: pd.Series,
 # ------------------------------
 # 6) Convenience Runner
 # ------------------------------
+
 @dataclass
 class HybridConfig:
     momentum_lookback_m: int = 6
@@ -629,9 +517,8 @@ def run_hybrid_backtest(
 ) -> Dict[str, pd.Series]:
     """Run sleeves, blend, and return useful Series.
 
-    Always runs momentum and mean-reversion sleeves.  If
-    ``cfg.predictive_weight`` is greater than zero, the predictive sleeve is
-    also evaluated and included in the final blend.
+    Always runs momentum and mean-reversion sleeves. If cfg.predictive_weight > 0,
+    the predictive sleeve is also evaluated and included.
     """
     mom_rets, mom_tno = run_backtest_momentum(
         daily_prices,
@@ -678,7 +565,6 @@ def run_hybrid_backtest(
     if cfg.tc_bps != 0:
         hybrid_net = apply_tc(hybrid_gross, turnover, tc_bps=cfg.tc_bps)
 
-    # Optional vol targeting on combined series
     if apply_vol_target and cfg.target_vol_annual is not None:
         hybrid_net = volatility_target(hybrid_net, target_vol_annual=cfg.target_vol_annual)
 
@@ -691,9 +577,9 @@ def run_hybrid_backtest(
         "mr_turnover": mr_tno,
         "pred_rets": pred_rets,
         "pred_turnover": pred_tno,
-        "hybrid_rets": hybrid_net,
-        "hybrid_rets_net": hybrid_net,
-        "hybrid_rets_gross": hybrid_gross,
+        "hybrid_rets": hybrid_net,          # kept for backward-compat
+        "hybrid_rets_net": hybrid_net,      # explicit net
+        "hybrid_rets_gross": hybrid_gross,  # explicit gross
         "hybrid_turnover": turnover,
         "hybrid_equity": equity,
     }
@@ -705,50 +591,17 @@ def walk_forward_backtest(
     train_years: int = 3,
     val_years: int = 1,
 ) -> Dict[str, Any]:
-    """Run a simple walk-forward backtest and return average metrics.
-
-    The data is split into consecutive ``train_years``/``val_years`` windows.
-    For each window, :func:`run_hybrid_backtest` is evaluated on the combined
-    period but only the validation slice is used to compute performance
-    metrics.  Sharpe and Sortino ratios are computed for each validation
-    slice and then averaged across all windows.
-
-    Parameters
-    ----------
-    prices : DataFrame
-        Daily price data for the universe.
-    cfg : HybridConfig
-        Configuration passed to :func:`run_hybrid_backtest`.
-    train_years : int, default ``3``
-        Length of the in-sample training window in years.
-    val_years : int, default ``1``
-        Length of the out-of-sample validation window in years.
-
-    Returns
-    -------
-    dict
-        Dictionary containing the average ``sharpe`` and ``sortino`` along
-        with per-window metrics under ``windows``.
-    """
-
+    """Run a simple walk-forward backtest and return average metrics."""
     def _metrics(returns: pd.Series) -> Tuple[float, float]:
         if returns.empty:
             return float("nan"), float("nan")
         mean = returns.mean()
         std = returns.std()
-        sharpe = (
-            (mean * 12) / (std * np.sqrt(12) + 1e-9)
-            if pd.notna(std) and std != 0
-            else float("nan")
-        )
+        sharpe = (mean * 12) / (std * np.sqrt(12) + 1e-9) if pd.notna(std) and std != 0 else float("nan")
         downside = returns.copy()
         downside[downside > 0] = 0
         d_std = downside.std()
-        sortino = (
-            (mean * 12) / (d_std * np.sqrt(12) + 1e-9)
-            if pd.notna(d_std) and d_std != 0
-            else float("nan")
-        )
+        sortino = (mean * 12) / (d_std * np.sqrt(12) + 1e-9) if pd.notna(d_std) and d_std != 0 else float("nan")
         return float(sharpe), float(sortino)
 
     start = prices.index.min()
