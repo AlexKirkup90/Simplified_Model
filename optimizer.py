@@ -23,10 +23,43 @@ import random
 from dataclasses import replace, fields
 from typing import Dict, Iterable, Tuple, Any, Sequence
 
+try:
+    from joblib import Parallel, delayed
+except Exception:  # pragma: no cover - optional dependency fallback
+    def delayed(func):
+        def wrapper(*args, **kwargs):
+            return lambda: func(*args, **kwargs)
+
+        return wrapper
+
+    class Parallel:  # type: ignore[misc]
+        def __init__(self, n_jobs: int | None = None, backend: str | None = None, batch_size: str | None = None):
+            self.n_jobs = n_jobs
+            self.backend = backend
+            self.batch_size = batch_size
+
+        def __call__(self, iterable: Iterable[Any]) -> list[Any]:
+            return [task() for task in iterable]
+
 import numpy as np
 import pandas as pd
 
 from strategy_core import HybridConfig, run_hybrid_backtest
+
+
+def _get_perf_settings() -> Dict[str, Any]:
+    """Fetch ``PERF`` tuning hints from :mod:`backend` with safe fallbacks."""
+
+    defaults: Dict[str, Any] = {"parallel_grid": True, "n_jobs": 1}
+    try:
+        import backend as _backend  # type: ignore
+
+        perf = getattr(_backend, "PERF", None)
+        if isinstance(perf, dict):
+            defaults.update(perf)
+    except Exception:
+        pass
+    return defaults
 
 
 def _infer_periods_per_year(index: pd.DatetimeIndex) -> float:
@@ -70,47 +103,62 @@ def _annualized_sharpe(returns: pd.Series, periods_per_year: float | None = None
 
 
 def grid_search_hybrid(
-    daily_prices: pd.DataFrame,
-    param_grid: Dict[str, Iterable],
+    prices: pd.DataFrame,
+    search_grid: Dict[str, Iterable],
+    n_jobs: int | None = None,
     base_cfg: HybridConfig | None = None,
     tc_bps: float = 0.0,
     apply_vol_target: bool = False,
 ) -> Tuple[HybridConfig, pd.DataFrame]:
-    """Search over ``param_grid`` and return best config and results table."""
+    """Search over ``search_grid`` and return best config and results table."""
+
     base_cfg = base_cfg or HybridConfig()
 
-    # Only allow fields that exist on HybridConfig
+    perf = _get_perf_settings()
+    n_jobs = n_jobs or (perf["n_jobs"] if perf.get("parallel_grid", True) else 1)
+
     cfg_fields = {f.name for f in fields(HybridConfig)}
-    grid = {k: list(v) for k, v in param_grid.items() if k in cfg_fields}
-    if not grid:
-        grid = {"momentum_top_n": [base_cfg.momentum_top_n], "momentum_cap": [base_cfg.momentum_cap]}
-    keys = list(grid.keys())
+    normalized_grid = {k: list(v) for k, v in search_grid.items() if k in cfg_fields}
+    if not normalized_grid:
+        normalized_grid = {
+            "momentum_top_n": [base_cfg.momentum_top_n],
+            "momentum_cap": [base_cfg.momentum_cap],
+        }
+    keys = list(normalized_grid.keys())
+    grid_values = [normalized_grid[k] for k in keys]
 
-    best_score = float("-inf")
-    best_cfg = base_cfg
-    rows: list[dict] = []
-
-    # Try all combos; skip ones that error gracefully
-    for combo in itertools.product(*grid.values()):
+    def _evaluate_combo(combo: Tuple[Any, ...]) -> Tuple[HybridConfig | None, Dict[str, Any]]:
         params = dict(zip(keys, combo))
         try:
             cfg = replace(base_cfg, **params, tc_bps=tc_bps)
-            res = run_hybrid_backtest(daily_prices, cfg, apply_vol_target=apply_vol_target)
+            res = run_hybrid_backtest(prices, cfg, apply_vol_target=apply_vol_target)
             rets = res.get("hybrid_rets_net", res.get("hybrid_rets"))
             if rets is None:
                 raise ValueError("run_hybrid_backtest returned no hybrid returns.")
-            ppyr = _infer_periods_per_year(pd.Index(rets.index))
-            sharpe = _annualized_sharpe(pd.Series(rets).dropna(), periods_per_year=ppyr)
-        except Exception as exc:
+            rets_series = pd.Series(rets).dropna()
+            rets_index = getattr(rets, "index", rets_series.index)
+            periods_per_year = _infer_periods_per_year(pd.Index(rets_index))
+            sharpe = _annualized_sharpe(rets_series, periods_per_year=periods_per_year)
+            row = {**params, "sharpe": sharpe, "periods_per_year": periods_per_year}
+            return cfg, row
+        except Exception as exc:  # pragma: no cover - defensive
             row = {**params, "sharpe": float("-inf"), "error": str(exc)}
-            rows.append(row)
-            continue
+            return None, row
 
-        row = {**params, "sharpe": sharpe, "periods_per_year": ppyr}
+    evaluations = Parallel(n_jobs=n_jobs, backend="loky", batch_size="auto")(
+        delayed(_evaluate_combo)(combo) for combo in itertools.product(*grid_values)
+    )
+
+    best_score = float("-inf")
+    best_cfg = base_cfg
+    rows: list[Dict[str, Any]] = []
+
+    for candidate, row in evaluations:
         rows.append(row)
-        if sharpe > best_score:
+        sharpe = row.get("sharpe", float("-inf"))
+        if candidate is not None and sharpe > best_score:
             best_score = sharpe
-            best_cfg = cfg
+            best_cfg = candidate
 
     results = pd.DataFrame(rows)
     if not results.empty and "sharpe" in results.columns:
