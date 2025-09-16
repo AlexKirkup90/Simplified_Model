@@ -1941,6 +1941,42 @@ def kpi_row(name: str,
 # =========================
 # Composite Signals (mom + trend + lowvol) + Stickiness (Enhanced)
 # =========================
+@st.cache_data(ttl=43200)
+def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
+    """Cache common signal inputs derived from daily close data."""
+    if daily is None or daily.empty:
+        empty_df = pd.DataFrame()
+        return {
+            "monthly": empty_df,
+            "r3": empty_df,
+            "r6": empty_df,
+            "r12": empty_df,
+            "vol63": empty_df,
+            "ma200": empty_df,
+            "dist200": empty_df,
+        }
+
+    daily_sorted = daily.sort_index()
+    monthly = daily_sorted.resample("M").last()
+    r3 = daily_sorted.pct_change(63)
+    r6 = daily_sorted.pct_change(126)
+    r12 = daily_sorted.pct_change(252)
+    daily_returns = daily_sorted.pct_change()
+    vol63 = daily_returns.rolling(63).std()
+    ma200 = daily_sorted.rolling(200).mean()
+    dist200 = (daily_sorted / ma200 - 1).replace([np.inf, -np.inf], np.nan)
+
+    return {
+        "monthly": monthly,
+        "r3": r3,
+        "r6": r6,
+        "r12": r12,
+        "vol63": vol63,
+        "ma200": ma200,
+        "dist200": dist200,
+    }
+
+
 def blended_momentum_z(monthly: pd.DataFrame) -> pd.Series:
     if monthly.shape[0] < 13: return pd.Series(dtype=float)
     r3, r6, r12 = monthly.pct_change(3).iloc[-1], monthly.pct_change(6).iloc[-1], monthly.pct_change(12).iloc[-1]
@@ -1951,14 +1987,28 @@ def blended_momentum_z(monthly: pd.DataFrame) -> pd.Series:
     cols = monthly.columns
     return 0.2*z(r3,cols) + 0.4*z(r6,cols) + 0.4*z(r12,cols)
 
-def lowvol_z(daily: pd.DataFrame) -> pd.Series:
+def lowvol_z(daily: pd.DataFrame, vol_series: pd.Series | None = None) -> pd.Series:
+    if vol_series is not None:
+        vol = vol_series.replace([np.inf, -np.inf], np.nan).dropna()
+        if vol.empty or vol.std(ddof=0) == 0:
+            return pd.Series(0.0, index=daily.columns)
+        z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
+        return z.reindex(daily.columns).fillna(0.0)
+
     if daily.shape[0] < 80: return pd.Series(0.0, index=daily.columns)
     vol = daily.pct_change().rolling(63).std().iloc[-1].replace([np.inf,-np.inf], np.nan).dropna()
     if vol.empty or vol.std(ddof=0)==0: return pd.Series(0.0, index=daily.columns)
     z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
     return z.reindex(daily.columns).fillna(0.0)
 
-def trend_z(daily: pd.DataFrame) -> pd.Series:
+def trend_z(daily: pd.DataFrame, dist_series: pd.Series | None = None) -> pd.Series:
+    if dist_series is not None:
+        dist = dist_series.replace([np.inf, -np.inf], np.nan).dropna()
+        if dist.empty or dist.std(ddof=0) == 0:
+            return pd.Series(0.0, index=daily.columns)
+        z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
+        return z.reindex(daily.columns).fillna(0.0)
+
     if daily.shape[0] < 220: return pd.Series(0.0, index=daily.columns)
     ma200 = daily.rolling(200).mean().iloc[-1]; last = daily.iloc[-1]
     dist = (last/ma200 - 1).replace([np.inf,-np.inf], np.nan).dropna()
@@ -1966,20 +2016,50 @@ def trend_z(daily: pd.DataFrame) -> pd.Series:
     z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
     return z.reindex(daily.columns).fillna(0.0)
 
-def composite_score(daily: pd.DataFrame) -> pd.Series:
-    monthly = daily.resample("M").last()
+def composite_score(daily: pd.DataFrame, panels: Dict[str, pd.DataFrame | pd.Series] | None = None) -> pd.Series:
+    panels = compute_signal_panels(daily) if panels is None else panels
+    monthly = panels.get("monthly", pd.DataFrame())
     momz = blended_momentum_z(monthly)
-    lvz  = lowvol_z(daily)
-    tz   = trend_z(daily)
+
+    vol_panel = panels.get("vol63")
+    vol_series = None
+    if isinstance(vol_panel, pd.DataFrame) and not vol_panel.empty:
+        vol_series = vol_panel.iloc[-1]
+    elif isinstance(vol_panel, pd.Series):
+        vol_series = vol_panel
+    lvz  = lowvol_z(daily, vol_series=vol_series)
+
+    dist_panel = panels.get("dist200")
+    dist_series = None
+    if isinstance(dist_panel, pd.DataFrame) and not dist_panel.empty:
+        dist_series = dist_panel.iloc[-1]
+    elif isinstance(dist_panel, pd.Series):
+        dist_series = dist_panel
+    tz   = trend_z(daily, dist_series=dist_series)
     return (0.6*momz.add(0.0, fill_value=0.0) + 0.2*(-lvz) + 0.2*tz).dropna()
 
-def momentum_stable_names(daily: pd.DataFrame, top_n: int, days: int) -> List[str]:
+def momentum_stable_names(
+    daily: pd.DataFrame,
+    top_n: int,
+    days: int,
+    panels: Dict[str, pd.DataFrame | pd.Series] | None = None,
+) -> List[str]:
     if daily.shape[0] < (days + 260): return []
-    r63, r126, r252 = daily.pct_change(63), daily.pct_change(126), daily.pct_change(252)
-    def zrow(df):
-        mu = df.mean(axis=1); sd = df.std(axis=1).replace(0,np.nan)
-        return (df.sub(mu,axis=0)).div(sd,axis=0).fillna(0.0)
-    mscore = 0.2*zrow(r63) + 0.4*zrow(r126) + 0.4*zrow(r252)
+
+    panels = compute_signal_panels(daily) if panels is None else panels
+    r3 = panels.get("r3", pd.DataFrame())
+    r6 = panels.get("r6", pd.DataFrame())
+    r12 = panels.get("r12", pd.DataFrame())
+
+    if any(not isinstance(df, pd.DataFrame) or df.empty for df in (r3, r6, r12)):
+        return []
+
+    def zrow(df: pd.DataFrame) -> pd.DataFrame:
+        mu = df.mean(axis=1)
+        sd = df.std(axis=1).replace(0, np.nan)
+        return (df.sub(mu, axis=0)).div(sd, axis=0).fillna(0.0)
+
+    mscore = 0.2*zrow(r3) + 0.4*zrow(r6) + 0.4*zrow(r12)
     if mscore.shape[0] < days: return []
     tops = []
     for d in mscore.index[-days:]:
@@ -2203,10 +2283,17 @@ def _build_isa_weights_fixed(
     hierarchical cap enforcement. Cap trimming does **not** redistribute weight;
     any residual cash is returned to the caller to handle separately.
     """
-    monthly = daily_close.resample("M").last()
+    panels = compute_signal_panels(daily_close)
+    monthly = panels.get("monthly", pd.DataFrame())
 
     # --- Momentum Component (NO CAPS YET) ---
-    comp_all = composite_score(daily_close)
+    try:
+        comp_all = composite_score(daily_close, panels=panels)
+    except TypeError as exc:
+        if "panels" in str(exc):
+            comp_all = composite_score(daily_close)
+        else:
+            raise
     comp_vec = comp_all.iloc[-1].dropna() if isinstance(comp_all, pd.DataFrame) else pd.Series(comp_all).dropna()
 
     momz = blended_momentum_z(monthly)
@@ -2215,13 +2302,23 @@ def _build_isa_weights_fixed(
     top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
 
     # Stickiness filter (keep names that have persisted in the top set)
-    stable_names = set(
-        momentum_stable_names(
+    try:
+        stable_iter = momentum_stable_names(
             daily_close,
             top_n=preset["mom_topn"],
-            days=preset.get("stickiness_days", 7)  # <- align key name with the rest of the app
+            days=preset.get("stickiness_days", 7),  # <- align key name with the rest of the app
+            panels=panels,
         )
-    )
+    except TypeError as exc:
+        if "panels" in str(exc):
+            stable_iter = momentum_stable_names(
+                daily_close,
+                top_n=preset["mom_topn"],
+                days=preset.get("stickiness_days", 7),
+            )
+        else:
+            raise
+    stable_names = set(stable_iter)
     if stable_names and not top_m.empty:
         filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
         if not filtered.empty:
@@ -2232,7 +2329,11 @@ def _build_isa_weights_fixed(
 
     # --- Mean Reversion Component (NO CAPS YET) ---
     st_ret  = daily_close.pct_change(preset["mr_lb"]).iloc[-1]
-    long_ma = daily_close.rolling(preset["mr_ma"]).mean().iloc[-1]
+    ma200_df = panels.get("ma200")
+    if preset.get("mr_ma") == 200 and isinstance(ma200_df, pd.DataFrame) and not ma200_df.empty:
+        long_ma = ma200_df.iloc[-1]
+    else:
+        long_ma = daily_close.rolling(preset["mr_ma"]).mean().iloc[-1]
     quality = (daily_close.iloc[-1] > long_ma)
     pool    = [t for t, ok in quality.items() if ok]
     dips    = st_ret.reindex(pool).dropna().nsmallest(preset["mr_topn"])
