@@ -13,6 +13,11 @@ from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
+try:
+    from joblib import Parallel, delayed
+except Exception:  # pragma: no cover - optional dependency fallback
+    Parallel = None  # type: ignore[assignment]
+    delayed = None  # type: ignore[assignment]
 import optimizer
 import strategy_core
 from strategy_core import HybridConfig
@@ -1184,6 +1189,53 @@ def _yf_download(tickers, **kwargs):
         params.pop("timeout", None)
         return yf.download(tickers, **params)
 
+
+def parallel_yf_download(tickers, start, end, slices: int = 2):
+    """Download Yahoo Finance data in parallel date slices and merge the result."""
+
+    try:
+        slices = int(slices)
+    except Exception:
+        slices = 2
+
+    if slices <= 1 or Parallel is None or delayed is None:
+        return _yf_download(tickers, start=start, end=end)
+
+    try:
+        boundaries = pd.date_range(start=start, end=end, periods=slices + 1)
+    except Exception:
+        return _yf_download(tickers, start=start, end=end)
+
+    pairs = list(zip(boundaries[:-1], boundaries[1:]))
+    if not pairs:
+        return _yf_download(tickers, start=start, end=end)
+
+    n_jobs_cfg = PERF.get("n_jobs", 1) or 1
+    try:
+        n_jobs_cfg = int(n_jobs_cfg)
+    except Exception:
+        n_jobs_cfg = 1
+    n_jobs = max(1, min(len(pairs), n_jobs_cfg))
+
+    parts = Parallel(n_jobs=n_jobs)(
+        delayed(_yf_download)(tickers, start=s, end=e) for s, e in pairs
+    )
+
+    frames: List[pd.DataFrame] = []
+    for part in parts:
+        if part is None:
+            continue
+        if isinstance(part, pd.Series):
+            part = part.to_frame()
+        frames.append(part)
+
+    if not frames:
+        return pd.DataFrame()
+
+    merged = pd.concat(frames).sort_index()
+    merged = merged.loc[~merged.index.duplicated(keep="last")]
+    return merged.ffill()
+
 # =========================
 # Universe builders & sectors (Enhanced with validation)
 # =========================
@@ -1549,7 +1601,12 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
         frames: List[pd.DataFrame] = []
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(batch, start=fetch_start, end=end_date)["Close"]
+            try:
+                raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
+            except Exception:
+                raw = _yf_download(batch, start=fetch_start, end=end_date)
+
+            df = raw["Close"]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
@@ -1606,7 +1663,12 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         vol_frames: List[pd.DataFrame] = []
 
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(batch, start=fetch_start, end=end_date)[["Close", "Volume"]]
+            try:
+                raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
+            except Exception:
+                raw = _yf_download(batch, start=fetch_start, end=end_date)
+
+            df = raw[["Close", "Volume"]]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
 
@@ -3128,11 +3190,14 @@ def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
     """
     for attempt in range(2):
         try:
-            data = _yf_download(
-                ticker,
-                start=start,
-                end=end,
-            )
+            try:
+                data = parallel_yf_download(ticker, start=start, end=end)
+            except Exception:
+                data = _yf_download(
+                    ticker,
+                    start=start,
+                    end=end,
+                )
             try:
                 px = data["Close"]
             except Exception:
@@ -3261,11 +3326,20 @@ def select_optimal_universe(as_of: date | None = None) -> str:
     # Proxy ETFs for each universe
     etfs = {"NASDAQ100+": "QQQ", "S&P500 (All)": "SPY", "Hybrid Top150": "SPY"}
     try:
-        data = _yf_download(
-            list(set(etfs.values())),
-            start=start,
-            end=end,
-        )["Close"]
+        try:
+            raw = parallel_yf_download(
+                list(set(etfs.values())),
+                start=start,
+                end=end,
+            )
+        except Exception:
+            raw = _yf_download(
+                list(set(etfs.values())),
+                start=start,
+                end=end,
+            )
+
+        data = raw["Close"]
         if isinstance(data, pd.Series):
             data = data.to_frame()
     except Exception:
