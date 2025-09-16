@@ -54,9 +54,10 @@ class _GradientBoostingLinear:
     mechanism and is sufficient for small feature sets.
     """
 
-    def __init__(self, n_estimators: int = 100, learning_rate: float = 0.1):
+    def __init__(self, n_estimators: int = 100, learning_rate: float = 0.1, ridge_lambda: float = 1e-4):
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
+        self.ridge_lambda = ridge_lambda
         self.coefs_: list[np.ndarray] = []
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "_GradientBoostingLinear":
@@ -64,9 +65,17 @@ class _GradientBoostingLinear:
         y = np.asarray(y, dtype=float)
         pred = np.zeros_like(y)
         self.coefs_ = []
+        if X.ndim != 2 or X.shape[1] == 0:
+            return self
+        eye = np.eye(X.shape[1])
         for _ in range(self.n_estimators):
             residual = y - pred
-            coef, *_ = np.linalg.lstsq(X, residual, rcond=None)
+            xtx = X.T @ X + self.ridge_lambda * eye
+            xty = X.T @ residual
+            try:
+                coef = np.linalg.solve(xtx, xty)
+            except np.linalg.LinAlgError:
+                coef, *_ = np.linalg.lstsq(X, residual, rcond=None)
             self.coefs_.append(coef)
             pred += self.learning_rate * X.dot(coef)
         return self
@@ -157,15 +166,29 @@ def predict_next_returns(
         y = data["target"].to_numpy(dtype=float)
         latest_feat = feat.iloc[[-1]].to_numpy(dtype=float)
 
-        # Cross-validation (errors ignored; used for estimation only)
-        _time_series_cv_score(X, y, n_splits, n_estimators, learning_rate)
+        candidate_grid = {
+            (int(n_estimators), float(learning_rate)),
+            (max(20, int(n_estimators // 2)), max(0.01, float(learning_rate) / 2)),
+            (min(200, int(n_estimators * 2)), min(0.3, float(learning_rate) * 1.5)),
+        }
+
+        best_score = np.inf
+        best_params = (int(n_estimators), float(learning_rate))
+        for n_est, lr in candidate_grid:
+            score = _time_series_cv_score(X, y, n_splits, int(n_est), float(lr))
+            if np.isnan(score):
+                continue
+            if score < best_score:
+                best_score = score
+                best_params = (int(n_est), float(lr))
 
         scaler = _StandardScaler()
         X_s = scaler.fit_transform(X)
         latest_s = scaler.transform(latest_feat)
 
-        model = _GradientBoostingLinear(n_estimators=n_estimators, learning_rate=learning_rate)
+        model = _GradientBoostingLinear(n_estimators=best_params[0], learning_rate=best_params[1])
         model.fit(X_s, y)
-        preds[ticker] = float(model.predict(latest_s)[0])
+        prediction = float(model.predict(latest_s)[0])
+        preds[ticker] = float(np.clip(prediction, -0.30, 0.30))
 
     return pd.Series(preds)

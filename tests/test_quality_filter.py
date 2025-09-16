@@ -1,9 +1,7 @@
 import numpy as np
 import pandas as pd
-import numpy as np
 import streamlit as st
 import sys, pathlib, types
-import inspect
 
 # Provide empty secrets so backend import does not fail
 st.secrets = types.SimpleNamespace(get=lambda *args, **kwargs: None)
@@ -61,7 +59,10 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
 
     monkeypatch.setattr(strategy_core, "run_hybrid_backtest", fake_run_hybrid_backtest)
 
-    kwargs = dict(
+    st.session_state["min_profitability"] = 0.0
+    st.session_state["max_leverage"] = 1.0
+
+    backend.run_backtest_isa_dynamic(
         min_dollar_volume=0,
         top_n=1,
         name_cap=1.0,
@@ -71,13 +72,7 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
         mom_weight=1.0,
         mr_weight=0.0,
         use_enhanced_features=False,
+        apply_quality_filter=True,
     )
-    sig = inspect.signature(backend.run_backtest_isa_dynamic)
-    if "min_profitability" in sig.parameters:
-        kwargs.update(min_profitability=0.0, max_leverage=1.0)
-    else:
-        st.session_state["min_profitability"] = 0.0
-        st.session_state["max_leverage"] = 1.0
-    backend.run_backtest_isa_dynamic(**kwargs)
 
     assert captured.get("cols") == ["AAA"]
