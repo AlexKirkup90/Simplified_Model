@@ -36,8 +36,9 @@ def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
 
     import strategy_core
 
-    def fake_run_hybrid_backtest(daily_prices, cfg):
+    def fake_run_hybrid_backtest(daily_prices, cfg, apply_vol_target=False):
         captured["cfg"] = cfg
+        captured["apply_vol_target"] = apply_vol_target
         idx = pd.date_range("2020-01-31", "2020-03-31", freq="M")
         return {
             "hybrid_rets": pd.Series(0.0, index=idx),
@@ -69,3 +70,54 @@ def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
     assert cfg.mr_top_n == 3
     assert cfg.mom_weight == 0.6
     assert cfg.mr_weight == 0.4
+    assert captured["apply_vol_target"] is False
+    assert cfg.target_vol_annual is None
+
+
+def test_run_backtest_isa_dynamic_applies_vol_target(monkeypatch):
+    dates = pd.date_range("2020-01-01", periods=10, freq="D")
+    close = pd.DataFrame({
+        "AAA": np.linspace(100, 110, len(dates)),
+        "BBB": np.linspace(50, 60, len(dates)),
+        "QQQ": np.linspace(200, 210, len(dates)),
+    }, index=dates)
+    vol = pd.DataFrame(1.0, index=dates, columns=["AAA", "BBB", "QQQ"])
+    sectors_map = {"AAA": "Tech", "BBB": "Tech"}
+
+    def fake_prepare(universe_choice, start_date, end_date):
+        return close, vol, sectors_map, "Test"
+
+    monkeypatch.setattr(backend, "_prepare_universe_for_backtest", fake_prepare)
+
+    captured = {}
+
+    import strategy_core
+
+    def fake_run_hybrid_backtest(daily_prices, cfg, apply_vol_target=False):
+        captured["apply_vol_target"] = apply_vol_target
+        captured["target_vol"] = cfg.target_vol_annual
+        idx = pd.date_range("2020-01-31", "2020-03-31", freq="M")
+        return {
+            "hybrid_rets": pd.Series(0.0, index=idx),
+            "mom_turnover": pd.Series(0.0, index=idx),
+            "mr_turnover": pd.Series(0.0, index=idx),
+        }
+
+    monkeypatch.setattr(strategy_core, "run_hybrid_backtest", fake_run_hybrid_backtest)
+
+    backend.run_backtest_isa_dynamic(
+        min_dollar_volume=0,
+        top_n=1,
+        name_cap=1.0,
+        sector_cap=1.0,
+        stickiness_days=1,
+        mr_topn=1,
+        mom_weight=1.0,
+        mr_weight=0.0,
+        use_enhanced_features=False,
+        target_vol_annual=0.1,
+        apply_vol_target=True,
+    )
+
+    assert captured.get("apply_vol_target") is True
+    assert captured.get("target_vol") == 0.1

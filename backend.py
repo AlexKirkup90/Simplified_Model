@@ -206,11 +206,21 @@ def linear_interpolate_short_gaps(
             left = s - 1
             right = e + 1
             # Need valid endpoints on both sides to interpolate
-            if left < 0 or right >= len(series):
+            left_val = series.iat[left] if left >= 0 else np.nan
+            right_val = series.iat[right] if right < len(series) else np.nan
+
+            if left < 0 or pd.isna(left_val):
+                if pd.isna(right_val):
+                    continue
+                idx_slice = series.index[s : e + 1]
+                filled.loc[idx_slice, column] = right_val
+                imputed_mask.loc[idx_slice, column] = True
                 continue
-            left_val = series.iat[left]
-            right_val = series.iat[right]
-            if pd.isna(left_val) or pd.isna(right_val):
+
+            if right >= len(series) or pd.isna(right_val):
+                idx_slice = series.index[s : e + 1]
+                filled.loc[idx_slice, column] = left_val
+                imputed_mask.loc[idx_slice, column] = True
                 continue
 
             idx_slice = series.index[s : e + 1]
@@ -222,6 +232,147 @@ def linear_interpolate_short_gaps(
             imputed_mask.loc[idx_slice, column] = True
 
     return filled, imputed_mask
+
+
+def clean_extreme_moves(
+    prices: pd.DataFrame,
+    *,
+    max_daily_move: float = 0.35,
+    min_price: float = 0.5,
+    zscore_threshold: float | None = 4.0,
+    info: Optional[Callable[[str], None]] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Clamp implausible price moves and return a mask of the edits made."""
+
+    if prices is None or prices.empty:
+        empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
+        return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
+
+    cleaned = prices.copy()
+    mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
+
+    total_fixes = 0
+    for col in cleaned.columns:
+        col_idx = cleaned.columns.get_loc(col)
+        series = cleaned[col].astype(float)
+        returns = series.pct_change()
+        if zscore_threshold is not None:
+            std = returns.std(skipna=True)
+            if std and not np.isclose(std, 0.0):
+                zscores = (returns - returns.mean(skipna=True)) / std
+            else:
+                zscores = pd.Series(np.nan, index=returns.index)
+        else:
+            zscores = pd.Series(np.nan, index=returns.index)
+
+        for i, value in enumerate(series.values):
+            if pd.isna(value):
+                continue
+
+            prev_val = None
+            if i > 0:
+                prev_val = cleaned.iat[i - 1, col_idx]
+            flagged = False
+
+            if min_price is not None and value < min_price:
+                flagged = True
+
+            if prev_val is not None and not pd.isna(prev_val):
+                baseline = max(abs(prev_val), 1e-9)
+                if max_daily_move is not None and abs(value - prev_val) > max_daily_move * baseline:
+                    flagged = True
+                if zscore_threshold is not None:
+                    z_val = zscores.iat[i] if i < len(zscores) else np.nan
+                    if pd.notna(z_val) and abs(float(z_val)) > zscore_threshold:
+                        flagged = True
+
+            if flagged:
+                if prev_val is not None and not pd.isna(prev_val):
+                    replacement = float(prev_val)
+                elif min_price is not None:
+                    replacement = float(max(min_price, value))
+                else:
+                    replacement = float(value)
+                cleaned.iat[i, col_idx] = replacement
+                mask.iat[i, col_idx] = True
+                total_fixes += 1
+
+    if callable(info) and total_fixes > 0:
+        info(f"🧹 Data cleaning: Fixed {total_fixes} extreme price moves across all stocks")
+
+    return cleaned, mask
+
+
+def fill_missing_data(
+    prices: pd.DataFrame,
+    *,
+    max_gap_days: int = 3,
+    info: Optional[Callable[[str], None]] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fill short gaps via linear interpolation and return a mask of edits."""
+
+    if prices is None or prices.empty:
+        empty_mask = pd.DataFrame(False, index=getattr(prices, "index", []), columns=getattr(prices, "columns", []))
+        return prices.copy() if hasattr(prices, "copy") else pd.DataFrame(), empty_mask
+
+    filled, mask = linear_interpolate_short_gaps(prices, max_gap=max_gap_days)
+    filled_count = int(mask.to_numpy().sum())
+    if callable(info) and filled_count > 0:
+        info(f"🔧 Data filling: Filled {filled_count} missing data points with interpolation")
+    return filled, mask.astype(bool)
+
+
+def validate_and_clean_market_data(
+    prices: pd.DataFrame,
+    *,
+    max_missing_ratio: float = 0.20,
+    max_daily_move: float = 0.35,
+    min_price: float = 0.5,
+    zscore_threshold: float | None = 4.0,
+    max_gap_days: int = 3,
+    info: Optional[Callable[[str], None]] = None,
+) -> tuple[pd.DataFrame, list[str], pd.DataFrame]:
+    """Validate raw market data and apply the cleaning pipeline."""
+
+    if prices is None or prices.empty:
+        empty = pd.DataFrame(index=getattr(prices, "index", []))
+        empty_mask = pd.DataFrame(False, index=empty.index, columns=[])
+        return empty, [], empty_mask
+
+    data = prices.copy()
+    alerts: list[str] = []
+    original_shape = data.shape
+
+    if max_missing_ratio is not None and data.shape[1] > 0:
+        missing_fraction = data.isna().mean()
+        drop_cols = missing_fraction[missing_fraction > max_missing_ratio].index.tolist()
+        if drop_cols:
+            data = data.drop(columns=drop_cols)
+            threshold_pct = int(round(max_missing_ratio * 100))
+            alerts.append(f"Removed {len(drop_cols)} stocks with >{threshold_pct}% missing data")
+
+    if data.shape != original_shape:
+        alerts.append(f"Data shape: {original_shape} → {data.shape}")
+
+    if data.empty:
+        mask = pd.DataFrame(False, index=prices.index, columns=data.columns)
+        return data, alerts, mask
+
+    cleaned, mask_clean = clean_extreme_moves(
+        data,
+        max_daily_move=max_daily_move,
+        min_price=min_price,
+        zscore_threshold=zscore_threshold,
+        info=info,
+    )
+    filled, mask_fill = fill_missing_data(
+        cleaned,
+        max_gap_days=max_gap_days,
+        info=info,
+    )
+    combined_mask = (mask_clean | mask_fill).astype(bool)
+
+    return filled, alerts, combined_mask
 
 # =========================
 # NEW: Enhanced Position Sizing (Fixes the 28.99% bug)
@@ -1002,6 +1153,39 @@ def _parquet_cache_path(prefix: str, tickers: List[str], start_date: str, end_da
     return PARQUET_CACHE_DIR / fname
 
 
+def _read_cached_dataframe(path: Path) -> Optional[pd.DataFrame]:
+    """Read a cached DataFrame with graceful fallback.
+
+    The primary format is parquet, but when pyarrow/fastparquet is unavailable
+    (common in lightweight test environments) we transparently fall back to
+    :func:`pandas.read_pickle`. The helper returns ``None`` if the cache is
+    missing or unreadable so callers can re-fetch the data.
+    """
+
+    if not path.exists():
+        return None
+
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        try:
+            return pd.read_pickle(path)
+        except Exception:
+            return None
+
+
+def _write_cached_dataframe(df: pd.DataFrame, path: Path) -> None:
+    """Persist ``df`` to ``path`` using parquet with pickle fallback."""
+
+    try:
+        df.to_parquet(path)
+    except Exception:
+        try:
+            df.to_pickle(path)
+        except Exception:
+            pass
+
+
 def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
     """Fetch ``ticker.info`` with a timeout and graceful fallback."""
 
@@ -1282,25 +1466,25 @@ def validate_and_clean_market_data(
 # =========================
 # Data fetching (cache) - Enhanced with validation
 # =========================
+from typing import List, Tuple
+
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
     cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
-    if cache_path.exists():
-        for reader in (pd.read_parquet, pd.read_pickle):
-            try:
-                return reader(cache_path)
-            except Exception:
-                continue
+
+    # Try local disk cache first (Parquet -> Pickle)
+    cached = _read_cached_dataframe(cache_path)
+    if cached is not None:
+        return cached
 
     try:
+        # Pull an extended window to help with MA/breadth calcs downstream
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+
         frames: List[pd.DataFrame] = []
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(
-                batch,
-                start=fetch_start,
-                end=end_date,
-            )["Close"]
+            df = _yf_download(batch, start=fetch_start, end=end_date)["Close"]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
@@ -1312,80 +1496,67 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         data = pd.concat(frames, axis=1)
         result = data.dropna(axis=1, how="all")
 
-        # Enhanced data cleaning pipeline
+        # Enhanced data cleaning pipeline (true linear interpolation on short gaps, etc.)
         if not result.empty:
             cleaned_result, cleaning_alerts, _ = validate_and_clean_market_data(result, info=logging.info)
 
-            # Show cleaning summary
+            # Log a brief cleaning summary (top 2 alerts)
             if cleaning_alerts:
-                for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
+                for alert in cleaning_alerts[:2]:
                     logging.info("Data cleaning: %s", alert)
 
-            try:
-                cleaned_result.to_parquet(cache_path)
-            except Exception:
-                try:
-                    cleaned_result.to_pickle(cache_path)
-                except Exception:
-                    pass
+            _write_cached_dataframe(cleaned_result, cache_path)
             return cleaned_result
 
-        try:
-            result.to_parquet(cache_path)
-        except Exception:
-            try:
-                result.to_pickle(cache_path)
-            except Exception:
-                pass
+        # Fallback: write whatever we got
+        _write_cached_dataframe(result, cache_path)
         return result
 
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
         return pd.DataFrame()
 
+
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit."""
     cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
-    if cache_path.exists():
-        for reader in (pd.read_parquet, pd.read_pickle):
-            try:
-                combined = reader(cache_path)
-            except Exception:
-                continue
 
-            if isinstance(combined.columns, pd.MultiIndex):
-                needed = {"Close", "Volume"}
-                have = set(combined.columns.get_level_values(0))
-                if needed.issubset(have):
-                    return combined["Close"], combined["Volume"]
-            else:
-                if {"Close", "Volume"}.issubset(combined.columns):
-                    return combined["Close"], combined["Volume"]
+    # Try local disk cache first (Parquet -> Pickle)
+    combined = _read_cached_dataframe(cache_path)
+    if combined is not None:
+        if isinstance(combined.columns, pd.MultiIndex):
+            needed = {"Close", "Volume"}
+            have = set(combined.columns.get_level_values(0))
+            if needed.issubset(have):
+                return combined["Close"], combined["Volume"]
+        else:
+            if {"Close", "Volume"}.issubset(combined.columns):
+                return combined["Close"], combined["Volume"]
 
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
+
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(
-                batch,
-                start=fetch_start,
-                end=end_date,
-            )[["Close", "Volume"]]
+            df = _yf_download(batch, start=fetch_start, end=end_date)[["Close", "Volume"]]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
+
             if isinstance(df.columns, pd.MultiIndex):
                 close_part = df["Close"]
                 vol_part = df["Volume"]
             else:
-                if "Close" in df.columns and "Volume" in df.columns:
-                    close_part = df[["Close"]].copy()
-                    vol_part = df[["Volume"]].copy()
-                    if len(batch) == 1:
-                        close_part.columns = [batch[0]]
-                        vol_part.columns = [batch[0]]
-                else:
+                if "Close" not in df.columns or "Volume" not in df.columns:
                     continue
+                close_part = df[["Close"]].copy()
+                vol_part = df[["Volume"]].copy()
+                if len(batch) == 1:
+                    close_part.columns = [batch[0]]
+                    vol_part.columns = [batch[0]]
+
             close_frames.append(close_part)
             vol_frames.append(vol_part)
 
@@ -1396,11 +1567,11 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         vol = pd.concat(vol_frames, axis=1)
         vol = vol.reindex_like(close).fillna(0)
 
-        # Enhanced data cleaning for prices
+        # Enhanced cleaning for prices
         if not close.empty:
             cleaned_close, close_alerts, _ = validate_and_clean_market_data(close, info=logging.info)
 
-            # Clean volume data (less aggressive)
+            # Mild cleaning for volume: align and clip extreme spikes (99th pct)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
             for col in vol_aligned.columns:
                 col_data = vol_aligned[col]
@@ -1409,33 +1580,20 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     vol_aligned[col] = col_data.clip(lower=0, upper=q99)
 
             if close_alerts:
-                for alert in close_alerts[:1]:  # Show top cleaning action
+                for alert in close_alerts[:1]:
                     logging.info("Price/Volume cleaning: %s", alert)
 
-            combined = pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1)
-            try:
-                combined.to_parquet(cache_path)
-            except Exception:
-                try:
-                    combined.to_pickle(cache_path)
-                except Exception:
-                    pass
+            _write_cached_dataframe(pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1), cache_path)
             return cleaned_close, vol_aligned
 
-        combined = pd.concat({"Close": close, "Volume": vol}, axis=1)
-        try:
-            combined.to_parquet(cache_path)
-        except Exception:
-            try:
-                combined.to_pickle(cache_path)
-            except Exception:
-                pass
+        # Fallback: cache raw combined
+        _write_cached_dataframe(pd.concat({"Close": close, "Volume": vol}, axis=1), cache_path)
         return close, vol
 
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()
-        
+      
 # =========================
 # Persistence (Gist + Local) - Unchanged
 # =========================
@@ -2357,6 +2515,8 @@ def run_backtest_isa_dynamic(
     mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
     apply_quality_filter: bool = False,
+    target_vol_annual: Optional[float] = None,
+    apply_vol_target: bool = False,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
     Enhanced ISA-Dynamic hybrid backtest with new features.
@@ -2366,6 +2526,12 @@ def run_backtest_isa_dynamic(
     apply_quality_filter: bool, optional
         If True, filter the universe using *current* fundamentals. Leave False
         during historical backtests to avoid look-ahead bias.
+    target_vol_annual: float, optional
+        Annualized volatility target (e.g., 0.15 for 15%) applied when
+        ``apply_vol_target`` is True.
+    apply_vol_target: bool, optional
+        If True, scale returns using the volatility targeting helper from
+        ``strategy_core``.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -2420,9 +2586,10 @@ def run_backtest_isa_dynamic(
         mr_weight=mr_weight,
         mr_lookback_days=21,
         mr_long_ma_days=200,
+        target_vol_annual=target_vol_annual if apply_vol_target else None,
     )
 
-    res = strategy_core.run_hybrid_backtest(daily, cfg)
+    res = strategy_core.run_hybrid_backtest(daily, cfg, apply_vol_target=apply_vol_target)
     hybrid_gross = res["hybrid_rets"]
     hybrid_tno = (
         cfg.mom_weight * res["mom_turnover"].reindex(hybrid_gross.index).fillna(0)
