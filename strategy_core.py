@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Iterable, List, Dict, Optional, Tuple, Callable, Any
 
 import numpy as np
@@ -32,6 +33,41 @@ from io import StringIO
 
 # Use shared helpers (do NOT reimplement here)
 from portfolio_utils import cap_weights, l1_turnover
+
+_BT_CACHE_DIR = Path(".bt_cache")
+
+
+def _cache_path(cache_key: str) -> Path:
+    if not cache_key:
+        raise ValueError("cache_key must be a non-empty string")
+    return _BT_CACHE_DIR / f"{cache_key}.pkl"
+
+
+def load_backtest_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Return cached hybrid backtest artefacts if available."""
+    path = _cache_path(cache_key)
+    if not path.exists():
+        return None
+    try:
+        cached = pd.read_pickle(path)
+    except Exception:
+        return None
+    if isinstance(cached, dict):
+        return cached
+    return None
+
+
+def save_backtest_cache(cache_key: str, payload: Dict[str, Any]) -> None:
+    """Persist hybrid backtest artefacts to disk."""
+    _BT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _cache_path(cache_key)
+    safe_payload: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, (pd.Series, pd.DataFrame)):
+            safe_payload[key] = value.copy()
+        else:
+            safe_payload[key] = value
+    pd.to_pickle(safe_payload, path)
 
 # ------------------------------
 # 1) Universe & Data
@@ -217,17 +253,42 @@ def run_backtest_momentum(
     top_n: int = 15,
     cap: float = 0.25,
     get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
-) -> Tuple[pd.Series, pd.Series]:
-    """Monthly backtest for the momentum sleeve. Returns (monthly_returns, monthly_turnover)."""
+    prev_w: Optional[pd.Series] = None,
+    start_at: Optional[pd.Timestamp] = None,
+    return_last_weights: bool = False,
+) -> Tuple[pd.Series, pd.Series] | Tuple[pd.Series, pd.Series, pd.Series]:
+    """Monthly backtest for the momentum sleeve.
+
+    Parameters
+    ----------
+    daily_prices : DataFrame
+        Daily close prices for the universe.
+    prev_w : Series, optional
+        Previous rebalance weights to seed turnover when resuming from cache.
+    start_at : Timestamp, optional
+        If provided, only months greater-or-equal to this timestamp are evaluated.
+    return_last_weights : bool, default False
+        When True, also return the final month-end weights used during the run.
+
+    Returns
+    -------
+    Tuple[Series, Series] or Tuple[Series, Series, Series]
+        Monthly returns and turnover (plus final weights when requested).
+    """
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
     mom = mp.pct_change(periods=lookback_m).shift(1)
 
-    rets = pd.Series(index=mp.index, dtype=float)
-    tno = pd.Series(index=mp.index, dtype=float)
-    prev_w: Optional[pd.Series] = None
+    if start_at is not None:
+        idx = mp.index[mp.index >= start_at]
+    else:
+        idx = mp.index
 
-    for dt in mp.index:
+    rets = pd.Series(index=idx, dtype=float)
+    tno = pd.Series(index=idx, dtype=float)
+    prev = prev_w.copy() if prev_w is not None else None
+
+    for dt in idx:
         scores = mom.loc[dt].dropna()
         if get_constituents is not None:
             members = set(get_constituents(dt))
@@ -236,8 +297,8 @@ def run_backtest_momentum(
 
         if scores.empty:
             rets.loc[dt] = 0.0
-            tno.loc[dt] = 0.0 if prev_w is None else l1_turnover(prev_w, pd.Series(dtype=float))
-            prev_w = None
+            tno.loc[dt] = 0.0 if prev is None else float(l1_turnover(prev, pd.Series(dtype=float)))
+            prev = None
             continue
 
         top = scores.nlargest(top_n)
@@ -249,10 +310,17 @@ def run_backtest_momentum(
             valid = valid.intersection(members)
 
         rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
-        tno.loc[dt] = float(l1_turnover(prev_w, w))
-        prev_w = w
+        tno.loc[dt] = float(l1_turnover(prev, w))
+        prev = w
 
-    return rets.fillna(0.0), tno.fillna(0.0)
+    rets = rets.fillna(0.0)
+    tno = tno.fillna(0.0)
+
+    if return_last_weights:
+        last = prev if prev is not None else pd.Series(dtype=float)
+        return rets, tno, last
+
+    return rets, tno
 
 
 def predictive_signals(monthly_prices: pd.DataFrame, lookback_m: int) -> pd.Series:
@@ -301,16 +369,24 @@ def run_backtest_predictive(
     top_n: int = 10,
     cap: float = 0.25,
     get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
-) -> Tuple[pd.Series, pd.Series]:
-    """Monthly backtest using predictive selection. Returns (monthly_returns, monthly_turnover)."""
+    prev_w: Optional[pd.Series] = None,
+    start_at: Optional[pd.Timestamp] = None,
+    return_last_weights: bool = False,
+) -> Tuple[pd.Series, pd.Series] | Tuple[pd.Series, pd.Series, pd.Series]:
+    """Monthly backtest using predictive selection."""
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
 
-    rets = pd.Series(index=mp.index, dtype=float)
-    tno = pd.Series(index=mp.index, dtype=float)
-    prev_w: Optional[pd.Series] = None
+    if start_at is not None:
+        idx = mp.index[mp.index >= start_at]
+    else:
+        idx = mp.index
 
-    for dt in mp.index:
+    rets = pd.Series(index=idx, dtype=float)
+    tno = pd.Series(index=idx, dtype=float)
+    prev = prev_w.copy() if prev_w is not None else None
+
+    for dt in idx:
         hist = mp.loc[:dt]
         scores = predictive_signals(hist, lookback_m)
         if get_constituents is not None:
@@ -321,7 +397,7 @@ def run_backtest_predictive(
         if scores.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
-            prev_w = None
+            prev = None
             continue
 
         top = scores.nlargest(top_n)
@@ -334,10 +410,17 @@ def run_backtest_predictive(
             valid = valid.intersection(members)
 
         rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
-        tno.loc[dt] = float(l1_turnover(prev_w, w))
-        prev_w = w
+        tno.loc[dt] = float(l1_turnover(prev, w))
+        prev = w
 
-    return rets.fillna(0.0), tno.fillna(0.0)
+    rets = rets.fillna(0.0)
+    tno = tno.fillna(0.0)
+
+    if return_last_weights:
+        last = prev if prev is not None else pd.Series(dtype=float)
+        return rets, tno, last
+
+    return rets, tno
 
 
 def run_backtest_mean_reversion(
@@ -346,10 +429,20 @@ def run_backtest_mean_reversion(
     top_n: int = 5,
     long_ma_days: int = 200,
     get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
-) -> Tuple[pd.Series, pd.Series]:
+    prev_w: Optional[pd.Series] = None,
+    start_at: Optional[pd.Timestamp] = None,
+    return_last_weights: bool = False,
+) -> Tuple[pd.Series, pd.Series] | Tuple[pd.Series, pd.Series, pd.Series]:
     """Monthly backtest for the mean-reversion sleeve with a long-term uptrend filter.
 
-    Returns (monthly_returns, monthly_turnover).
+    Parameters
+    ----------
+    prev_w : Series, optional
+        Previous weights used to seed turnover when resuming from cache.
+    start_at : Timestamp, optional
+        Optional month to begin evaluating (inclusive).
+    return_last_weights : bool, default False
+        When True, return the final sleeve weights alongside returns and turnover.
     """
     mp = _resample_month_end(daily_prices)
     future = mp.pct_change().shift(-1)
@@ -357,17 +450,22 @@ def run_backtest_mean_reversion(
     short = daily_prices.pct_change(lookback_days).resample("M").last()
     trend = daily_prices.rolling(long_ma_days).mean().resample("M").last()
 
-    rets = pd.Series(index=mp.index, dtype=float)
-    tno = pd.Series(index=mp.index, dtype=float)
-    prev_w: Optional[pd.Series] = None
+    if start_at is not None:
+        idx = mp.index[mp.index >= start_at]
+    else:
+        idx = mp.index
 
-    for dt in mp.index:
+    rets = pd.Series(index=idx, dtype=float)
+    tno = pd.Series(index=idx, dtype=float)
+    prev = prev_w.copy() if prev_w is not None else None
+
+    for dt in idx:
         # Guard against fully-NaN trend row (early history)
         trend_row = trend.loc[dt]
         if trend_row.isna().all():
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
-            prev_w = None
+            prev = None
             continue
 
         # Quality: price above long MA
@@ -379,7 +477,7 @@ def run_backtest_mean_reversion(
         if len(pool) == 0:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
-            prev_w = None
+            prev = None
             continue
 
         # Among quality names, pick worst short-term performers
@@ -387,14 +485,14 @@ def run_backtest_mean_reversion(
         if candidates.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
-            prev_w = None
+            prev = None
             continue
 
         picks = candidates.nsmallest(top_n)
         if picks.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
-            prev_w = None
+            prev = None
             continue
 
         w = pd.Series(1.0 / len(picks), index=picks.index)
@@ -404,10 +502,17 @@ def run_backtest_mean_reversion(
             valid = valid.intersection(members)
 
         rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
-        tno.loc[dt] = float(l1_turnover(prev_w, w))
-        prev_w = w
+        tno.loc[dt] = float(l1_turnover(prev, w))
+        prev = w
 
-    return rets.fillna(0.0), tno.fillna(0.0)
+    rets = rets.fillna(0.0)
+    tno = tno.fillna(0.0)
+
+    if return_last_weights:
+        last = prev if prev is not None else pd.Series(dtype=float)
+        return rets, tno, last
+
+    return rets, tno
 
 
 # ------------------------------
@@ -520,32 +625,39 @@ def run_hybrid_backtest(
     Always runs momentum and mean-reversion sleeves. If cfg.predictive_weight > 0,
     the predictive sleeve is also evaluated and included.
     """
-    mom_rets, mom_tno = run_backtest_momentum(
+    mom_bt = run_backtest_momentum(
         daily_prices,
         lookback_m=cfg.momentum_lookback_m,
         top_n=cfg.momentum_top_n,
         cap=cfg.momentum_cap,
         get_constituents=get_constituents,
+        return_last_weights=True,
     )
+    mom_rets, mom_tno, mom_last_w = mom_bt
 
-    mr_rets, mr_tno = run_backtest_mean_reversion(
+    mr_bt = run_backtest_mean_reversion(
         daily_prices,
         lookback_days=cfg.mr_lookback_days,
         top_n=cfg.mr_top_n,
         long_ma_days=cfg.mr_long_ma_days,
         get_constituents=get_constituents,
+        return_last_weights=True,
     )
+    mr_rets, mr_tno, mr_last_w = mr_bt
 
     pred_rets = pd.Series(dtype=float)
     pred_tno = pd.Series(dtype=float)
+    pred_last_w = pd.Series(dtype=float)
     if cfg.predictive_weight > 0:
-        pred_rets, pred_tno = run_backtest_predictive(
+        pred_bt = run_backtest_predictive(
             daily_prices,
             lookback_m=cfg.predictive_lookback_m,
             top_n=cfg.predictive_top_n,
             cap=cfg.predictive_cap,
             get_constituents=get_constituents,
+            return_last_weights=True,
         )
+        pred_rets, pred_tno, pred_last_w = pred_bt
 
     idx = mom_rets.index.union(mr_rets.index).union(pred_rets.index)
     mom_component = cfg.mom_weight * mom_rets.reindex(idx).fillna(0)
@@ -577,6 +689,9 @@ def run_hybrid_backtest(
         "mr_turnover": mr_tno,
         "pred_rets": pred_rets,
         "pred_turnover": pred_tno,
+        "mom_last_weights": mom_last_w,
+        "mr_last_weights": mr_last_w,
+        "pred_last_weights": pred_last_w,
         "hybrid_rets": hybrid_net,          # kept for backward-compat
         "hybrid_rets_net": hybrid_net,      # explicit net
         "hybrid_rets_gross": hybrid_gross,  # explicit gross
@@ -627,3 +742,206 @@ def walk_forward_backtest(
     avg_sortino = float(np.nanmean([w["sortino"] for w in window_metrics])) if window_metrics else float("nan")
 
     return {"sharpe": avg_sharpe, "sortino": avg_sortino, "windows": window_metrics}
+
+
+def run_hybrid_backtest_incremental(
+    daily_prices: pd.DataFrame,
+    cfg: HybridConfig = HybridConfig(),
+    cache_key: str = "",
+    apply_vol_target: bool = False,
+    get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
+) -> Dict[str, pd.Series]:
+    """Resume a hybrid backtest by appending only the newly available months.
+
+    Parameters
+    ----------
+    daily_prices : DataFrame
+        Daily close prices for the requested universe.
+    cache_key : str
+        Identifier used to locate the persisted cache on disk.
+    cfg, apply_vol_target, get_constituents
+        Same semantics as :func:`run_hybrid_backtest`.
+    """
+
+    existing = load_backtest_cache(cache_key) if cache_key else None
+    if existing is None:
+        result = run_hybrid_backtest(
+            daily_prices,
+            cfg,
+            apply_vol_target=apply_vol_target,
+            get_constituents=get_constituents,
+        )
+        if cache_key:
+            save_backtest_cache(cache_key, result)
+        return result
+
+    monthly_prices = daily_prices.resample("M").last()
+    if monthly_prices.empty:
+        return {k: (v.copy() if isinstance(v, (pd.Series, pd.DataFrame)) else v) for k, v in existing.items()}
+
+    cached_net = existing.get("hybrid_rets_net", pd.Series(dtype=float))
+    if not isinstance(cached_net, pd.Series):
+        cached_net = pd.Series(dtype=float)
+
+    cached_index = cached_net.index
+    requested_index = monthly_prices.index
+
+    if cached_index.empty:
+        result = run_hybrid_backtest(
+            daily_prices,
+            cfg,
+            apply_vol_target=apply_vol_target,
+            get_constituents=get_constituents,
+        )
+        if cache_key:
+            save_backtest_cache(cache_key, result)
+        return result
+
+    if requested_index.min() < cached_index.min():
+        result = run_hybrid_backtest(
+            daily_prices,
+            cfg,
+            apply_vol_target=apply_vol_target,
+            get_constituents=get_constituents,
+        )
+        if cache_key:
+            save_backtest_cache(cache_key, result)
+        return result
+
+    last_cached_month = cached_index.max()
+    new_months = requested_index[requested_index > last_cached_month]
+    if len(new_months) == 0:
+        return {k: (v.copy() if isinstance(v, (pd.Series, pd.DataFrame)) else v) for k, v in existing.items()}
+
+    first_new_month = new_months[0]
+
+    month_lb = max(cfg.momentum_lookback_m, cfg.predictive_lookback_m if cfg.predictive_weight > 0 else 0, 1) + 1
+    month_start = first_new_month - pd.DateOffset(months=month_lb)
+    day_lb = cfg.mr_long_ma_days + cfg.mr_lookback_days + 5
+    day_start = first_new_month - pd.DateOffset(days=day_lb)
+    slice_start = min(month_start, day_start)
+    if not daily_prices.index.empty:
+        slice_start = max(slice_start, daily_prices.index.min())
+
+    prices_slice = daily_prices.loc[slice_start:]
+
+    mom_prev = existing.get("mom_last_weights", pd.Series(dtype=float))
+    if isinstance(mom_prev, pd.Series) and not mom_prev.empty:
+        mom_prev_series: Optional[pd.Series] = mom_prev.copy()
+    else:
+        mom_prev_series = None
+
+    mr_prev = existing.get("mr_last_weights", pd.Series(dtype=float))
+    if isinstance(mr_prev, pd.Series) and not mr_prev.empty:
+        mr_prev_series: Optional[pd.Series] = mr_prev.copy()
+    else:
+        mr_prev_series = None
+
+    pred_prev = existing.get("pred_last_weights", pd.Series(dtype=float))
+    if isinstance(pred_prev, pd.Series) and not pred_prev.empty:
+        pred_prev_series: Optional[pd.Series] = pred_prev.copy()
+    else:
+        pred_prev_series = None
+
+    mom_bt = run_backtest_momentum(
+        prices_slice,
+        lookback_m=cfg.momentum_lookback_m,
+        top_n=cfg.momentum_top_n,
+        cap=cfg.momentum_cap,
+        get_constituents=get_constituents,
+        prev_w=mom_prev_series,
+        start_at=first_new_month,
+        return_last_weights=True,
+    )
+    mom_new_rets, mom_new_tno, mom_last_w = mom_bt
+
+    mr_bt = run_backtest_mean_reversion(
+        prices_slice,
+        lookback_days=cfg.mr_lookback_days,
+        top_n=cfg.mr_top_n,
+        long_ma_days=cfg.mr_long_ma_days,
+        get_constituents=get_constituents,
+        prev_w=mr_prev_series,
+        start_at=first_new_month,
+        return_last_weights=True,
+    )
+    mr_new_rets, mr_new_tno, mr_last_w = mr_bt
+
+    pred_cached = existing.get("pred_rets", pd.Series(dtype=float))
+    if not isinstance(pred_cached, pd.Series):
+        pred_cached = pd.Series(dtype=float)
+    run_predictive = cfg.predictive_weight > 0 or not pred_cached.empty
+    pred_new_rets = pd.Series(dtype=float)
+    pred_new_tno = pd.Series(dtype=float)
+    pred_last_w = pred_prev.copy() if isinstance(pred_prev, pd.Series) else pd.Series(dtype=float)
+    if run_predictive:
+        pred_bt = run_backtest_predictive(
+            prices_slice,
+            lookback_m=cfg.predictive_lookback_m,
+            top_n=cfg.predictive_top_n,
+            cap=cfg.predictive_cap,
+            get_constituents=get_constituents,
+            prev_w=pred_prev_series,
+            start_at=first_new_month,
+            return_last_weights=True,
+        )
+        pred_new_rets, pred_new_tno, pred_last_w = pred_bt
+
+    def _merge(old: Any, new: pd.Series) -> pd.Series:
+        base = old if isinstance(old, pd.Series) else pd.Series(dtype=float)
+        if base.empty:
+            return new.copy()
+        if new.empty:
+            return base.copy()
+        keep = base.loc[~base.index.isin(new.index)]
+        return pd.concat([keep, new]).sort_index()
+
+    mom_rets = _merge(existing.get("mom_rets"), mom_new_rets)
+    mom_tno = _merge(existing.get("mom_turnover"), mom_new_tno)
+    mr_rets = _merge(existing.get("mr_rets"), mr_new_rets)
+    mr_tno = _merge(existing.get("mr_turnover"), mr_new_tno)
+    pred_rets = _merge(pred_cached, pred_new_rets)
+    pred_tno = _merge(existing.get("pred_turnover"), pred_new_tno)
+
+    idx = mom_rets.index.union(mr_rets.index).union(pred_rets.index)
+    mom_component = cfg.mom_weight * mom_rets.reindex(idx).fillna(0)
+    mr_component = cfg.mr_weight * mr_rets.reindex(idx).fillna(0)
+    hybrid_gross = mom_component + mr_component
+    if cfg.predictive_weight > 0:
+        hybrid_gross += cfg.predictive_weight * pred_rets.reindex(idx).fillna(0)
+
+    turnover = (
+        cfg.mom_weight * mom_tno.reindex(idx).fillna(0)
+        + cfg.mr_weight * mr_tno.reindex(idx).fillna(0)
+    )
+    if cfg.predictive_weight > 0:
+        turnover += cfg.predictive_weight * pred_tno.reindex(idx).fillna(0)
+
+    hybrid_net = hybrid_gross
+    if cfg.tc_bps != 0:
+        hybrid_net = apply_tc(hybrid_gross, turnover, tc_bps=cfg.tc_bps)
+    if apply_vol_target and cfg.target_vol_annual is not None:
+        hybrid_net = volatility_target(hybrid_net, target_vol_annual=cfg.target_vol_annual)
+
+    equity = cumulative_growth(hybrid_net)
+
+    result: Dict[str, pd.Series] = {
+        "mom_rets": mom_rets,
+        "mom_turnover": mom_tno,
+        "mr_rets": mr_rets,
+        "mr_turnover": mr_tno,
+        "pred_rets": pred_rets,
+        "pred_turnover": pred_tno,
+        "mom_last_weights": mom_last_w,
+        "mr_last_weights": mr_last_w,
+        "pred_last_weights": pred_last_w,
+        "hybrid_rets": hybrid_net,
+        "hybrid_rets_net": hybrid_net,
+        "hybrid_rets_gross": hybrid_gross,
+        "hybrid_turnover": turnover,
+        "hybrid_equity": equity,
+    }
+
+    if cache_key:
+        save_backtest_cache(cache_key, result)
+    return result
