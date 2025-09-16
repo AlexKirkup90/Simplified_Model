@@ -18,12 +18,201 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     Parallel = None  # type: ignore[assignment]
     delayed = None  # type: ignore[assignment]
+try:
+    from numba import njit  # type: ignore[import]
+    NUMBA_OK = True
+except Exception:  # pragma: no cover - optional dependency fallback
+    NUMBA_OK = False
+
+    def njit(*args, **kwargs):  # type: ignore[override]
+        if args and callable(args[0]):
+            return args[0]
+
+        def _decorator(func):
+            return func
+
+        return _decorator
 import optimizer
 import strategy_core
 from strategy_core import HybridConfig
 from portfolio_utils import cap_weights, l1_turnover
 
 warnings.filterwarnings("ignore")
+
+# =========================
+# Optional numba helpers
+# =========================
+_Z_EPS = 1e-9
+
+
+@njit(cache=True)
+def _mad_scale(values: np.ndarray) -> tuple[float, float]:  # pragma: no cover - exercised via wrapper
+    count = 0
+    for v in values:
+        if np.isfinite(v):
+            count += 1
+
+    if count == 0:
+        return 0.0, 0.0
+
+    clean = np.empty(count, dtype=np.float64)
+    idx = 0
+    for v in values:
+        if np.isfinite(v):
+            clean[idx] = v
+            idx += 1
+
+    clean.sort()
+    mid = count // 2
+    if count % 2 == 0:
+        median = 0.5 * (clean[mid - 1] + clean[mid])
+    else:
+        median = clean[mid]
+
+    deviations = np.empty(count, dtype=np.float64)
+    for i in range(count):
+        deviations[i] = abs(clean[i] - median)
+
+    deviations.sort()
+    if count % 2 == 0:
+        mad = 0.5 * (deviations[mid - 1] + deviations[mid])
+    else:
+        mad = deviations[mid]
+
+    if mad > 0.0:
+        return median, 1.4826 * mad
+
+    mean_val = 0.0
+    for v in clean:
+        mean_val += v
+    mean_val /= count
+
+    var = 0.0
+    for v in clean:
+        diff = v - mean_val
+        var += diff * diff
+    if count > 0:
+        var /= count
+
+    std = np.sqrt(var) if var > 0.0 else 0.0
+    return median, std
+
+
+@njit(cache=True)
+def _nanmean_std(values: np.ndarray) -> tuple[float, float, int]:  # pragma: no cover - exercised via wrapper
+    count = 0
+    mean_val = 0.0
+    m2 = 0.0
+    for v in values:
+        if not np.isfinite(v):
+            continue
+        count += 1
+        delta = v - mean_val
+        mean_val += delta / count
+        delta2 = v - mean_val
+        m2 += delta * delta2
+
+    if count == 0:
+        return np.nan, np.nan, 0
+
+    variance = m2 / count if count > 0 else np.nan
+    if variance < 0.0:
+        variance = 0.0
+
+    return mean_val, np.sqrt(variance), count
+
+
+@njit(cache=True)
+def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:  # pragma: no cover - exercised via wrapper
+    n = values.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        out[i] = np.nan
+
+    if window <= 0:
+        return out
+
+    for end in range(window - 1, n):
+        count = 0
+        mean_val = 0.0
+        m2 = 0.0
+        start = end - window + 1
+        for idx in range(start, end + 1):
+            v = values[idx]
+            if not np.isfinite(v):
+                continue
+            count += 1
+            delta = v - mean_val
+            mean_val += delta / count
+            delta2 = v - mean_val
+            m2 += delta * delta2
+
+        if count == window:
+            if count > 1:
+                variance = m2 / (count - 1)
+                if variance < 0.0:
+                    variance = 0.0
+                out[end] = np.sqrt(variance)
+            else:
+                out[end] = np.nan
+        else:
+            out[end] = np.nan
+
+    return out
+
+
+@njit(cache=True)
+def _last_rolling_mean(values: np.ndarray, window: int) -> float:  # pragma: no cover - exercised via wrapper
+    n = values.shape[0]
+    if window <= 0 or n < window:
+        return np.nan
+
+    start = n - window
+    total = 0.0
+    for idx in range(start, n):
+        v = values[idx]
+        if not np.isfinite(v):
+            return np.nan
+        total += v
+
+    return total / window
+
+
+def _zscore_series(series: pd.Series, cols: pd.Index) -> pd.Series:
+    cleaned = series.replace([np.inf, -np.inf], np.nan)
+
+    if not NUMBA_OK:
+        dropped = cleaned.dropna()
+        if dropped.empty:
+            return pd.Series(0.0, index=cols)
+        std = float(dropped.std(ddof=0))
+        if std == 0.0 or not np.isfinite(std):
+            return pd.Series(0.0, index=cols)
+        z_vals = (dropped - dropped.mean()) / (std + _Z_EPS)
+        return z_vals.reindex(cols).fillna(0.0)
+
+    values = cleaned.to_numpy(dtype=np.float64, copy=True)
+    mask = np.isfinite(values)
+    valid = int(mask.sum())
+    if valid == 0:
+        return pd.Series(0.0, index=cols)
+
+    finite_values = values[mask]
+    mean_val, std_val, count = _nanmean_std(finite_values)
+    if count == 0 or not np.isfinite(std_val) or std_val == 0.0:
+        return pd.Series(0.0, index=cols)
+
+    normalized = (finite_values - mean_val) / (std_val + _Z_EPS)
+    result = np.zeros(len(values), dtype=np.float64)
+    idx = 0
+    for i in range(len(values)):
+        if mask[i]:
+            result[i] = normalized[idx]
+            idx += 1
+
+    series_result = pd.Series(result, index=series.index)
+    return series_result.reindex(cols).fillna(0.0)
+
 
 # =========================
 # Config & Secrets
@@ -270,6 +459,11 @@ def linear_interpolate_short_gaps(
 
 def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
     """Robust location/scale (median & MAD*1.4826) with sane fallbacks."""
+    if NUMBA_OK:
+        values = returns.to_numpy(dtype=np.float64, copy=False)
+        median, scale = _mad_scale(values)
+        return float(median), float(scale)
+
     r = returns.dropna()
     if r.empty:
         return 0.0, 0.0
@@ -2044,43 +2238,74 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
 
 
 def blended_momentum_z(monthly: pd.DataFrame) -> pd.Series:
-    if monthly.shape[0] < 13: return pd.Series(dtype=float)
-    r3, r6, r12 = monthly.pct_change(3).iloc[-1], monthly.pct_change(6).iloc[-1], monthly.pct_change(12).iloc[-1]
-    def z(s, cols):
-        s = s.replace([np.inf,-np.inf], np.nan).dropna()
-        if s.empty or s.std(ddof=0)==0: return pd.Series(0.0, index=cols)
-        return ((s - s.mean()) / (s.std(ddof=0) + 1e-9)).reindex(cols).fillna(0.0)
+    if monthly.shape[0] < 13:
+        return pd.Series(dtype=float)
+
     cols = monthly.columns
-    return 0.2*z(r3,cols) + 0.4*z(r6,cols) + 0.4*z(r12,cols)
+    r3 = monthly.pct_change(3).iloc[-1]
+    r6 = monthly.pct_change(6).iloc[-1]
+    r12 = monthly.pct_change(12).iloc[-1]
+    return 0.2 * _zscore_series(r3, cols) + 0.4 * _zscore_series(r6, cols) + 0.4 * _zscore_series(r12, cols)
 
 def lowvol_z(daily: pd.DataFrame, vol_series: pd.Series | None = None) -> pd.Series:
-    if vol_series is not None:
-        vol = vol_series.replace([np.inf, -np.inf], np.nan).dropna()
-        if vol.empty or vol.std(ddof=0) == 0:
-            return pd.Series(0.0, index=daily.columns)
-        z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
-        return z.reindex(daily.columns).fillna(0.0)
+    cols = daily.columns
 
-    if daily.shape[0] < 80: return pd.Series(0.0, index=daily.columns)
-    vol = daily.pct_change().rolling(63).std().iloc[-1].replace([np.inf,-np.inf], np.nan).dropna()
-    if vol.empty or vol.std(ddof=0)==0: return pd.Series(0.0, index=daily.columns)
-    z = (vol - vol.mean()) / (vol.std(ddof=0) + 1e-9)
-    return z.reindex(daily.columns).fillna(0.0)
+    if vol_series is not None:
+        return _zscore_series(vol_series, cols)
+
+    if daily.shape[0] < 80:
+        return pd.Series(0.0, index=cols)
+
+    if NUMBA_OK and not daily.empty:
+        returns = daily.pct_change()
+        values = returns.to_numpy(dtype=np.float64, copy=True)
+        if values.size == 0:
+            vol = pd.Series(dtype=float)
+        else:
+            last_std = np.empty(values.shape[1], dtype=np.float64)
+            for col_idx in range(values.shape[1]):
+                std_values = _rolling_std(values[:, col_idx], 63)
+                last_std[col_idx] = std_values[-1]
+            vol = pd.Series(last_std, index=cols)
+        vol = vol.replace([np.inf, -np.inf], np.nan)
+    else:
+        vol = daily.pct_change().rolling(63).std().iloc[-1]
+        vol = vol.replace([np.inf, -np.inf], np.nan)
+
+    return _zscore_series(vol, cols)
 
 def trend_z(daily: pd.DataFrame, dist_series: pd.Series | None = None) -> pd.Series:
-    if dist_series is not None:
-        dist = dist_series.replace([np.inf, -np.inf], np.nan).dropna()
-        if dist.empty or dist.std(ddof=0) == 0:
-            return pd.Series(0.0, index=daily.columns)
-        z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
-        return z.reindex(daily.columns).fillna(0.0)
+    cols = daily.columns
 
-    if daily.shape[0] < 220: return pd.Series(0.0, index=daily.columns)
-    ma200 = daily.rolling(200).mean().iloc[-1]; last = daily.iloc[-1]
-    dist = (last/ma200 - 1).replace([np.inf,-np.inf], np.nan).dropna()
-    if dist.empty or dist.std(ddof=0)==0: return pd.Series(0.0, index=daily.columns)
-    z = (dist - dist.mean()) / (dist.std(ddof=0) + 1e-9)
-    return z.reindex(daily.columns).fillna(0.0)
+    if dist_series is not None:
+        return _zscore_series(dist_series, cols)
+
+    if daily.shape[0] < 220:
+        return pd.Series(0.0, index=cols)
+
+    if NUMBA_OK and not daily.empty:
+        data = daily.to_numpy(dtype=np.float64, copy=True)
+        last_row = data[-1]
+        ma_values = np.empty(data.shape[1], dtype=np.float64)
+        for col_idx in range(data.shape[1]):
+            ma_values[col_idx] = _last_rolling_mean(data[:, col_idx], 200)
+
+        dist_vals = np.empty(data.shape[1], dtype=np.float64)
+        for idx, ma_val in enumerate(ma_values):
+            last_val = last_row[idx]
+            if not np.isfinite(last_val) or not np.isfinite(ma_val) or ma_val == 0.0:
+                dist_vals[idx] = np.nan
+            else:
+                dist_vals[idx] = last_val / ma_val - 1.0
+        dist = pd.Series(dist_vals, index=cols)
+        dist = dist.replace([np.inf, -np.inf], np.nan)
+    else:
+        ma200 = daily.rolling(200).mean().iloc[-1]
+        last = daily.iloc[-1]
+        dist = (last / ma200 - 1)
+        dist = dist.replace([np.inf, -np.inf], np.nan)
+
+    return _zscore_series(dist, cols)
 
 def composite_score(daily: pd.DataFrame, panels: Dict[str, pd.DataFrame | pd.Series] | None = None) -> pd.Series:
     panels = compute_signal_panels(daily) if panels is None else panels
