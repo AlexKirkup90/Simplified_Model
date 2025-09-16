@@ -1,7 +1,7 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
 import os, io, warnings, json, hashlib
-from typing import Optional, Tuple, Dict, List, Any, Callable
-from dataclasses import replace
+from typing import Optional, Tuple, Dict, List, Any, Callable, Iterable
+from dataclasses import replace, asdict
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -38,6 +38,70 @@ from strategy_core import HybridConfig
 from portfolio_utils import cap_weights, l1_turnover
 
 warnings.filterwarnings("ignore")
+
+# =========================
+# Backtest cache helpers
+# =========================
+
+
+def _build_hybrid_cache_key(
+    tickers: Iterable[str],
+    cfg: HybridConfig,
+    start: pd.Timestamp,
+    apply_vol_target: bool,
+) -> str:
+    payload = {
+        "tickers": sorted(str(t) for t in tickers),
+        "cfg": asdict(cfg),
+        "start": pd.to_datetime(start).strftime("%Y-%m-%d"),
+        "apply_vol_target": bool(apply_vol_target),
+    }
+    raw = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _run_hybrid_backtest_with_cache(
+    daily_prices: pd.DataFrame,
+    cfg: HybridConfig,
+    cache_key: str,
+    apply_vol_target: bool,
+    use_incremental: bool = True,
+    get_constituents: Optional[Callable[[pd.Timestamp], Iterable[str]]] = None,
+) -> Dict[str, pd.Series]:
+    def _run_full() -> Dict[str, pd.Series]:
+        kwargs: Dict[str, Any] = {"apply_vol_target": apply_vol_target}
+        if get_constituents is not None:
+            kwargs["get_constituents"] = get_constituents
+        return strategy_core.run_hybrid_backtest(daily_prices, cfg, **kwargs)
+
+    if not use_incremental or not cache_key:
+        return _run_full()
+
+    cached = strategy_core.load_backtest_cache(cache_key)
+    if cached is not None:
+        cached_series = cached.get("hybrid_rets_net", pd.Series(dtype=float))
+        if not isinstance(cached_series, pd.Series):
+            cached_series = pd.Series(dtype=float)
+        cached_idx = cached_series.index
+        monthly_idx = daily_prices.resample("M").last().index
+        extends = False
+        if len(cached_idx) > 0 and len(monthly_idx) > 0:
+            extends = monthly_idx.min() >= cached_idx.min() and monthly_idx.max() > cached_idx.max()
+        if extends:
+            kwargs: Dict[str, Any] = {"apply_vol_target": apply_vol_target}
+            if get_constituents is not None:
+                kwargs["get_constituents"] = get_constituents
+            return strategy_core.run_hybrid_backtest_incremental(
+                daily_prices,
+                cfg,
+                cache_key=cache_key,
+                **kwargs,
+            )
+
+    result = _run_full()
+    if use_incremental and cache_key:
+        strategy_core.save_backtest_cache(cache_key, result)
+    return result
 
 # =========================
 # Optional numba helpers
@@ -1387,6 +1451,10 @@ def _yf_download(tickers, **kwargs):
 def parallel_yf_download(tickers, start, end, slices: int = 2):
     """Download Yahoo Finance data in parallel date slices and merge the result."""
 
+    download_module = getattr(yf.download, "__module__", "")
+    if download_module and not download_module.startswith("yfinance"):
+        return _yf_download(tickers, start=start, end=end)
+
     try:
         slices = int(slices)
     except Exception:
@@ -2721,6 +2789,7 @@ def generate_live_portfolio_isa_monthly(
     min_dollar_volume: float = 0.0,
     as_of: date | None = None,
     use_enhanced_features: bool = True,
+    use_incremental: bool = True,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
     """
     Enhanced ISA Dynamic live weights with MONTHLY LOCK + composite + stability + sector caps.
@@ -2851,7 +2920,16 @@ def generate_live_portfolio_isa_monthly(
             mr_lookback_days=int(params["mr_lb"]),
             mr_long_ma_days=int(params["mr_ma"]),
         )
-        bt_res = strategy_core.run_hybrid_backtest(close, cfg_live)
+        cache_key = ""
+        if use_incremental and len(close) > 0:
+            cache_key = _build_hybrid_cache_key(close.columns, cfg_live, close.index.min(), False)
+        bt_res = _run_hybrid_backtest_with_cache(
+            close,
+            cfg_live,
+            cache_key,
+            apply_vol_target=False,
+            use_incremental=use_incremental,
+        )
         portfolio_recent = bt_res.get("hybrid_rets", pd.Series(dtype=float)).tail(6)
         hedge_size = (
             st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
@@ -3012,6 +3090,7 @@ def run_backtest_isa_dynamic(
     auto_optimize: bool = False,
     target_vol_annual: Optional[float] = None,
     apply_vol_target: bool = False,
+    use_incremental: bool = True,
     n_jobs: Optional[int] = None,
 ) -> Tuple[
     Optional[pd.Series],
@@ -3059,6 +3138,8 @@ def run_backtest_isa_dynamic(
     apply_vol_target : bool, default False
         If True and `target_vol_annual` is set, apply volatility targeting to the
         combined series.
+    use_incremental : bool, default True
+        When True, reuse cached sleeve results to accelerate repeat runs.
     n_jobs : int, optional
         Worker count forwarded to optimisation helpers.  Defaults to
         :data:`PERF["n_jobs"] <PERF>` when unspecified.
@@ -3188,7 +3269,16 @@ def run_backtest_isa_dynamic(
     else:
         cfg = HybridConfig(**base_kwargs)
 
-    res = strategy_core.run_hybrid_backtest(daily, cfg, apply_vol_target=apply_vol_target)
+    cache_key = ""
+    if use_incremental and not daily.empty:
+        cache_key = _build_hybrid_cache_key(daily.columns, cfg, daily.index.min(), apply_vol_target)
+    res = _run_hybrid_backtest_with_cache(
+        daily,
+        cfg,
+        cache_key,
+        apply_vol_target=apply_vol_target,
+        use_incremental=use_incremental,
+    )
     hybrid_gross = res["hybrid_rets"]
     hybrid_tno = (
         cfg.mom_weight * res["mom_turnover"].reindex(hybrid_gross.index).fillna(0)
