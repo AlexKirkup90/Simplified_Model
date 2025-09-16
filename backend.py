@@ -125,9 +125,9 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return str(val).strip().lower() in {"1", "true", "yes", "on"}
 
 
-PERF = {
+PERF.update({
     "fast_io": _env_flag("FAST_IO", "0"),
-}
+})
 
 
 def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
@@ -2646,7 +2646,8 @@ def generate_live_portfolio_isa_monthly(
 def optimize_hybrid_strategy(prices: Optional[pd.DataFrame] = None,
                              start_date: str = "2017-07-01",
                              end_date: Optional[str] = None,
-                             universe: str = "Hybrid Top150") -> Tuple[HybridConfig, float]:
+                             universe: str = "Hybrid Top150",
+                             n_jobs: Optional[int] = None) -> Tuple[HybridConfig, float]:
     """Autonomously search for a Sharpe-maximizing ``HybridConfig``.
 
     Parameters
@@ -2659,6 +2660,9 @@ def optimize_hybrid_strategy(prices: Optional[pd.DataFrame] = None,
     universe : str
         Universe name passed to ``_prepare_universe_for_backtest`` when
         fetching data internally.
+    n_jobs : int, optional
+        Overrides the worker count used during grid-search evaluation.
+        Defaults to the value specified in :data:`PERF` when available.
 
     Returns
     -------
@@ -2691,7 +2695,12 @@ def optimize_hybrid_strategy(prices: Optional[pd.DataFrame] = None,
         "mr_weight": param_grid["mr_weight"],
     }
 
-    best_cfg, _ = optimizer.grid_search_hybrid(prices, search_grid)
+    perf_jobs = PERF.get("n_jobs")
+    best_cfg, _ = optimizer.grid_search_hybrid(
+        prices,
+        search_grid,
+        n_jobs=n_jobs or perf_jobs,
+    )
     # ``sector_cap`` is not part of ``HybridConfig``; we simply choose the
     # first value in the grid (callers may override as needed).
     sector_cap = param_grid["sector_cap"][0]
@@ -2716,6 +2725,7 @@ def run_backtest_isa_dynamic(
     auto_optimize: bool = False,
     target_vol_annual: Optional[float] = None,
     apply_vol_target: bool = False,
+    n_jobs: Optional[int] = None,
 ) -> Tuple[
     Optional[pd.Series],
     Optional[pd.Series],
@@ -2762,6 +2772,9 @@ def run_backtest_isa_dynamic(
     apply_vol_target : bool, default False
         If True and `target_vol_annual` is set, apply volatility targeting to the
         combined series.
+    n_jobs : int, optional
+        Worker count forwarded to optimisation helpers.  Defaults to
+        :data:`PERF["n_jobs"] <PERF>` when unspecified.
 
     Returns
     -------
@@ -2855,7 +2868,7 @@ def run_backtest_isa_dynamic(
         mom_weight = optimization_cfg.mom_weight
         mr_weight = optimization_cfg.mr_weight
     elif any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
-        cfg, opt_sector_cap = optimize_hybrid_strategy(daily)
+        cfg, opt_sector_cap = optimize_hybrid_strategy(daily, n_jobs=n_jobs)
         top_n = top_n or cfg.momentum_top_n
         name_cap = name_cap or cfg.momentum_cap
         mom_weight = mom_weight or cfg.mom_weight
