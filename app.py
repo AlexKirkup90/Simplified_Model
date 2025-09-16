@@ -83,6 +83,7 @@ st.session_state.setdefault("max_leverage", 2.0)
 st.session_state.setdefault("show_net", True)
 st.session_state.setdefault("vix_ts_threshold", backend.VIX_TS_THRESHOLD_DEFAULT)
 st.session_state.setdefault("hy_oas_threshold", backend.HY_OAS_THRESHOLD_DEFAULT)
+st.session_state.setdefault("max_hedge", backend.HEDGE_MAX_DEFAULT)
 st.session_state["use_enhanced_features"] = use_enhanced_features
 st.session_state["auto_optimize"] = auto_optimize
 
@@ -325,6 +326,29 @@ with tab2:
         # Decision banner
         st.info(decision)
 
+        hedge_details = st.session_state.get("latest_live_hedge", {})
+        if hedge_details:
+            hedge_weight = float(hedge_details.get("weight") or 0.0)
+            corr = hedge_details.get("correlation")
+            breadth = hedge_details.get("breadth_pos_6m")
+            qqq_above = hedge_details.get("qqq_above_200dma")
+
+            help_bits = []
+            if corr is not None:
+                help_bits.append(f"Correlation vs QQQ: {corr:.2f}")
+            if qqq_above is not None:
+                help_bits.append("QQQ above 200DMA" if qqq_above >= 1 else "QQQ below 200DMA")
+            if breadth is not None and not np.isnan(breadth):
+                help_bits.append(f"Breadth (6M > 0): {breadth:.0%}")
+            help_text = "; ".join(help_bits) if help_bits else "Hedge overlay based on regime metrics."
+
+            st.metric(
+                "QQQ Hedge",
+                f"{-hedge_weight:.2%}" if hedge_weight > 0 else "0.00%",
+                delta="Active" if hedge_weight > 0 else "Inactive",
+                help=help_text,
+            )
+
         # Feature badge
         if use_enhanced_features:
             st.success("🔬 Enhanced features active: Volatility-adjusted caps, regime awareness, signal decay")
@@ -428,6 +452,29 @@ with tab3:
     if strategy_cum_gross is None or qqq_cum is None:
         st.info("Click Generate to see backtest results.")
     else:
+        hedge_details = st.session_state.get("latest_backtest_hedge", {})
+        if hedge_details:
+            hedge_weight = float(hedge_details.get("weight") or 0.0)
+            corr = hedge_details.get("correlation")
+            breadth = hedge_details.get("breadth_pos_6m")
+            qqq_above = hedge_details.get("qqq_above_200dma")
+
+            help_bits = []
+            if corr is not None:
+                help_bits.append(f"Correlation vs QQQ: {corr:.2f}")
+            if qqq_above is not None:
+                help_bits.append("QQQ above 200DMA" if qqq_above >= 1 else "QQQ below 200DMA")
+            if breadth is not None and not np.isnan(breadth):
+                help_bits.append(f"Breadth (6M > 0): {breadth:.0%}")
+            help_text = "; ".join(help_bits) if help_bits else "Hedge overlay inferred from recent regime metrics."
+
+            st.metric(
+                "Backtest QQQ Hedge",
+                f"{-hedge_weight:.2%}" if hedge_weight > 0 else "0.00%",
+                delta="Active" if hedge_weight > 0 else "Inactive",
+                help=help_text,
+            )
+
         st.markdown("#### Key Performance (monthly series inferred)")
 
         # --- KPI table ---

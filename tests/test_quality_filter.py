@@ -48,8 +48,9 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
 
     import strategy_core
 
-    def fake_run_hybrid_backtest(daily_prices, cfg):
+    def fake_run_hybrid_backtest(daily_prices, cfg, apply_vol_target=False):
         captured["cols"] = list(daily_prices.columns)
+        captured["apply_vol_target"] = apply_vol_target
         idx = pd.date_range("2020-01-31", "2020-03-31", freq="M")
         return {
             "hybrid_rets": pd.Series(0.0, index=idx),
@@ -61,6 +62,9 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
 
     st.session_state["min_profitability"] = 0.0
     st.session_state["max_leverage"] = 1.0
+    monkeypatch.setattr(backend, "compute_regime_metrics", lambda *args, **kwargs: {})
+    monkeypatch.setattr(backend, "build_hedge_weight", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(backend, "calculate_portfolio_correlation_to_market", lambda *args, **kwargs: 0.0)
 
     backend.run_backtest_isa_dynamic(
         min_dollar_volume=0,
