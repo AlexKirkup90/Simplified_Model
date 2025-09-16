@@ -62,6 +62,9 @@ def test_run_backtest_isa_dynamic_uses_quality_filter(monkeypatch):
 
     st.session_state["min_profitability"] = 0.0
     st.session_state["max_leverage"] = 1.0
+    monkeypatch.setattr(backend, "compute_regime_metrics", lambda *args, **kwargs: {})
+    monkeypatch.setattr(backend, "build_hedge_weight", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(backend, "calculate_portfolio_correlation_to_market", lambda *args, **kwargs: 0.0)
 
     backend.run_backtest_isa_dynamic(
         min_dollar_volume=0,

@@ -69,6 +69,9 @@ ASSESS_LOG_FILE   = "assess_log.csv"
 ROUNDTRIP_BPS_DEFAULT   = 20
 REGIME_MA               = 200
 AVG_TRADE_SIZE_DEFAULT  = 0.02  # 2% avg single-leg trade size
+HEDGE_MAX_DEFAULT       = 0.20
+HEDGE_TICKER_LABEL      = "QQQ (Hedge)"
+HEDGE_TICKER_ALIASES    = {HEDGE_TICKER_LABEL, "QQQ_HEDGE", "QQQ-HEDGE"}
 
 # Defaults for regime-based exposure adjustments
 VIX_TS_THRESHOLD_DEFAULT = 1.0   # VIX3M / VIX ratio; <1 implies stress
@@ -122,6 +125,25 @@ def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
 
     # 3) Fallback to logging
     logging.info(msg)
+
+
+def _record_hedge_state(scope: str,
+                        weight: float,
+                        correlation: float | None,
+                        regime_metrics: Dict[str, float]) -> None:
+    """Persist the latest hedge details for UI/reporting purposes."""
+    if not _HAS_ST:
+        return
+
+    summary = {
+        "weight": float(weight or 0.0),
+        "correlation": (None if correlation is None or pd.isna(correlation)
+                         else float(correlation)),
+        "qqq_above_200dma": regime_metrics.get("qqq_above_200dma"),
+        "breadth_pos_6m": regime_metrics.get("breadth_pos_6m"),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    st.session_state[f"latest_{scope}_hedge"] = summary
 
 # =========================
 # NEW: Enhanced Data Validation & Cleaning
@@ -1188,6 +1210,13 @@ def get_sector_map(tickers: List[str]) -> Dict[str, str]:
     missing sector information are stored as ``"Unknown"``.
     """
 
+    tickers = list(tickers)
+
+    # Ensure the synthetic hedge ticker is always mapped without hitting yfinance
+    for alias in HEDGE_TICKER_ALIASES:
+        if alias in tickers and alias not in _SECTOR_CACHE:
+            _SECTOR_CACHE[alias] = "Hedge Overlay"
+
     new_tickers = [t for t in tickers if t not in _SECTOR_CACHE]
     for t in new_tickers:
         if t in _SECTOR_OVERRIDES:
@@ -1307,24 +1336,155 @@ def _prepare_universe_for_backtest(
     return close, vol, sectors_map, label
 
 # =========================
+# Data cleaning helpers
+# =========================
+def clean_extreme_moves(
+    prices: pd.DataFrame,
+    max_daily_move: float = 0.30,
+    min_price: float = 0.5,
+    zscore_threshold: float = 4.0,
+    info: Optional[Callable[[str], None]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Clip extreme one-day moves and replace with adjacent prices."""
+
+    if prices.empty:
+        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
+        return prices.copy(), empty
+
+    df = prices.copy()
+    mask = pd.DataFrame(False, index=df.index, columns=df.columns)
+
+    pct = df.pct_change().replace([np.inf, -np.inf], np.nan)
+    large_moves = pct.abs() > max_daily_move
+    low_prices = df < min_price
+    median = df.rolling(window=5, min_periods=1).median()
+    deviation = (df - median).abs() / (median.replace(0, np.nan).abs() + 1e-9)
+    extreme_price = deviation > max_daily_move
+
+    mask |= (large_moves & extreme_price).fillna(False)
+    mask |= low_prices.fillna(False)
+
+    if zscore_threshold is not None and not pct.empty:
+        zscores = (pct - pct.mean()) / (pct.std(ddof=0) + 1e-9)
+        mask |= zscores.abs() > zscore_threshold
+        mask = mask.fillna(False)
+
+    if mask.values.any():
+        cleaned = df.where(~mask)
+        filled = cleaned.ffill().bfill()
+        df = df.where(~mask, filled)
+        fixed = int(mask.values.sum())
+        msg = "🧹 Data cleaning: Fixed {} extreme price moves across all stocks".format(
+            fixed
+        )
+        _emit_info(msg, info)
+
+    return df, mask.astype(bool)
+
+
+def fill_missing_data(
+    prices: pd.DataFrame,
+    max_gap_days: int = 3,
+    info: Optional[Callable[[str], None]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Interpolate short gaps up to ``max_gap_days`` consecutive missing points."""
+
+    if prices.empty:
+        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
+        return prices.copy(), empty
+
+    df = prices.copy()
+    original_na = df.isna()
+
+    try:
+        filled = df.interpolate(
+            method="time",
+            limit=max_gap_days,
+            limit_direction="both",
+            limit_area="inside",
+        )
+    except Exception:
+        filled = df.interpolate(
+            method="linear",
+            limit=max_gap_days,
+            limit_direction="both",
+            limit_area="inside",
+        )
+
+    filled = filled.ffill(limit=max_gap_days).bfill(limit=max_gap_days)
+
+    mask = original_na & filled.notna()
+    filled_points = int(mask.values.sum())
+    if filled_points > 0:
+        msg = (
+            "🔧 Data filling: Filled {} missing data points with interpolation".format(
+                filled_points
+            )
+        )
+        _emit_info(msg, info)
+
+    return filled, mask.astype(bool)
+
+
+def validate_and_clean_market_data(
+    prices: pd.DataFrame,
+    max_missing_ratio: float = 0.20,
+    info: Optional[Callable[[str], None]] = None,
+) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
+    """Run the full cleaning pipeline used by cached market data downloads."""
+
+    if prices.empty:
+        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
+        return prices.copy(), [], empty
+
+    df = prices.copy()
+    alerts: List[str] = []
+
+    missing_ratio = df.isna().mean()
+    drop_cols = missing_ratio[missing_ratio > max_missing_ratio].index.tolist()
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+        alerts.append(
+            f"Removed {len(drop_cols)} stocks with >{int(max_missing_ratio * 100)}% missing data"
+        )
+
+    if df.empty:
+        alerts.append(f"Data shape: {prices.shape} → {df.shape}")
+        empty_mask = pd.DataFrame(False, index=df.index, columns=df.columns)
+        return df, alerts, empty_mask
+
+    cleaned, clean_mask = clean_extreme_moves(df, info=info)
+    filled, fill_mask = fill_missing_data(cleaned, info=info)
+    combined_mask = clean_mask.reindex_like(filled).fillna(False) | fill_mask
+
+    if df.shape != prices.shape or drop_cols:
+        alerts.append(f"Data shape: {prices.shape} → {filled.shape}")
+
+    return filled, alerts, combined_mask.astype(bool)
+
+
+# =========================
 # Data fetching (cache) - Enhanced with validation
 # =========================
+from typing import List, Tuple
+
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
     cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
+
+    # Try local disk cache first (Parquet -> Pickle)
     cached = _read_cached_dataframe(cache_path)
     if cached is not None:
         return cached
 
     try:
+        # Pull an extended window to help with MA/breadth calcs downstream
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+
         frames: List[pd.DataFrame] = []
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(
-                batch,
-                start=fetch_start,
-                end=end_date,
-            )["Close"]
+            df = _yf_download(batch, start=fetch_start, end=end_date)["Close"]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
@@ -1336,18 +1496,19 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         data = pd.concat(frames, axis=1)
         result = data.dropna(axis=1, how="all")
 
-        # Enhanced data cleaning pipeline
+        # Enhanced data cleaning pipeline (true linear interpolation on short gaps, etc.)
         if not result.empty:
             cleaned_result, cleaning_alerts, _ = validate_and_clean_market_data(result, info=logging.info)
 
-            # Show cleaning summary
+            # Log a brief cleaning summary (top 2 alerts)
             if cleaning_alerts:
-                for alert in cleaning_alerts[:2]:  # Show top 2 cleaning actions
+                for alert in cleaning_alerts[:2]:
                     logging.info("Data cleaning: %s", alert)
 
             _write_cached_dataframe(cleaned_result, cache_path)
             return cleaned_result
 
+        # Fallback: write whatever we got
         _write_cached_dataframe(result, cache_path)
         return result
 
@@ -1355,9 +1516,13 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         st.error(f"Failed to download market data: {e}")
         return pd.DataFrame()
 
+
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit."""
     cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
+
+    # Try local disk cache first (Parquet -> Pickle)
     combined = _read_cached_dataframe(cache_path)
     if combined is not None:
         if isinstance(combined.columns, pd.MultiIndex):
@@ -1371,28 +1536,27 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
     try:
         fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
+
         for batch in _chunk_tickers(tickers):
-            df = _yf_download(
-                batch,
-                start=fetch_start,
-                end=end_date,
-            )[["Close", "Volume"]]
+            df = _yf_download(batch, start=fetch_start, end=end_date)[["Close", "Volume"]]
             if isinstance(df, pd.Series):
                 df = df.to_frame()
+
             if isinstance(df.columns, pd.MultiIndex):
                 close_part = df["Close"]
                 vol_part = df["Volume"]
             else:
-                if "Close" in df.columns and "Volume" in df.columns:
-                    close_part = df[["Close"]].copy()
-                    vol_part = df[["Volume"]].copy()
-                    if len(batch) == 1:
-                        close_part.columns = [batch[0]]
-                        vol_part.columns = [batch[0]]
-                else:
+                if "Close" not in df.columns or "Volume" not in df.columns:
                     continue
+                close_part = df[["Close"]].copy()
+                vol_part = df[["Volume"]].copy()
+                if len(batch) == 1:
+                    close_part.columns = [batch[0]]
+                    vol_part.columns = [batch[0]]
+
             close_frames.append(close_part)
             vol_frames.append(vol_part)
 
@@ -1403,11 +1567,11 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         vol = pd.concat(vol_frames, axis=1)
         vol = vol.reindex_like(close).fillna(0)
 
-        # Enhanced data cleaning for prices
+        # Enhanced cleaning for prices
         if not close.empty:
             cleaned_close, close_alerts, _ = validate_and_clean_market_data(close, info=logging.info)
 
-            # Clean volume data (less aggressive)
+            # Mild cleaning for volume: align and clip extreme spikes (99th pct)
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
             for col in vol_aligned.columns:
                 col_data = vol_aligned[col]
@@ -1416,25 +1580,20 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     vol_aligned[col] = col_data.clip(lower=0, upper=q99)
 
             if close_alerts:
-                for alert in close_alerts[:1]:  # Show top cleaning action
+                for alert in close_alerts[:1]:
                     logging.info("Price/Volume cleaning: %s", alert)
 
-            _write_cached_dataframe(
-                pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1),
-                cache_path,
-            )
+            _write_cached_dataframe(pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1), cache_path)
             return cleaned_close, vol_aligned
 
-        _write_cached_dataframe(
-            pd.concat({"Close": close, "Volume": vol}, axis=1),
-            cache_path,
-        )
+        # Fallback: cache raw combined
+        _write_cached_dataframe(pd.concat({"Close": close, "Volume": vol}, axis=1), cache_path)
         return close, vol
 
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()
-        
+      
 # =========================
 # Persistence (Gist + Local) - Unchanged
 # =========================
@@ -2139,6 +2298,14 @@ def generate_live_portfolio_isa_monthly(
     # Expose the price index for downstream processes (e.g. save gating)
     st.session_state["latest_price_index"] = close.index
 
+    regime_metrics: Dict[str, float] = {}
+    if len(close) > 0:
+        try:
+            regime_metrics = compute_regime_metrics(close)
+        except Exception:
+            logging.warning("R02 regime metric calculation failed in allocation", exc_info=True)
+            regime_metrics = {}
+
     # Monthly lock check – always compute new weights
     is_monthly = is_rebalance_today(today, close.index)
     decision = "Preview only – portfolio not saved" if not is_monthly else ""
@@ -2151,10 +2318,9 @@ def generate_live_portfolio_isa_monthly(
     # Apply regime-based exposure scaling to final weights
     if use_enhanced_features and len(close) > 0 and len(new_w) > 0:
         try:
-            regime_metrics = compute_regime_metrics(close)
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
             new_w = new_w * float(regime_exposure)
-        except Exception as e:
+        except Exception:
             logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
     # Validate and re-enforce caps if scaling introduced violations
@@ -2188,6 +2354,32 @@ def generate_live_portfolio_isa_monthly(
                     f"Constraint violations after re-enforcing caps: {violations}"
                 )
 
+    hedge_weight = 0.0
+    corr = np.nan
+    portfolio_recent = pd.Series(dtype=float)
+    try:
+        cfg_live = HybridConfig(
+            momentum_top_n=int(params["mom_topn"]),
+            momentum_cap=float(params["mom_cap"]),
+            mr_top_n=int(params["mr_topn"]),
+            mom_weight=float(params["mom_w"]),
+            mr_weight=float(params["mr_w"]),
+            mr_lookback_days=int(params["mr_lb"]),
+            mr_long_ma_days=int(params["mr_ma"]),
+        )
+        bt_res = strategy_core.run_hybrid_backtest(close, cfg_live)
+        portfolio_recent = bt_res.get("hybrid_rets", pd.Series(dtype=float)).tail(6)
+        hedge_size = (
+            st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
+            if _HAS_ST else HEDGE_MAX_DEFAULT
+        )
+        hedge_weight = build_hedge_weight(portfolio_recent, regime_metrics, hedge_size)
+        corr = calculate_portfolio_correlation_to_market(portfolio_recent)
+    except Exception:
+        logging.warning("H02 hedge overlay failed in allocation", exc_info=True)
+
+    final_weights = new_w.astype(float) if len(new_w) > 0 else new_w
+
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("M").last()
@@ -2196,6 +2388,7 @@ def generate_live_portfolio_isa_monthly(
             top_m = mom_scores.nlargest(params["mom_topn"])
             top_score = float(top_m.iloc[0]) if len(top_m) > 0 else 1e-9
             prev_w = prev_portfolio["Weight"].astype(float)
+            prev_w = prev_w.drop(index=HEDGE_TICKER_LABEL, errors="ignore")
             held_scores = mom_scores.reindex(prev_w.index).fillna(0.0)
             health = float((held_scores * prev_w).sum() / max(top_score, 1e-9))
             if health >= params["trigger"]:
@@ -2214,8 +2407,7 @@ def generate_live_portfolio_isa_monthly(
                 )
                 if not violations:
                     decision = f"Health {health:.2f} ≥ trigger {params['trigger']:.2f} — holding existing portfolio."
-                    disp, raw = _format_display(prev_w)
-                    return disp, raw, decision
+                    final_weights = prev_w.astype(float)
                 decision = (
                     f"Health {health:.2f} ≥ trigger {params['trigger']:.2f}"
                     " — constraints violated, rebalancing to new targets."
@@ -2223,7 +2415,33 @@ def generate_live_portfolio_isa_monthly(
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
-    disp, raw = _format_display(new_w)
+    def _inject_hedge(weights: pd.Series) -> pd.Series:
+        w = weights.copy() if weights is not None else pd.Series(dtype=float)
+        if not isinstance(w, pd.Series):
+            w = pd.Series(dtype=float)
+        w = w.drop(index=HEDGE_TICKER_LABEL, errors="ignore")
+        if hedge_weight > 0:
+            w.loc[HEDGE_TICKER_LABEL] = -hedge_weight
+        return w.astype(float)
+
+    final_weights = _inject_hedge(final_weights if isinstance(final_weights, pd.Series) else pd.Series(dtype=float))
+
+    state = "active" if hedge_weight > 0 else "inactive"
+    corr_txt = "n/a" if pd.isna(corr) else f"{corr:.2f}"
+    _emit_info(
+        f"Live allocation QQQ hedge {state} (weight={hedge_weight:.1%}, corr={corr_txt})"
+    )
+    _record_hedge_state("live", hedge_weight, corr, regime_metrics)
+
+    hedge_note = (
+        f"QQQ hedge active at {hedge_weight:.1%} short."
+        if hedge_weight > 0
+        else "QQQ hedge inactive."
+    )
+    decision = (decision or "").strip()
+    decision = f"{decision}\n{hedge_note}" if decision else hedge_note
+
+    disp, raw = _format_display(final_weights)
     return disp, raw, decision
 
 
@@ -2378,19 +2596,51 @@ def run_backtest_isa_dynamic(
         + cfg.mr_weight * res["mr_turnover"].reindex(hybrid_gross.index).fillna(0)
     )
 
+    qqq_monthly = qqq.resample("M").last().pct_change()
+
     # Apply drawdown-based exposure adjustment (walk-forward)
     if use_enhanced_features:
-        qqq_monthly = qqq.resample("M").last().pct_change()
         hybrid_gross = apply_dynamic_drawdown_scaling(
             hybrid_gross, qqq_monthly, threshold_fraction=0.8
         )
+
+    hedge_weight = 0.0
+    corr = np.nan
+    regime_metrics: Dict[str, float] = {}
+    portfolio_recent = hybrid_gross.tail(6)
+
+    try:
+        lookback_daily = daily.iloc[-252:] if len(daily) > 252 else daily
+        if not lookback_daily.empty:
+            regime_metrics = compute_regime_metrics(lookback_daily)
+
+        hedge_size = (
+            st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
+            if _HAS_ST else HEDGE_MAX_DEFAULT
+        )
+        hedge_weight = build_hedge_weight(portfolio_recent, regime_metrics, hedge_size)
+        corr = calculate_portfolio_correlation_to_market(portfolio_recent)
+
+        if hedge_weight > 0 and not qqq_monthly.empty:
+            qqq_aligned = qqq_monthly.reindex(hybrid_gross.index).fillna(0.0)
+            hedge_returns = -hedge_weight * qqq_aligned
+            hybrid_gross = hybrid_gross.add(hedge_returns, fill_value=0.0)
+    except Exception:
+        logging.warning("H01 hedge overlay failed in backtest", exc_info=True)
+
+    state = "active" if hedge_weight > 0 else "inactive"
+    corr_txt = "n/a" if pd.isna(corr) else f"{corr:.2f}"
+    _emit_info(
+        f"Backtest QQQ hedge {state} (weight={hedge_weight:.1%}, corr={corr_txt})"
+    )
+    _record_hedge_state("backtest", hedge_weight, corr, regime_metrics)
 
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
     # Cum curves
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
     strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
-    qqq_cum = (1 + qqq.resample("M").last().pct_change()).cumprod().reindex(strat_cum_gross.index, method="ffill")
+    qqq_cum = (1 + qqq_monthly).cumprod().reindex(strat_cum_gross.index, method="ffill")
 
     return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
     
