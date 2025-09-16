@@ -357,7 +357,7 @@ def cap_abnormal_returns(
 def clean_extreme_moves(
     prices: pd.DataFrame,
     *,
-    max_daily_move: float = 0.35,
+    max_daily_move: float = 0.30,
     min_price: float = 0.5,
     zscore_threshold: float | None = 4.0,
     info: Optional[Callable[[str], None]] = None,
@@ -412,7 +412,7 @@ def validate_and_clean_market_data(
     prices: pd.DataFrame,
     *,
     max_missing_ratio: float = 0.20,
-    max_daily_move: float = 0.35,
+    max_daily_move: float = 0.30,
     min_price: float = 0.5,
     zscore_threshold: float | None = 4.0,
     max_gap_days: int = 3,
@@ -1439,122 +1439,135 @@ def clean_extreme_moves(
     zscore_threshold: float = 4.0,
     info: Optional[Callable[[str], None]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Clip extreme one-day moves and replace with adjacent prices."""
+    """Clamp implausible price swings and return the cleaned data with a mask."""
 
-    if prices.empty:
-        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
-        return prices.copy(), empty
-
-    df = prices.copy()
-    mask = pd.DataFrame(False, index=df.index, columns=df.columns)
-
-    pct = df.pct_change().replace([np.inf, -np.inf], np.nan)
-    large_moves = pct.abs() > max_daily_move
-    low_prices = df < min_price
-    median = df.rolling(window=5, min_periods=1).median()
-    deviation = (df - median).abs() / (median.replace(0, np.nan).abs() + 1e-9)
-    extreme_price = deviation > max_daily_move
-
-    mask |= (large_moves & extreme_price).fillna(False)
-    mask |= low_prices.fillna(False)
-
-    if zscore_threshold is not None and not pct.empty:
-        zscores = (pct - pct.mean()) / (pct.std(ddof=0) + 1e-9)
-        mask |= zscores.abs() > zscore_threshold
-        mask = mask.fillna(False)
-
-    if mask.values.any():
-        cleaned = df.where(~mask)
-        filled = cleaned.ffill().bfill()
-        df = df.where(~mask, filled)
-        fixed = int(mask.values.sum())
-        msg = "🧹 Data cleaning: Fixed {} extreme price moves across all stocks".format(
-            fixed
+    if prices is None or prices.empty:
+        empty_mask = pd.DataFrame(
+            False,
+            index=getattr(prices, "index", []),
+            columns=getattr(prices, "columns", []),
         )
+        empty = prices.copy() if hasattr(prices, "copy") else pd.DataFrame()
+        return empty, empty_mask
+
+    cleaned = prices.copy()
+    floor_mask = pd.DataFrame(False, index=cleaned.index, columns=cleaned.columns)
+
+    if min_price is not None:
+        floor_mask = (cleaned < min_price) & cleaned.notna()
+        if floor_mask.any().any():
+            cleaned[floor_mask] = float(min_price)
+
+    capped, cap_mask = cap_abnormal_returns(
+        cleaned,
+        max_daily_move=max_daily_move,
+        zscore_threshold=zscore_threshold,
+        min_price=min_price,
+    )
+
+    cap_mask = cap_mask.astype(bool).reindex_like(cleaned).fillna(False)
+    floor_mask = floor_mask.astype(bool).reindex_like(cleaned).fillna(False)
+    combined_mask = (cap_mask | floor_mask).astype(bool)
+
+    fixes = int(combined_mask.to_numpy().sum())
+    if fixes > 0:
+        msg = f"🧹 Data cleaning: Fixed {fixes} extreme price moves across all stocks"
         _emit_info(msg, info)
 
-    return df, mask.astype(bool)
+    return capped, combined_mask
 
 
 def fill_missing_data(
     prices: pd.DataFrame,
     max_gap_days: int = 3,
     info: Optional[Callable[[str], None]] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Interpolate short gaps up to ``max_gap_days`` consecutive missing points."""
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Interpolate short gaps on price levels and return the filled data and masks."""
 
-    if prices.empty:
-        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
-        return prices.copy(), empty
-
-    df = prices.copy()
-    original_na = df.isna()
-
-    try:
-        filled = df.interpolate(
-            method="time",
-            limit=max_gap_days,
-            limit_direction="both",
-            limit_area="inside",
+    if prices is None or prices.empty:
+        empty = prices.copy() if hasattr(prices, "copy") else pd.DataFrame()
+        empty_mask = pd.DataFrame(
+            False,
+            index=getattr(prices, "index", []),
+            columns=getattr(prices, "columns", []),
         )
-    except Exception:
-        filled = df.interpolate(
-            method="linear",
-            limit=max_gap_days,
-            limit_direction="both",
-            limit_area="inside",
-        )
+        return empty, empty_mask, empty_mask.copy()
 
-    filled = filled.ffill(limit=max_gap_days).bfill(limit=max_gap_days)
+    filled, interp_mask = linear_interpolate_short_gaps(prices, max_gap=max_gap_days)
+    interp_mask = interp_mask.reindex_like(filled).fillna(False).astype(bool)
 
-    mask = original_na & filled.notna()
-    filled_points = int(mask.values.sum())
+    filled_points = int(interp_mask.to_numpy().sum())
     if filled_points > 0:
-        msg = (
-            "🔧 Data filling: Filled {} missing data points with interpolation".format(
-                filled_points
-            )
-        )
+        msg = f"🔧 Data filling: Filled {filled_points} missing data points with interpolation"
         _emit_info(msg, info)
 
-    return filled, mask.astype(bool)
+    cap_mask = pd.DataFrame(False, index=filled.index, columns=filled.columns)
+    return filled, interp_mask, cap_mask
 
 
 def validate_and_clean_market_data(
     prices: pd.DataFrame,
+    *,
     max_missing_ratio: float = 0.20,
+    max_daily_move: float = 0.30,
+    min_price: float = 0.5,
+    zscore_threshold: float | None = 4.0,
+    max_gap_days: int = 3,
     info: Optional[Callable[[str], None]] = None,
-) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
-    """Run the full cleaning pipeline used by cached market data downloads."""
+) -> Tuple[pd.DataFrame, List[str], pd.DataFrame, pd.DataFrame]:
+    """Run the full cleaning pipeline and return the cleaned data plus masks."""
 
-    if prices.empty:
-        empty = pd.DataFrame(False, index=prices.index, columns=prices.columns)
-        return prices.copy(), [], empty
-
-    df = prices.copy()
-    alerts: List[str] = []
-
-    missing_ratio = df.isna().mean()
-    drop_cols = missing_ratio[missing_ratio > max_missing_ratio].index.tolist()
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-        alerts.append(
-            f"Removed {len(drop_cols)} stocks with >{int(max_missing_ratio * 100)}% missing data"
+    if prices is None or prices.empty:
+        empty = prices.copy() if hasattr(prices, "copy") else pd.DataFrame()
+        empty_mask = pd.DataFrame(
+            False,
+            index=getattr(prices, "index", []),
+            columns=getattr(prices, "columns", []),
         )
+        return empty, [], empty_mask.copy(), empty_mask.copy()
 
-    if df.empty:
-        alerts.append(f"Data shape: {prices.shape} → {df.shape}")
-        empty_mask = pd.DataFrame(False, index=df.index, columns=df.columns)
-        return df, alerts, empty_mask
+    data = prices.copy()
+    alerts: List[str] = []
+    original_shape = data.shape
 
-    cleaned, clean_mask = clean_extreme_moves(df, info=info)
-    filled, fill_mask = fill_missing_data(cleaned, info=info)
-    combined_mask = clean_mask.reindex_like(filled).fillna(False) | fill_mask
+    if max_missing_ratio is not None and data.shape[1] > 0:
+        miss_frac = data.isna().mean()
+        drop_cols = miss_frac[miss_frac > max_missing_ratio].index.tolist()
+        if drop_cols:
+            data = data.drop(columns=drop_cols)
+            alerts.append(
+                f"Removed {len(drop_cols)} stocks with >{int(round(max_missing_ratio * 100))}% missing data"
+            )
+    else:
+        drop_cols = []
 
-    if df.shape != prices.shape or drop_cols:
-        alerts.append(f"Data shape: {prices.shape} → {filled.shape}")
+    if data.shape != original_shape:
+        alerts.append(f"Data shape: {original_shape} → {data.shape}")
 
-    return filled, alerts, combined_mask.astype(bool)
+    if data.empty:
+        empty_mask = pd.DataFrame(False, index=prices.index, columns=data.columns)
+        return data, alerts, empty_mask.copy(), empty_mask.copy()
+
+    cleaned, cap_mask = clean_extreme_moves(
+        data,
+        max_daily_move=max_daily_move,
+        min_price=min_price,
+        zscore_threshold=zscore_threshold if zscore_threshold is not None else None,
+        info=info,
+    )
+
+    filled, fill_mask, fill_cap_mask = fill_missing_data(
+        cleaned,
+        max_gap_days=max_gap_days,
+        info=info,
+    )
+
+    cap_mask = cap_mask.reindex_like(filled).fillna(False)
+    fill_mask = fill_mask.reindex_like(filled).fillna(False)
+    fill_cap_mask = fill_cap_mask.reindex_like(filled).fillna(False)
+    combined_cap_mask = (cap_mask | fill_cap_mask).astype(bool)
+
+    return filled, alerts, fill_mask.astype(bool), combined_cap_mask
 
 
 # =========================
