@@ -54,6 +54,9 @@ def test_run_backtest_isa_dynamic_uses_optimizer(monkeypatch):
         mr_weight = 0.4
 
     monkeypatch.setattr(backend, "optimize_hybrid_strategy", lambda prices: (DummyCfg(), 0.33))
+    monkeypatch.setattr(backend, "compute_regime_metrics", lambda *args, **kwargs: {})
+    monkeypatch.setattr(backend, "build_hedge_weight", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(backend, "calculate_portfolio_correlation_to_market", lambda *args, **kwargs: 0.0)
 
     st.session_state["min_profitability"] = 0.0
     st.session_state["max_leverage"] = 10.0
