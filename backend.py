@@ -1,6 +1,7 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
 import os, io, warnings, json, hashlib
 from typing import Optional, Tuple, Dict, List, Any, Callable
+from dataclasses import replace
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -2608,23 +2609,65 @@ def run_backtest_isa_dynamic(
     mr_weight: Optional[float] = None,
     use_enhanced_features: bool = True,
     apply_quality_filter: bool = False,
+    auto_optimize: bool = False,
     target_vol_annual: Optional[float] = None,
     apply_vol_target: bool = False,
 ) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
     """
-    Enhanced ISA-Dynamic hybrid backtest with new features.
+    Enhanced ISA-Dynamic hybrid backtest with stickiness, sector caps, and optional extras.
 
     Parameters
     ----------
-    apply_quality_filter: bool, optional
-        If True, filter the universe using *current* fundamentals. Leave False
-        during historical backtests to avoid look-ahead bias.
-    target_vol_annual: float, optional
-        Annualized volatility target (e.g., 0.15 for 15%) applied when
-        ``apply_vol_target`` is True.
-    apply_vol_target: bool, optional
-        If True, scale returns using the volatility targeting helper from
-        ``strategy_core``.
+    roundtrip_bps : float, default 0.0
+        Round-trip transaction cost in basis points used to model trading drag.
+    min_dollar_volume : float, default 0.0
+        Liquidity floor for universe filtering (ignored if your pipeline
+        doesn't compute dollar volume).
+    show_net : bool, default True
+        If True, downstream displays prefer net returns; both gross and net are computed.
+    start_date, end_date : str
+        Backtest window (YYYY-MM-DD). end_date defaults to today.
+    universe_choice : {"Hybrid Top150","NASDAQ100+","S&P500 (All)"}, optional
+        Universe selector used by your data/universe builder.
+    top_n, name_cap, sector_cap : optional
+        Overrides for momentum sleeve breadth and caps. Pass None to use preset
+        or optimisation.
+    stickiness_days : int, default 7
+        Holding “stickiness” (days) to reduce churn in the live portfolio logic.
+    mr_topn : int, default 3
+        Breadth of the mean-reversion sleeve.
+    mom_weight, mr_weight : optional
+        Hybrid blend weights. Pass None to use preset or optimisation.
+    use_enhanced_features : bool, default True
+        Enable volatility-adjusted caps / regime awareness / signal decay (if implemented).
+    apply_quality_filter : bool, default False
+        If True, apply a current-fundamentals quality screen. Keep False for historical
+        tests to avoid look-ahead bias.
+    auto_optimize : bool, default False
+        If True, run parameter optimisation (e.g., grid/Bayesian). The function
+        still returns the legacy 4-tuple for compatibility; optimisation
+        artefacts should be stored/logged elsewhere if needed.
+    target_vol_annual : float, optional
+        Annualised volatility target (e.g., 0.15) for optional vol targeting.
+    apply_vol_target : bool, default False
+        If True and `target_vol_annual` is set, apply volatility targeting to the
+        combined series.
+
+    Returns
+    -------
+    strat_cum_gross : Series or None
+        Strategy cumulative equity (gross of costs).
+    strat_cum_net : Series or None
+        Strategy cumulative equity (net of costs / vol targeting as configured).
+    qqq_cum : Series or None
+        Benchmark cumulative equity (e.g., QQQ).
+    hybrid_tno : Series or None
+        Monthly turnover (0.5 × L1) for the hybrid portfolio.
+
+    Notes
+    -----
+    This signature is backward-compatible with existing `app.py` usage while adding
+    optimisation and vol-target controls.
     """
     if end_date is None:
         end_date = date.today().strftime("%Y-%m-%d")
@@ -2632,7 +2675,7 @@ def run_backtest_isa_dynamic(
     # Universe & data (helper)
     close, vol, sectors_map, label = _prepare_universe_for_backtest(universe_choice, start_date, end_date)
     if close.empty or "QQQ" not in close.columns:
-        return None, None, None, None
+        return None, None, None, None, None, pd.DataFrame()
 
     # Liquidity floor (optional)
     if min_dollar_volume > 0:
@@ -2643,7 +2686,7 @@ def run_backtest_isa_dynamic(
         )
         keep_cols = [c for c in keep if c in close.columns]
         if not keep_cols:
-            return None, None, None, None
+            return None, None, None, None, None, pd.DataFrame()
         close = close[keep_cols + ["QQQ"]]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep_cols}
 
@@ -2659,11 +2702,50 @@ def run_backtest_isa_dynamic(
             fundamentals, min_profitability=min_prof, max_leverage=max_lev
         )
         if not keep:
-            return None, None, None, None
+            return None, None, None, None, None, pd.DataFrame()
         daily = daily[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
 
-    if any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
+    optimization_cfg: Optional[HybridConfig] = None
+    search_diagnostics = pd.DataFrame()
+
+    if auto_optimize:
+        base_defaults = HybridConfig()
+        base_cfg = HybridConfig(
+            momentum_lookback_m=base_defaults.momentum_lookback_m,
+            momentum_top_n=top_n or base_defaults.momentum_top_n,
+            momentum_cap=name_cap or base_defaults.momentum_cap,
+            mr_lookback_days=base_defaults.mr_lookback_days,
+            mr_top_n=mr_topn or base_defaults.mr_top_n,
+            mr_long_ma_days=base_defaults.mr_long_ma_days,
+            mom_weight=mom_weight or base_defaults.mom_weight,
+            mr_weight=mr_weight or base_defaults.mr_weight,
+            predictive_weight=0.0,
+            target_vol_annual=base_defaults.target_vol_annual,
+        )
+        search_space = {
+            "momentum_top_n": range(6, 21),
+            "momentum_cap": [0.15, 0.2, 0.25, 0.3, 0.35],
+            "momentum_lookback_m": [3, 6, 9, 12],
+            "mr_top_n": [2, 3, 4, 5, 6],
+            "mr_lookback_days": [10, 15, 21, 30],
+            "mr_long_ma_days": [150, 180, 200, 220, 250],
+            "mom_weight": [0.55, 0.65, 0.75, 0.85, 0.9],
+            "mr_weight": [0.05, 0.15, 0.25, 0.35, 0.45],
+        }
+        optimization_cfg, search_diagnostics = optimizer.bayesian_optimize_hybrid(
+            daily,
+            search_space=search_space,
+            base_cfg=base_cfg,
+            tc_bps=roundtrip_bps if show_net else 0.0,
+            apply_vol_target=False,
+        )
+        top_n = optimization_cfg.momentum_top_n
+        name_cap = optimization_cfg.momentum_cap
+        mr_topn = optimization_cfg.mr_top_n
+        mom_weight = optimization_cfg.mom_weight
+        mr_weight = optimization_cfg.mr_weight
+    elif any(p is None for p in (top_n, name_cap, sector_cap, mom_weight, mr_weight)):
         cfg, opt_sector_cap = optimize_hybrid_strategy(daily)
         top_n = top_n or cfg.momentum_top_n
         name_cap = name_cap or cfg.momentum_cap
@@ -2671,16 +2753,31 @@ def run_backtest_isa_dynamic(
         mr_weight = mr_weight or cfg.mr_weight
         sector_cap = sector_cap or opt_sector_cap
 
-    cfg = HybridConfig(
-        momentum_top_n=top_n,
-        momentum_cap=name_cap,
-        mr_top_n=mr_topn,
-        mom_weight=mom_weight,
-        mr_weight=mr_weight,
-        mr_lookback_days=21,
-        mr_long_ma_days=200,
-        target_vol_annual=target_vol_annual if apply_vol_target else None,
-    )
+# --- Build HybridConfig (works with/without an optimizer-provided cfg) ---
+tc_for_sim = roundtrip_bps if show_net else 0.0
+
+# Only pass non-None overrides so dataclass defaults remain intact
+base_kwargs = {
+    "momentum_top_n": top_n,
+    "momentum_cap": name_cap,
+    "mr_top_n": mr_topn,
+    "mom_weight": mom_weight,
+    "mr_weight": mr_weight,
+    "mr_lookback_days": 21,
+    "mr_long_ma_days": 200,
+    "tc_bps": tc_for_sim,
+    # apply vol target only if requested
+    "target_vol_annual": (target_vol_annual if apply_vol_target else None),
+}
+
+# Drop keys whose values are None to avoid overriding dataclass defaults
+base_kwargs = {k: v for k, v in base_kwargs.items() if v is not None}
+
+# If an optimisation step produced a config, start from it and overlay overrides
+if "optimization_cfg" in locals() and optimization_cfg is not None:
+    cfg = replace(optimization_cfg, **base_kwargs)
+else:
+    cfg = HybridConfig(**base_kwargs)
 
     res = strategy_core.run_hybrid_backtest(daily, cfg, apply_vol_target=apply_vol_target)
     hybrid_gross = res["hybrid_rets"]
@@ -2735,7 +2832,14 @@ def run_backtest_isa_dynamic(
     strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
     qqq_cum = (1 + qqq_monthly).cumprod().reindex(strat_cum_gross.index, method="ffill")
 
-    return strat_cum_gross, strat_cum_net, qqq_cum, hybrid_tno
+    return (
+        strat_cum_gross,
+        strat_cum_net,
+        qqq_cum,
+        hybrid_tno,
+        optimization_cfg,
+        search_diagnostics,
+    )
     
 # =========================
 # Diff engine (for Plan tab) - Unchanged

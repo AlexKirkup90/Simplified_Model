@@ -1,5 +1,6 @@
 # app.py - Enhanced Hybrid Momentum Portfolio (ISA-Dynamic) with Strategy Health Monitoring
 import traceback
+from dataclasses import asdict
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
@@ -200,7 +201,14 @@ if go:
 
         try:
             # ---- Enhanced ISA Dynamic backtest (Hybrid150 default) from 2017-07-01
-            strategy_cum_gross, strategy_cum_net, qqq_cum, hybrid_tno = backend.run_backtest_isa_dynamic(
+            (
+                strategy_cum_gross,
+                strategy_cum_net,
+                qqq_cum,
+                hybrid_tno,
+                auto_cfg,
+                auto_diag,
+            ) = backend.run_backtest_isa_dynamic(
                 roundtrip_bps=st.session_state.get("roundtrip_bps", backend.ROUNDTRIP_BPS_DEFAULT),
                 min_dollar_volume=st.session_state.get("min_dollar_volume", 0),
                 show_net=st.session_state.get("show_net", True),
@@ -218,7 +226,12 @@ if go:
                 mom_weight=None if auto_optimize else preset["mom_w"],
                 mr_weight=None if auto_optimize else preset["mr_w"],
                 use_enhanced_features=st.session_state.get("use_enhanced_features", True),
+                auto_optimize=auto_optimize,
             )
+            if auto_cfg is not None:
+                st.session_state["auto_best_config"] = asdict(auto_cfg)
+            if auto_diag is not None and not auto_diag.empty:
+                st.session_state["auto_search_diagnostics"] = auto_diag.to_dict(orient="list")
         except Exception as e:
             st.warning(f"Backtest failed: {e}")
             st.code(traceback.format_exc())

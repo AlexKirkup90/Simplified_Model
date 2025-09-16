@@ -51,3 +51,40 @@ def test_grid_search_hybrid_passes_tc_and_vol(monkeypatch):
     idx = pd.date_range('2020-01-31', periods=3, freq='M')
     expected = optimizer._annualized_sharpe(pd.Series([0.02, -0.01, 0.015], index=idx))
     assert np.isclose(results['sharpe'].iloc[0], expected)
+
+
+def test_bayesian_optimize_hybrid_prefers_best_candidate(monkeypatch):
+    prices = pd.DataFrame(
+        {
+            "AAA": [1.0, 1.1, 1.2, 1.3],
+            "BBB": [1.0, 0.9, 0.95, 1.0],
+        },
+        index=pd.date_range("2020-01-01", periods=4, freq="D"),
+    )
+
+    returns_map = {
+        5: [0.01, -0.005, 0.009],
+        10: [0.015, -0.004, 0.016],
+        15: [0.005, -0.006, 0.007],
+    }
+
+    def fake_run_hybrid_backtest(daily_prices, cfg, apply_vol_target=False):
+        idx = pd.date_range("2020-01-31", periods=3, freq="M")
+        vals = returns_map[cfg.momentum_top_n]
+        series = pd.Series(vals, index=idx)
+        return {"hybrid_rets": series}
+
+    monkeypatch.setattr(optimizer, "run_hybrid_backtest", fake_run_hybrid_backtest)
+
+    best_cfg, diagnostics = optimizer.bayesian_optimize_hybrid(
+        prices,
+        search_space={"momentum_top_n": [5, 10, 15]},
+        population_size=4,
+        n_iter=2,
+        seed=42,
+    )
+
+    assert isinstance(best_cfg, optimizer.HybridConfig)
+    assert best_cfg.momentum_top_n == 10
+    assert not diagnostics.empty
+    assert 10 in diagnostics["momentum_top_n"].values
