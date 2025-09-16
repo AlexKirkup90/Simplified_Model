@@ -14,6 +14,7 @@ import backend  # all logic lives here
 
 # Default average trade size as a fraction
 AVG_TRADE_SIZE_DEFAULT = backend.AVG_TRADE_SIZE_DEFAULT
+HISTORY_YEARS_DEFAULT = 9
 
 # ---------------------------
 # Page config
@@ -57,6 +58,18 @@ auto_optimize = st.sidebar.checkbox(
 st.sidebar.caption(
     "Presets use fixed parameters and skip optimization unless 'Auto-optimize parameters' is enabled."
 )
+
+# Backtest history window
+st.session_state.setdefault("history_years", HISTORY_YEARS_DEFAULT)
+history_years_selection = st.sidebar.slider(
+    "History (years)",
+    min_value=5,
+    max_value=15,
+    step=1,
+    value=int(st.session_state.get("history_years", HISTORY_YEARS_DEFAULT)),
+    help="Length of historical data used for the backtest window (defaults to about 9 years).",
+)
+st.session_state["history_years"] = int(history_years_selection)
 
 # Monte Carlo seed input
 st.session_state.setdefault("mc_seed", 42)
@@ -200,7 +213,10 @@ if go:
             st.code(traceback.format_exc())
 
         try:
-            # ---- Enhanced ISA Dynamic backtest (Hybrid150 default) from 2017-07-01
+            history_years = int(st.session_state.get("history_years", HISTORY_YEARS_DEFAULT))
+            backtest_start = (date.today() - relativedelta(years=history_years)).replace(day=1)
+            backtest_start_str = backtest_start.strftime("%Y-%m-%d")
+            # ---- Enhanced ISA Dynamic backtest (Hybrid150 default) for selected history window
             (
                 strategy_cum_gross,
                 strategy_cum_net,
@@ -212,7 +228,7 @@ if go:
                 roundtrip_bps=st.session_state.get("roundtrip_bps", backend.ROUNDTRIP_BPS_DEFAULT),
                 min_dollar_volume=st.session_state.get("min_dollar_volume", 0),
                 show_net=st.session_state.get("show_net", True),
-                start_date="2017-07-01",
+                start_date=backtest_start_str,
                 universe_choice=st.session_state.get("universe", "Hybrid Top150"),
                 top_n=None if auto_optimize else preset["mom_topn"],
                 name_cap=None if auto_optimize else float(

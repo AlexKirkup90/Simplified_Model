@@ -106,6 +106,19 @@ PARAM_MAP_DEFAULTS = {
 }
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    """Interpret environment variable ``name`` as a boolean flag."""
+    val = os.getenv(name, default)
+    if val is None:
+        return False
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+PERF = {
+    "fast_io": _env_flag("FAST_IO", "0"),
+}
+
+
 def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
     """Prefer provided info callback, then Streamlit (if available), else logging."""
     # 1) Caller-provided callback
@@ -1440,6 +1453,33 @@ def _prepare_universe_for_backtest(
 # =========================
 from typing import List, Tuple
 
+
+def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
+    """Return the actual start date to use when downloading data."""
+    months_back = 6 if PERF.get("fast_io") else 14
+
+    try:
+        start_ts = pd.to_datetime(start_date)
+    except Exception:
+        # If parsing fails, fall back to the provided start string.
+        return start_date
+
+    extend_window = False
+    if end_date:
+        try:
+            end_ts = pd.to_datetime(end_date)
+        except Exception:
+            end_ts = None
+        if end_ts is not None and not pd.isna(end_ts):
+            # Extend only when the requested window is long enough to
+            # benefit downstream rolling calculations (e.g., 200DMA).
+            extend_window = (end_ts - start_ts) >= pd.Timedelta(days=REGIME_MA)
+
+    if extend_window:
+        start_ts = start_ts - pd.DateOffset(months=months_back)
+
+    return start_ts.strftime("%Y-%m-%d")
+
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
     """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
@@ -1451,8 +1491,8 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         return cached
 
     try:
-        # Pull an extended window to help with MA/breadth calcs downstream
-        fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+        # Pull an extended window only when downstream calculations require it
+        fetch_start = _resolve_fetch_start(start_date, end_date)
 
         frames: List[pd.DataFrame] = []
         for batch in _chunk_tickers(tickers):
@@ -1507,7 +1547,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 return combined["Close"], combined["Volume"]
 
     try:
-        fetch_start = (pd.to_datetime(start_date) - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+        fetch_start = _resolve_fetch_start(start_date, end_date)
 
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
