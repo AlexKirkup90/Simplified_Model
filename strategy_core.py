@@ -19,7 +19,9 @@ All functions are deterministic and return pandas objects.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterable, List, Dict, Optional, Tuple, Callable, Any
 
 import numpy as np
@@ -27,6 +29,8 @@ import pandas as pd
 import yfinance as yf
 import requests
 from io import StringIO
+
+from portfolio_utils import cap_weights, l1_turnover
 
 # ------------------------------
 # 1) Universe & Data
@@ -41,6 +45,48 @@ def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
         yield tickers[i : i + size]
 
 _NDX_CONSTITUENT_CACHE: Dict[str, List[str]] = {}
+_NDX_LAST_SUCCESS: List[str] = []
+
+
+@lru_cache(maxsize=32)
+def _fetch_market_data_cached(
+    tickers_key: tuple[str, ...], start_key: str, end_key: Optional[str]
+) -> pd.DataFrame:
+    tickers = list(tickers_key)
+    if not tickers:
+        return pd.DataFrame()
+
+    frames: List[pd.DataFrame] = []
+    for batch in _chunk_tickers(tickers):
+        try:
+            data = yf.download(
+                batch,
+                start=start_key,
+                end=end_key,
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker",
+            )["Close"]
+        except TypeError:
+            data = yf.download(
+                batch,
+                start=start_key,
+                end=end_key,
+                auto_adjust=True,
+                progress=False,
+            )["Close"]
+        if isinstance(data, pd.Series):
+            data = data.to_frame()
+            data.columns = [batch[0]]
+        frames.append(data)
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=1)
+    if df.shape[1] == 1 and len(tickers) == 1:
+        df.columns = [tickers[0]]
+    return df.dropna(how="all", axis=1)
 
 
 def get_nasdaq_100_plus_tickers(
@@ -69,8 +115,12 @@ def get_nasdaq_100_plus_tickers(
     date_str = pd.to_datetime(as_of or pd.Timestamp.today()).strftime("%Y-%m-%d")
 
     if date_str not in _NDX_CONSTITUENT_CACHE:
+        tickers: List[str] = []
         try:
             params = {"date": date_str, "download": "true"}
+            api_key = os.getenv("NASDAQ_DATA_LINK_API_KEY")
+            if api_key:
+                params["api_key"] = api_key
             resp = requests.get(
                 api_url,
                 params=params,
@@ -81,7 +131,13 @@ def get_nasdaq_100_plus_tickers(
             df = pd.read_csv(StringIO(resp.text))
             tickers = df["ticker"].astype(str).str.upper().str.strip().tolist()
         except Exception:
-            tickers = []
+            if _NDX_LAST_SUCCESS:
+                tickers = list(_NDX_LAST_SUCCESS)
+            else:
+                tickers = []
+        else:
+            _NDX_LAST_SUCCESS.clear()
+            _NDX_LAST_SUCCESS.extend(tickers)
         _NDX_CONSTITUENT_CACHE[date_str] = tickers
 
     tickers = _NDX_CONSTITUENT_CACHE.get(date_str, [])
@@ -90,9 +146,9 @@ def get_nasdaq_100_plus_tickers(
     return sorted(set(tickers + extras))
 
 
-def fetch_market_data(tickers: Iterable[str],
-                      start_date: str,
-                      end_date: Optional[str] = None) -> pd.DataFrame:
+def fetch_market_data(
+    tickers: Iterable[str], start_date: str, end_date: Optional[str] = None
+) -> pd.DataFrame:
     """Fetch daily split/dividend-adjusted close prices for tickers using yfinance.
 
     Parameters
@@ -109,93 +165,77 @@ def fetch_market_data(tickers: Iterable[str],
     -----
     Prices are adjusted for splits and dividends via ``auto_adjust=True``.
     """
-    tickers = list(tickers)
-    if not tickers:
-        return pd.DataFrame()
+    
+# ------------------------------
+# 1) Market data (cached)
+# ------------------------------
 
-    frames: List[pd.DataFrame] = []
-    for batch in _chunk_tickers(tickers):
-        data = yf.download(batch, start=start_date, end=end_date, auto_adjust=True, progress=False)["Close"]
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-            data.columns = [batch[0]]
-        frames.append(data)
+from functools import lru_cache  # (already imported)
 
-    if not frames:
-        return pd.DataFrame()
-
-    df = pd.concat(frames, axis=1)
-    if df.shape[1] == 1 and len(tickers) == 1:
-        df.columns = [tickers[0]]
+@lru_cache(maxsize=32)
+def _fetch_market_data_cached(
+    tickers_key: tuple[str, ...], start_key: str, end_key: Optional[str]
+) -> pd.DataFrame:
+    ...
     return df.dropna(how="all", axis=1)
+
+def fetch_market_data(
+    tickers: Iterable[str],
+    start_date: str,
+    end_date: Optional[str] = None
+) -> pd.DataFrame:
+    """Fetch daily split/dividend-adjusted close prices for tickers.
+
+    Uses the shared cached downloader so repeated calls are fast and consistent.
+    """
+    tickers_tuple = tuple(pd.Index(tickers).astype(str)) if tickers else tuple()
+    if not tickers_tuple:
+        return pd.DataFrame()
+
+    start_key = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+    end_key = pd.to_datetime(end_date).strftime("%Y-%m-%d") if end_date else None
+
+    df = _fetch_market_data_cached(tickers_tuple, start_key, end_key)
+    return df.copy()
 
 
 # ------------------------------
 # 2) Portfolio Utilities
 # ------------------------------
+# Intentionally NOT redefining cap/turnover helpers here.
+# These are provided by the shared `portfolio_utils` module and imported at top:
+#   from portfolio_utils import cap_weights, l1_turnover
+# ------------------------------------------------------------------------------
 
-def cap_weights(weights: pd.Series, cap: float = 0.25, max_iter: int = 100,
-                tol: float = 1e-12) -> pd.Series:
-    """Iterative waterfall cap. Preserves proportionality below cap.
+def volatility_target(returns: pd.Series,
+                      target_vol_annual: Optional[float] = None,
+                      periods_per_year: int = 12,
+                      min_leverage: float = 0.0,
+                      max_leverage: float = 1.0,
+                      lookback: int = 12) -> pd.Series:
+    """Scale monthly returns to a target annualized volatility using a rolling estimate.
 
-    If every name breaches the cap (i.e. no "under-cap" names remain), the
-    function stops redistributing and leaves residual cash rather than forcing
-    further violations.  The final series is renormalized to sum to 1 only when
-    doing so will not exceed the available cap capacity.
-    """
-    w = weights.copy().astype(float)
-    if (w < 0).any():
-        raise ValueError("Weights must be non-negative.")
-    if w.sum() == 0:
-        return w
-    w = w / w.sum()
-
-    for _ in range(max_iter):
-        over = w > cap
-        if not over.any():
-            break
-        excess = (w[over] - cap).sum()
-        w[over] = cap
-        under = ~over
-        if w[under].sum() > 0:
-            w[under] += (w[under] / w[under].sum()) * excess
-        else:
-            # All names at cap -> no feasible redistribution; leave residual cash.
-            break
-
-    total_capacity = min(len(w), (w > 0).sum()) * cap
-    if total_capacity >= 1 - 1e-12 and abs(w.sum() - 1.0) > tol:
-        w = w / w.sum()
-    return w
-
-
-def volatility_target(returns: pd.Series, target_vol_annual: Optional[float] = None,
-                      periods_per_year: int = 12, min_leverage: float = 0.0,
-                      max_leverage: float = 1.0, lookback: int = 12) -> pd.Series:
-    """Scale monthly returns to a target annualized volatility using rolling estimate.
-
-    If target_vol_annual is None, returns are unchanged.
+    If `target_vol_annual` is None, returns are unchanged.
     """
     if target_vol_annual is None:
         return returns
     rolling_vol = returns.rolling(lookback).std() * np.sqrt(periods_per_year)
-    with np.errstate(divide='ignore', invalid='ignore'):
+    with np.errstate(divide="ignore", invalid="ignore"):
         lev = target_vol_annual / rolling_vol
     lev = lev.clip(lower=min_leverage, upper=max_leverage).fillna(0)
     return returns * lev
 
 
 def apply_tc(returns: pd.Series, turnover: pd.Series, tc_bps: float = 10.0) -> pd.Series:
-    """Apply simple transaction cost model in basis points per 100% turnover per rebalance.
+    """Apply a simple transaction-cost model (bps per 100% turnover per rebalance).
 
-    Turnover is defined as ``0.5 * |w - w_prev|_1`` at each rebalance.
-
+    Turnover is defined as 0.5 * ||w_t - w_{t-1}||_1 at each rebalance.
     Example: tc_bps=10 means 10 bps * turnover deducted from that period's return.
     """
     drag = (tc_bps / 1e4) * turnover.fillna(0)
     return returns - drag
-
-
+  
+  
 # ------------------------------
 # 3) Signal Engines (Monthly)
 # ------------------------------
@@ -437,7 +477,14 @@ def run_backtest_mean_reversion(
         return float(0.5 * (a - b).abs().sum())
 
     for dt in mp.index:
-        quality = mp.loc[dt] > trend.loc[dt]
+        trend_row = trend.loc[dt]
+        if trend_row.isna().all():
+            rets.loc[dt] = 0.0
+            tno.loc[dt] = 0.0
+            prev_w = None
+            continue
+
+        quality = mp.loc[dt] > trend_row
         if get_constituents is not None:
             members = set(get_constituents(dt))
             quality = quality.loc[quality.index.intersection(members)]
@@ -467,18 +514,8 @@ def run_backtest_mean_reversion(
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
-        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
-
-        # Robust 0.5 * L1 turnover (handles changing universes)
-        if prev_w is None:
-            # first rebalance
-            tno.loc[dt] = 0.5 * w.abs().sum()
-        else:
-            union = w.index.union(prev_w.index)
-            aligned_w = w.reindex(union, fill_value=0.0)
-            aligned_prev = prev_w.reindex(union, fill_value=0.0)
-            tno.loc[dt] = 0.5 * (aligned_w - aligned_prev).abs().sum()
-
+rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
+tno.loc[dt] = float(l1_turnover(prev_w, w))
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
@@ -623,31 +660,29 @@ def run_hybrid_backtest(
             get_constituents=get_constituents,
         )
 
-    idx = mom_rets.index
-    idx = idx.union(mr_rets.index)
-    idx = idx.union(pred_rets.index)
-    hybrid = (
-        cfg.mom_weight * mom_rets.reindex(idx).fillna(0)
-        + cfg.mr_weight * mr_rets.reindex(idx).fillna(0)
+    idx = mom_rets.index.union(mr_rets.index).union(pred_rets.index)
+    mom_component = cfg.mom_weight * mom_rets.reindex(idx).fillna(0)
+    mr_component = cfg.mr_weight * mr_rets.reindex(idx).fillna(0)
+    hybrid_gross = mom_component + mr_component
+    if cfg.predictive_weight > 0:
+        hybrid_gross += cfg.predictive_weight * pred_rets.reindex(idx).fillna(0)
+
+    turnover = (
+        cfg.mom_weight * mom_tno.reindex(idx).fillna(0)
+        + cfg.mr_weight * mr_tno.reindex(idx).fillna(0)
     )
     if cfg.predictive_weight > 0:
-        hybrid += cfg.predictive_weight * pred_rets.reindex(idx).fillna(0)
+        turnover += cfg.predictive_weight * pred_tno.reindex(idx).fillna(0)
 
-    # Apply TC
+    hybrid_net = hybrid_gross
     if cfg.tc_bps != 0:
-        turnover = (
-            cfg.mom_weight * mom_tno.reindex(idx).fillna(0)
-            + cfg.mr_weight * mr_tno.reindex(idx).fillna(0)
-        )
-        if cfg.predictive_weight > 0:
-            turnover += cfg.predictive_weight * pred_tno.reindex(idx).fillna(0)
-        hybrid = apply_tc(hybrid, turnover, tc_bps=cfg.tc_bps)
+        hybrid_net = apply_tc(hybrid_gross, turnover, tc_bps=cfg.tc_bps)
 
     # Optional vol targeting on combined series
     if apply_vol_target and cfg.target_vol_annual is not None:
-        hybrid = volatility_target(hybrid, target_vol_annual=cfg.target_vol_annual)
+        hybrid_net = volatility_target(hybrid_net, target_vol_annual=cfg.target_vol_annual)
 
-    equity = cumulative_growth(hybrid)
+    equity = cumulative_growth(hybrid_net)
 
     return {
         "mom_rets": mom_rets,
@@ -656,7 +691,10 @@ def run_hybrid_backtest(
         "mr_turnover": mr_tno,
         "pred_rets": pred_rets,
         "pred_turnover": pred_tno,
-        "hybrid_rets": hybrid,
+        "hybrid_rets": hybrid_net,
+        "hybrid_rets_net": hybrid_net,
+        "hybrid_rets_gross": hybrid_gross,
+        "hybrid_turnover": turnover,
         "hybrid_equity": equity,
     }
 

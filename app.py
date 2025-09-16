@@ -335,6 +335,11 @@ with tab2:
         except Exception:
             weights = None
 
+        if weights is None:
+            st.warning(
+                "Unable to parse weights from the table – download the CSV to inspect the raw data."
+            )
+
         # -------------------------
         # Constraints & concentration metrics
         # -------------------------

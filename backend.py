@@ -14,7 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 import optimizer
 import strategy_core
-from strategy_core import HybridConfig  # keep import minimal to avoid shadowing
+from strategy_core import HybridConfig
+from portfolio_utils import cap_weights, l1_turnover
 
 warnings.filterwarnings("ignore")
 
@@ -75,12 +76,14 @@ PARAM_MAP_DEFAULTS = {
     "sector_cap_high": 0.25,
 }
 
+
 def _emit_info(msg: str, info: Callable[[str], None] | None = None) -> None:
     """Prefer provided info callback, then Streamlit, else logging."""
     if callable(info):
         info(msg)
         return
     try:
+import streamlit as st  # type: ignore
         st.info(msg)
     except Exception:
         logging.info(msg)
@@ -202,16 +205,16 @@ def fill_missing_data(
 
                 seg = series.iloc[max(0, start_idx - 1) : min(len(series), end_idx + 2)]
                 seg = seg.interpolate(method="linear", limit_direction="both")
-                series.loc[gap_indices] = seg.loc[gap_indices]
+series.loc[gap_indices] = seg.loc[gap_indices]
 
-                imputed_mask.loc[gap_indices, column] = True
-                total_filled += len(gap_indices)
+                imputed_mask.loc[gap_indices, column] = filled_values.notna().values
+                total_filled += int(filled_values.notna().sum())
 
         filled_df[column] = series
 
     if total_filled > 0:
         msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        _emit_info(msg, info)
+_emit_info(msg, info)
 
     return filled_df, imputed_mask
 
@@ -838,8 +841,6 @@ def calculate_portfolio_correlation_to_market(
 ) -> float:
     """Calculate correlation between portfolio and benchmark.
 
-    Both series may be at any frequency; we downsample to monthly first when
-    a datetime-like index is available to reduce high-frequency noise.
     """
 
     def _to_monthly_returns(r: pd.Series) -> pd.Series:
@@ -1455,8 +1456,22 @@ def save_portfolio_if_rebalance(
     Returns True if the save routines executed, otherwise False.
     """
     if not is_rebalance_today(date.today(), price_index):
-        # Provide user feedback via sidebar but do not save
-        st.sidebar.info("Not a rebalance day – skipping save")
+        next_window = None
+        if price_index is not None and len(price_index) > 0:
+            idx = pd.to_datetime(price_index).normalize()
+            latest = idx.max()
+            current_window = first_trading_day(latest, idx)
+            if latest <= current_window:
+                next_window = current_window
+            else:
+                next_month = pd.Timestamp(latest) + pd.offsets.MonthBegin(1)
+                next_window = first_trading_day(next_month, None)
+        if next_window is not None:
+            st.sidebar.info(
+                f"Not a rebalance day – next window opens {next_window.date()}"
+            )
+        else:
+            st.sidebar.info("Not a rebalance day – skipping save")
         return False
 
     # Proceed with standard save routines
@@ -1477,55 +1492,28 @@ def first_trading_day(dt: pd.Timestamp, ref_index: Optional[pd.DatetimeIndex] = 
     return pd.Timestamp(bdays[0]).normalize()
 
 def is_rebalance_today(today: date, price_index: Optional[pd.DatetimeIndex]) -> bool:
-    ts = pd.Timestamp(today)
-    ftd = first_trading_day(ts, price_index)
-    return ts.normalize() == ftd
+    if price_index is None or len(price_index) == 0:
+        return False
+
+    idx = pd.to_datetime(price_index).normalize()
+    ts = pd.Timestamp(today).normalize()
+
+    if ts in idx:
+        reference = ts
+        ftd = first_trading_day(ts, idx)
+        return reference == ftd
+
+    latest = idx.max()
+    if ts.year != latest.year or ts.month != latest.month:
+        ftd = first_trading_day(ts, idx)
+        return ts == ftd
+
+    ftd = first_trading_day(latest, idx)
+    return latest == ftd
 
 # =========================
 # Math utils & KPIs (Enhanced)
 # =========================
-def cap_weights(weights: pd.Series, cap: float = 0.25,
-                vol_adjusted_caps: Optional[Dict[str, float]] = None,
-                max_iter: int = 100, tol: float = 1e-12) -> pd.Series:
-    """Enhanced cap_weights with optional volatility adjustments"""
-    if weights.empty:
-        return weights
-    w = weights.copy().astype(float)
-    if (w < 0).any():
-        raise ValueError("Weights must be non-negative.")
-    if w.sum() == 0:
-        return w
-    w = w / w.sum()
-
-    # Use volatility-adjusted caps if provided
-    caps_to_use = vol_adjusted_caps if vol_adjusted_caps is not None else {ticker: cap for ticker in w.index}
-
-    for _ in range(max_iter):
-        over_cap = pd.Series(False, index=w.index)
-        for ticker in w.index:
-            ticker_cap = caps_to_use.get(ticker, cap)
-            if w[ticker] > ticker_cap:
-                over_cap[ticker] = True
-
-        if not over_cap.any():
-            break
-
-        excess = 0.0
-        for ticker in w.index:
-            if over_cap[ticker]:
-                ticker_cap = caps_to_use.get(ticker, cap)
-                excess += w[ticker] - ticker_cap
-                w[ticker] = ticker_cap
-
-        under = ~over_cap
-        if w[under].sum() > 0:
-            w[under] += (w[under] / w[under].sum()) * excess
-        else:
-            w += excess / len(w)
-    if abs(w.sum() - 1.0) > tol:
-        w = w / w.sum()
-    return w
-
 def equity_curve(returns: pd.Series) -> pd.Series:
     r = pd.Series(returns).fillna(0.0)
     return (1 + r).cumprod()
@@ -2490,43 +2478,61 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
     """Enhanced regime metrics calculation"""
     if universe_prices_daily.empty:
         return {}
+
     start = (universe_prices_daily.index.min() - pd.DateOffset(days=5)).strftime("%Y-%m-%d")
-    end   = (universe_prices_daily.index.max() + pd.DateOffset(days=5)).strftime("%Y-%m-%d")
-    qqq = get_benchmark_series("QQQ", start, end).reindex(universe_prices_daily.index).ffill().dropna()
+    end = (universe_prices_daily.index.max() + pd.DateOffset(days=5)).strftime("%Y-%m-%d")
 
-    # Additional benchmarks for regime metrics
-    try:
-        vix = get_benchmark_series("^VIX", start, end).reindex(universe_prices_daily.index).ffill()
-        vix3m = get_benchmark_series("^VIX3M", start, end).reindex(universe_prices_daily.index).ffill()
-        vix_ts = float(vix3m.iloc[-1] / vix.iloc[-1]) if len(vix) and len(vix3m) else np.nan
-    except Exception:
+    def _safe_fetch(ticker: str) -> pd.Series:
+        try:
+            return get_benchmark_series(ticker, start, end).reindex(universe_prices_daily.index).ffill()
+        except Exception:
+            logging.info("Benchmark fetch failed for %s", ticker)
+            return pd.Series(dtype=float)
+
+    qqq = _safe_fetch("QQQ").dropna()
+    vix = _safe_fetch("^VIX")
+    vix3m = _safe_fetch("^VIX3M")
+    hy_oas = _safe_fetch("BAMLH0A0HYM2")
+
+    if len(vix) and len(vix3m):
+        latest_vix = vix.iloc[-1]
+        latest_vix3m = vix3m.iloc[-1]
+        vix_ts = float(latest_vix3m / latest_vix) if latest_vix not in (0, np.nan) else np.nan
+    else:
         vix_ts = np.nan
-    try:
-        hy_oas = get_benchmark_series("BAMLH0A0HYM2", start, end).reindex(universe_prices_daily.index).ffill()
-        hy_oas_last = float(hy_oas.iloc[-1]) if len(hy_oas) else np.nan
-    except Exception:
-        hy_oas_last = np.nan
 
-    pct_above_ma = (universe_prices_daily.iloc[-1] >
-                    universe_prices_daily.rolling(REGIME_MA).mean().iloc[-1]).mean()
+    hy_oas_last = float(hy_oas.iloc[-1]) if len(hy_oas) else np.nan
 
-    qqq_ma = qqq.rolling(REGIME_MA).mean()
-    qqq_above_ma = float(qqq.iloc[-1] > qqq_ma.iloc[-1]) if len(qqq_ma.dropna()) else np.nan
+    roll_ma = universe_prices_daily.rolling(REGIME_MA).mean()
+    if len(roll_ma) and not roll_ma.iloc[-1].isna().all():
+        pct_above_ma = float((universe_prices_daily.iloc[-1] > roll_ma.iloc[-1]).mean())
+    else:
+        pct_above_ma = np.nan
 
-    qqq_vol_10d = qqq.pct_change().rolling(10).std().iloc[-1]
-    qqq_slope_50 = (qqq.rolling(50).mean().iloc[-1] / qqq.rolling(50).mean().iloc[-10] - 1) if len(qqq) > 60 else np.nan
+    qqq_above_ma = np.nan
+    qqq_vol_10d = np.nan
+    qqq_slope_50 = np.nan
+    if not qqq.empty:
+        qqq_ma = qqq.rolling(REGIME_MA).mean()
+        if len(qqq_ma.dropna()) > 0:
+            qqq_above_ma = float(qqq.iloc[-1] > qqq_ma.iloc[-1])
+        qqq_vol_10d = float(qqq.pct_change().rolling(10).std().iloc[-1]) if len(qqq) >= 11 else np.nan
+        if len(qqq) > 60:
+            ma50 = qqq.rolling(50).mean()
+            if pd.notna(ma50.iloc[-1]) and pd.notna(ma50.iloc[-10]):
+                qqq_slope_50 = float(ma50.iloc[-1] / ma50.iloc[-10] - 1)
 
     monthly = universe_prices_daily.resample("M").last()
-    pos_6m = (monthly.pct_change(6).iloc[-1] > 0).mean()
+    pos_6m = float((monthly.pct_change(6).iloc[-1] > 0).mean()) if len(monthly) >= 7 else np.nan
 
     return {
-        "universe_above_200dma": float(pct_above_ma),
-        "qqq_above_200dma": float(qqq_above_ma),
-        "qqq_vol_10d": float(qqq_vol_10d),
-        "breadth_pos_6m": float(pos_6m),
-        "qqq_50dma_slope_10d": float(qqq_slope_50) if pd.notna(qqq_slope_50) else np.nan,
-        "vix_term_structure": float(vix_ts) if pd.notna(vix_ts) else np.nan,
-        "hy_oas": float(hy_oas_last) if pd.notna(hy_oas_last) else np.nan,
+        "universe_above_200dma": pct_above_ma,
+        "qqq_above_200dma": qqq_above_ma,
+        "qqq_vol_10d": qqq_vol_10d,
+        "breadth_pos_6m": pos_6m,
+        "qqq_50dma_slope_10d": qqq_slope_50,
+        "vix_term_structure": vix_ts,
+        "hy_oas": hy_oas_last,
     }
 
 def get_market_regime() -> Tuple[str, Dict[str, float]]:
