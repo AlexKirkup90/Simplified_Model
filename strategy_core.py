@@ -165,40 +165,77 @@ def fetch_market_data(
     -----
     Prices are adjusted for splits and dividends via ``auto_adjust=True``.
     """
-    tickers_tuple = tuple(tickers)
+    
+# ------------------------------
+# 1) Market data (cached)
+# ------------------------------
+
+from functools import lru_cache  # (already imported)
+
+@lru_cache(maxsize=32)
+def _fetch_market_data_cached(
+    tickers_key: tuple[str, ...], start_key: str, end_key: Optional[str]
+) -> pd.DataFrame:
+    ...
+    return df.dropna(how="all", axis=1)
+
+def fetch_market_data(
+    tickers: Iterable[str],
+    start_date: str,
+    end_date: Optional[str] = None
+) -> pd.DataFrame:
+    """Fetch daily split/dividend-adjusted close prices for tickers.
+
+    Uses the shared cached downloader so repeated calls are fast and consistent.
+    """
+    tickers_tuple = tuple(pd.Index(tickers).astype(str)) if tickers else tuple()
+    if not tickers_tuple:
+        return pd.DataFrame()
+
     start_key = pd.to_datetime(start_date).strftime("%Y-%m-%d")
     end_key = pd.to_datetime(end_date).strftime("%Y-%m-%d") if end_date else None
-    cached = _fetch_market_data_cached(tickers_tuple, start_key, end_key)
-    return cached.copy()
+
+    df = _fetch_market_data_cached(tickers_tuple, start_key, end_key)
+    return df.copy()
 
 
-def volatility_target(returns: pd.Series, target_vol_annual: Optional[float] = None,
-                      periods_per_year: int = 12, min_leverage: float = 0.0,
-                      max_leverage: float = 1.0, lookback: int = 12) -> pd.Series:
-    """Scale monthly returns to a target annualized volatility using rolling estimate.
+# ------------------------------
+# 2) Portfolio Utilities
+# ------------------------------
+# Intentionally NOT redefining cap/turnover helpers here.
+# These are provided by the shared `portfolio_utils` module and imported at top:
+#   from portfolio_utils import cap_weights, l1_turnover
+# ------------------------------------------------------------------------------
 
-    If target_vol_annual is None, returns are unchanged.
+def volatility_target(returns: pd.Series,
+                      target_vol_annual: Optional[float] = None,
+                      periods_per_year: int = 12,
+                      min_leverage: float = 0.0,
+                      max_leverage: float = 1.0,
+                      lookback: int = 12) -> pd.Series:
+    """Scale monthly returns to a target annualized volatility using a rolling estimate.
+
+    If `target_vol_annual` is None, returns are unchanged.
     """
     if target_vol_annual is None:
         return returns
     rolling_vol = returns.rolling(lookback).std() * np.sqrt(periods_per_year)
-    with np.errstate(divide='ignore', invalid='ignore'):
+    with np.errstate(divide="ignore", invalid="ignore"):
         lev = target_vol_annual / rolling_vol
     lev = lev.clip(lower=min_leverage, upper=max_leverage).fillna(0)
     return returns * lev
 
 
 def apply_tc(returns: pd.Series, turnover: pd.Series, tc_bps: float = 10.0) -> pd.Series:
-    """Apply simple transaction cost model in basis points per 100% turnover per rebalance.
+    """Apply a simple transaction-cost model (bps per 100% turnover per rebalance).
 
-    Turnover is defined as ``0.5 * |w - w_prev|_1`` at each rebalance.
-
+    Turnover is defined as 0.5 * ||w_t - w_{t-1}||_1 at each rebalance.
     Example: tc_bps=10 means 10 bps * turnover deducted from that period's return.
     """
     drag = (tc_bps / 1e4) * turnover.fillna(0)
     return returns - drag
-
-
+  
+  
 # ------------------------------
 # 3) Signal Engines (Monthly)
 # ------------------------------
@@ -228,6 +265,19 @@ def build_momentum_weights(monthly_prices: pd.DataFrame, lookback_m: int, top_n:
     capped = cap_weights(raw, cap=cap)
     final_w = capped / capped.sum()
     return final_w, top
+
+
+def l1_turnover(prev_w: pd.Series | None, w: pd.Series) -> float:
+    """0.5 × L1 distance between consecutive weight vectors.
+
+    Aligns on the union of tickers so both additions and deletions are counted.
+    """
+    if prev_w is None:
+        return 0.5 * w.abs().sum()
+    union = w.index.union(prev_w.index)
+    aligned_w = w.reindex(union, fill_value=0.0)
+    aligned_prev = prev_w.reindex(union, fill_value=0.0)
+    return 0.5 * (aligned_w - aligned_prev).abs().sum()
 
 
 def run_backtest_momentum(
@@ -414,7 +464,17 @@ def run_backtest_mean_reversion(
 
     rets = pd.Series(index=mp.index, dtype=float)
     tno = pd.Series(index=mp.index, dtype=float)
-    prev_w = None
+    prev_w: Optional[pd.Series] = None
+
+    # Local fallback if a shared helper isn't available
+    def _l1_turnover(prev_w_: Optional[pd.Series], w_: pd.Series) -> float:
+        if prev_w_ is None or prev_w_.empty:
+            # first rebalance: 0.5 * ||w - 0||_1 = 0.5 * sum(|w|)
+            return float(0.5 * w_.abs().sum())
+        union = w_.index.union(prev_w_.index)
+        a = w_.reindex(union, fill_value=0.0)
+        b = prev_w_.reindex(union, fill_value=0.0)
+        return float(0.5 * (a - b).abs().sum())
 
     for dt in mp.index:
         trend_row = trend.loc[dt]
@@ -434,24 +494,28 @@ def run_backtest_mean_reversion(
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         candidates = short.loc[dt, pool].dropna()
         if candidates.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         picks = candidates.nsmallest(top_n)
         if picks.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev_w = None
             continue
+
         w = pd.Series(1.0 / len(picks), index=picks.index)
+
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
             valid = valid.intersection(members)
-        rets.loc[dt] = (future.loc[dt, valid] * w[valid]).sum()
-        tno.loc[dt] = l1_turnover(prev_w, w)
+rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
+tno.loc[dt] = float(l1_turnover(prev_w, w))
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)

@@ -60,7 +60,7 @@ STRATEGY_PRESETS = {
     }
 }
 
-# Default mapping from regime metrics to strategy parameters.  These
+# Default mapping from regime metrics to strategy parameters. These
 # values are recalibrated periodically by ``update_parameter_mapping``.
 PARAM_MAP_DEFAULTS = {
     "low_vol": 0.02,
@@ -83,7 +83,7 @@ def _emit_info(msg: str, info: Callable[[str], None] | None = None) -> None:
         info(msg)
         return
     try:
-        import streamlit as st  # type: ignore
+import streamlit as st  # type: ignore
         st.info(msg)
     except Exception:
         logging.info(msg)
@@ -205,8 +205,7 @@ def fill_missing_data(
 
                 seg = series.iloc[max(0, start_idx - 1) : min(len(series), end_idx + 2)]
                 seg = seg.interpolate(method="linear", limit_direction="both")
-                filled_values = seg.loc[gap_indices]
-                series.loc[gap_indices] = filled_values
+series.loc[gap_indices] = seg.loc[gap_indices]
 
                 imputed_mask.loc[gap_indices, column] = filled_values.notna().values
                 total_filled += int(filled_values.notna().sum())
@@ -215,13 +214,7 @@ def fill_missing_data(
 
     if total_filled > 0:
         msg = f"🔧 Data filling: Filled {total_filled} missing data points with interpolation"
-        try:
-            if info:
-                info(msg)
-            else:
-                st.info(msg)
-        except Exception:
-            logging.info(msg)
+_emit_info(msg, info)
 
     return filled_df, imputed_mask
 
@@ -848,38 +841,68 @@ def calculate_portfolio_correlation_to_market(
 ) -> float:
     """Calculate correlation between portfolio and benchmark.
 
-    Both ``portfolio_returns`` and ``market_returns`` may be at any frequency;
-    the series are resampled to monthly returns before computing correlation to
-    reduce high‑frequency noise.
     """
-    if market_returns is None:
-        # Fetch QQQ data for correlation
-        try:
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - relativedelta(months=6)).strftime('%Y-%m-%d')
-            qqq_data = _yf_download(
-                'QQQ',
-                start=start_date,
-                end=end_date,
-            )['Close']
-            market_returns = qqq_data.pct_change().dropna()
-        except:
-            return np.nan
 
-    # Resample to common monthly frequency
-    port_monthly = (1 + portfolio_returns.dropna()).resample('M').prod() - 1
-    market_monthly = (1 + market_returns.dropna()).resample('M').prod() - 1
+    def _to_monthly_returns(r: pd.Series) -> pd.Series:
+        """Convert an arbitrary-return series to monthly returns if possible.
+        If index isn't datetime-like and can't be coerced, return as-is."""
+        r = pd.Series(r).astype(float).dropna()
+        if r.empty:
+            return r
 
-    # Align periods
-    common_dates = port_monthly.index.intersection(market_monthly.index)
-    if len(common_dates) < 3:  # Need minimum periods
+        idx = r.index
+        # Coerce to DatetimeIndex when possible
+        if not isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
+            try:
+                coerced = pd.to_datetime(idx, errors="coerce")
+                mask = ~coerced.isna()
+                if mask.any():
+                    r = r.loc[mask]
+                    r.index = coerced[mask]
+                else:
+                    # Cannot coerce -> return without resampling
+                    return r
+            except Exception:
+                return r
+
+        # Normalize PeriodIndex to Timestamp for resampling
+        if isinstance(r.index, pd.PeriodIndex):
+            r.index = r.index.to_timestamp()
+
+        # Now safe to resample monthly
+        return (1.0 + r).groupby(pd.Grouper(freq="M")).prod() - 1.0
+
+    # Portfolio series
+    port = pd.Series(portfolio_returns).astype(float).dropna()
+    if port.empty:
         return np.nan
 
-    port_aligned = port_monthly.reindex(common_dates)
-    market_aligned = market_monthly.reindex(common_dates)
+    # Market series (fetch QQQ if not provided)
+    if market_returns is None:
+        try:
+            end = datetime.now()
+            start = end - relativedelta(months=9)
+            qqq_px = get_benchmark_series("QQQ", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+            mkt = qqq_px.pct_change().dropna()
+        except Exception:
+            return np.nan
+    else:
+        mkt = pd.Series(market_returns).astype(float).dropna()
 
-    correlation = port_aligned.corr(market_aligned)
-    return correlation if not pd.isna(correlation) else 0.0
+    # Downsample to monthly when possible
+    port_m = _to_monthly_returns(port)
+    mkt_m  = _to_monthly_returns(mkt)
+
+    if port_m.empty or mkt_m.empty:
+        return np.nan
+
+    # Align and require enough overlap
+    common = port_m.index.intersection(mkt_m.index)
+    if len(common) < 3:
+        return np.nan
+
+    corr = port_m.reindex(common).corr(mkt_m.reindex(common))
+    return float(corr) if pd.notna(corr) else np.nan
 
 # =========================
 # NEW: QQQ Hedge Builder
@@ -2924,6 +2947,168 @@ def diagnose_strategy_issues(current_returns: pd.Series,
         issues.append("No significant issues detected")
     
     return issues
+                               
+# =========================
+# TRUST CHECKS (Signal, Construction, Health)
+# =========================
+def summarize_signal_alignment(metrics: Dict[str, float]) -> Dict[str, Any]:
+    """Quick pass/fail style view for regime vs market reality."""
+    if not metrics:
+        return {"ok": False, "reason": "no-metrics", "checks": {}}
+
+    breadth    = float(metrics.get("breadth_pos_6m", np.nan))
+    qqq_above  = float(metrics.get("qqq_above_200dma", np.nan))
+    vol10      = float(metrics.get("qqq_vol_10d", np.nan))
+    vix_ts     = float(metrics.get("vix_term_structure", np.nan))
+    regime_lbl = str(metrics.get("regime", "Unknown"))
+
+    checks = {
+        "qqq_above_200dma": (qqq_above >= 1.0),
+        "breadth_ok": (not np.isnan(breadth) and breadth >= 0.50),
+        "vol_ok": (not np.isnan(vol10) and vol10 < 0.03),
+        "vix_ts_ok": (not np.isnan(vix_ts) and vix_ts >= 1.0),  # contango-ish
+    }
+
+    # If labeled Strong Risk-On, require stricter tests
+    if "strong" in regime_lbl.lower():
+        checks["breadth_strong"] = (not np.isnan(breadth) and breadth >= 0.60)
+        checks["vol_strong"] = (not np.isnan(vol10) and vol10 < 0.025)
+
+    ok = all(v is True for v in checks.values())
+    return {"ok": ok, "reason": regime_lbl, "checks": checks}
+
+
+def summarize_portfolio_construction(
+    weights: pd.Series | None,
+    sectors_map: Dict[str, str] | None,
+    name_cap: float,
+    sector_cap: float,
+    turnover_series: pd.Series | None = None,
+) -> Dict[str, Any]:
+    """Caps, exposure, turnover sanity."""
+    out = {"ok": True, "issues": [], "stats": {}}
+    if weights is None or len(weights) == 0:
+        out["ok"] = False
+        out["issues"].append("no-weights")
+        return out
+
+    w = pd.Series(weights).dropna().astype(float)
+    total_exp = float(w.sum())
+    max_w = float(w.max()) if len(w) else 0.0
+
+    # Constraint violations (uses your existing checker)
+    violations = []
+    if sectors_map:
+        try:
+            violations = check_constraint_violations(
+                w, sectors_map, name_cap=name_cap, sector_cap=sector_cap, group_caps=None
+            )
+        except Exception:
+            violations = []
+    if violations:
+        out["ok"] = False
+        out["issues"].extend(violations)
+
+    # Turnover — use last 12M mean if available
+    tpy = None
+    if turnover_series is not None and len(turnover_series) > 0:
+        try:
+            ts = pd.Series(turnover_series).dropna()
+            if len(ts) >= 6:
+                tpy = float(ts.tail(12).sum() / max(1, len(ts.tail(12)) / 1.0))  # monthly sum avg
+        except Exception:
+            tpy = None
+
+    out["stats"] = {
+        "total_equity_exposure": total_exp,
+        "max_name_weight": max_w,
+        "avg_turnover_last_12m": tpy,
+    }
+
+    # Heuristics
+    if total_exp <= 0.50:
+        out["issues"].append("low-exposure")
+        out["ok"] = False
+    if max_w > max(0.35, name_cap + 0.10):  # hard stop if crazy
+        out["issues"].append(f"max-name-weight {max_w:.2%} too high")
+        out["ok"] = False
+    if tpy is not None and tpy > 1.0:  # >100% monthly (0.5*L1 def)
+        out["issues"].append("excessive-turnover")
+        out["ok"] = False
+
+    return out
+
+
+def summarize_health(
+    monthly_returns: pd.Series,
+    benchmark_monthly_returns: pd.Series | None = None,
+) -> Dict[str, Any]:
+    """Wraps your existing health calc + adds rolling correlation guard."""
+    if monthly_returns is None or len(monthly_returns) == 0:
+        return {"ok": False, "issues": ["no-returns"], "stats": {}}
+
+    stats = get_strategy_health_metrics(monthly_returns, benchmark_monthly_returns)
+
+    corr = stats.get("benchmark_correlation", np.nan)
+    rolling_ok = (np.isnan(corr) or corr < 0.85)  # not a closet tracker
+    issues = []
+    if not rolling_ok:
+        issues.append("high-benchmark-correlation")
+
+    # Drawdown guardrails
+    dd = stats.get("current_drawdown", 0.0)
+    if dd < -0.30:
+        issues.append("large-drawdown")
+
+    ok = len(issues) == 0
+    return {"ok": ok, "issues": issues, "stats": stats}
+
+
+def run_trust_checks(
+    weights_df: pd.DataFrame | None,
+    metrics: Dict[str, float] | None,
+    turnover_series: pd.Series | None,
+    name_cap: float,
+    sector_cap: float,
+) -> Dict[str, Any]:
+    """Convenience wrapper used by the app tab."""
+    # Weights
+    weights = None
+    sectors_map = None
+    try:
+        if weights_df is not None and "Weight" in weights_df.columns:
+            weights = weights_df["Weight"].astype(float)
+            base_map = get_sector_map(list(weights.index))
+            sectors_map = get_enhanced_sector_map(list(weights.index), base_map=base_map)
+    except Exception:
+        pass
+
+    # 1) Signal alignment
+    sig = summarize_signal_alignment(metrics or {})
+
+    # 2) Portfolio construction
+    constr = summarize_portfolio_construction(weights, sectors_map, name_cap, sector_cap, turnover_series)
+
+    # 3) Health (use the same series you show in Performance tab)
+    # Pull what the app saved in session
+    base_cum = st.session_state.get("strategy_cum_net") or st.session_state.get("strategy_cum_gross")
+    qqq_cum  = st.session_state.get("qqq_cum")
+
+    def _to_monthly(series):
+        if series is None or len(series) == 0:
+            return pd.Series(dtype=float)
+        r = pd.Series(series).pct_change().dropna()
+        r.index = pd.to_datetime(r.index, errors="coerce")
+        r = r[~r.index.isna()]
+        return (1 + r).resample("M").prod() - 1
+
+    health = summarize_health(
+        _to_monthly(base_cum),
+        _to_monthly(qqq_cum) if qqq_cum is not None else None
+    )
+
+    score = sum(int(x["ok"]) for x in (sig, constr, health))
+    return {"score": score, "signal": sig, "construction": constr, "health": health}
 
 # =========================
 # Live performance tracking (Enhanced)

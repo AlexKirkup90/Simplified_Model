@@ -164,8 +164,8 @@ go = st.button("Generate Portfolio & Backtest", type="primary", use_container_wi
 # ---------------------------
 # Enhanced Tabs
 # ---------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["📊 Rebalancing Plan", "✅ Current Portfolio", "📈 Performance", "🧭 Regime", "🔎 Changes", "🏥 Strategy Health"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["📊 Rebalancing Plan", "✅ Current Portfolio", "📈 Performance", "🧭 Regime", "🔎 Changes", "🏥 Strategy Health", "🧪 Trust Checks"]
 )
 
 # Placeholders to reuse below
@@ -819,3 +819,89 @@ with tab6:
             st.info("🔬 **Enhanced Features Active:** Strategy using volatility-adjusted caps and regime awareness.")
         else:
             st.info("📊 **Standard Mode:** Consider enabling enhanced features for improved risk management.")
+
+# ---------------------------
+# Tab 7: Trust Checks (Signal • Construction • Health)
+# ---------------------------
+with tab7:
+    st.subheader("🧪 Trust Checks")
+
+    # Pull latest metrics / weights / turnover from earlier steps or session
+    metrics = st.session_state.get("latest_metrics")  # optional: set this when you call assess_market_conditions()
+    if metrics is None:
+        try:
+            # Fallback: compute quickly from current universe
+            label, metrics = backend.get_market_regime()
+            metrics["regime"] = label
+        except Exception:
+            metrics = {}
+
+    weights_df = None
+    try:
+        # Prefer current generated portfolio
+        if live_raw is not None and not live_raw.empty:
+            weights_df = live_raw
+        elif "latest_portfolio" in st.session_state:
+            weights_df = st.session_state["latest_portfolio"]
+    except Exception:
+        pass
+
+    turnover_series = None
+    try:
+        turnover_series = hybrid_tno
+        # Also stash for later refresh
+        st.session_state["hybrid_tno"] = hybrid_tno
+    except Exception:
+        turnover_series = st.session_state.get("hybrid_tno")
+
+    name_cap   = float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25)))
+    sector_cap = float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30)))
+
+    report = backend.run_trust_checks(
+        weights_df=weights_df,
+        metrics=metrics,
+        turnover_series=turnover_series,
+        name_cap=name_cap,
+        sector_cap=sector_cap,
+    )
+
+    # ======= Summary tiles =======
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Signal Alignment", "Pass" if report["signal"]["ok"] else "Check")
+    c2.metric("Construction", "Pass" if report["construction"]["ok"] else "Check")
+    c3.metric("Health", "Pass" if report["health"]["ok"] else "Check")
+
+    st.markdown(f"**Composite Score:** `{report['score']}/3` (3 = strong trust)")
+
+    # ======= Detail: Signal =======
+    with st.expander("🔎 Signal Alignment – details"):
+        st.write(f"Regime label: **{report['signal']['reason']}**")
+        checks = report["signal"]["checks"]
+        if checks:
+            st.table(
+                pd.DataFrame([checks]).T.rename(columns={0: "OK?"})
+            )
+        else:
+            st.info("No metrics available.")
+
+    # ======= Detail: Construction =======
+    with st.expander("🏗️ Portfolio Construction – details"):
+        st.json(report["construction"]["stats"])
+        issues = report["construction"]["issues"]
+        if issues:
+            st.warning("Issues:")
+            for it in issues:
+                st.write(f"- {it}")
+        else:
+            st.success("No construction issues detected.")
+
+    # ======= Detail: Health =======
+    with st.expander("🏥 Health – details"):
+        st.json(report["health"]["stats"])
+        issues = report["health"]["issues"]
+        if issues:
+            st.warning("Issues:")
+            for it in issues:
+                st.write(f"- {it}")
+        else:
+            st.success("No health issues detected.")
