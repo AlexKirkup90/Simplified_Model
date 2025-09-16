@@ -1347,29 +1347,42 @@ def get_sector_map(tickers: List[str]) -> Dict[str, str]:
     """
 
     tickers = list(tickers)
+    unique_tickers = list(dict.fromkeys(tickers))
 
     # Ensure the synthetic hedge ticker is always mapped without hitting yfinance
     for alias in HEDGE_TICKER_ALIASES:
-        if alias in tickers and alias not in _SECTOR_CACHE:
+        if alias in unique_tickers and alias not in _SECTOR_CACHE:
             _SECTOR_CACHE[alias] = "Hedge Overlay"
 
-    new_tickers = [t for t in tickers if t not in _SECTOR_CACHE]
-    for t in new_tickers:
+    for t in unique_tickers:
         if t in _SECTOR_OVERRIDES:
             _SECTOR_CACHE[t] = _SECTOR_OVERRIDES[t]
-            continue
+
+    new_tickers = [
+        t
+        for t in unique_tickers
+        if t not in _SECTOR_CACHE and t not in _SECTOR_OVERRIDES
+    ]
+    for t in new_tickers:
+        sector = "Unknown"
         try:
             tkr = yf.Ticker(t)
-            sector = tkr.fast_info.get("sector")
+            try:
+                fast_info = getattr(tkr, "fast_info", {}) or {}
+                sector = fast_info.get("sector")
+            except Exception:
+                sector = None
             if not sector:
-                sector = _safe_get_info(tkr).get("sector") or "Unknown"
+                sector = _safe_get_info(tkr).get("sector")
+            if not sector:
+                sector = "Unknown"
         except Exception:
             sector = "Unknown"
         _SECTOR_CACHE[t] = sector
 
     return {
         t: _SECTOR_OVERRIDES.get(t, _SECTOR_CACHE.get(t, "Unknown"))
-        for t in tickers
+        for t in unique_tickers
     }
 
 def get_nasdaq_100_plus_tickers() -> List[str]:
