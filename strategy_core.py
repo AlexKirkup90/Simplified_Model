@@ -333,7 +333,7 @@ def run_backtest_predictive(
         if get_constituents is not None:
             valid = valid.intersection(members)
 
-        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum()))
+        rets.loc[dt] = float((future.loc[dt, valid] * w[valid]).sum())
         tno.loc[dt] = float(l1_turnover(prev_w, w))
         prev_w = w
 
