@@ -43,5 +43,5 @@ def test_constituent_cache(monkeypatch):
     monkeypatch.setattr(sc.requests, "get", fake_get)
     first = sc.get_nasdaq_100_plus_tickers(as_of="2024-01-01")
     second = sc.get_nasdaq_100_plus_tickers(as_of="2024-01-01")
-    assert first == second == ["AAPL", "MSFT"]
+    assert first == second == ["AAPL", "MSFT", "QQQ"]
     assert len(calls) == 1

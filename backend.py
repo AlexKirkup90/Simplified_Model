@@ -6,16 +6,17 @@ from typing import Optional, Tuple, Dict, List, Any, Callable, Iterable
 from dataclasses import replace, asdict
 import numpy as np
 import pandas as pd
-try:  # optional acceleration library
+
+# Optional Polars support (convert to pandas if provided)
+try:  # don't hard-require polars
     import polars as pl  # type: ignore
     _HAS_POLARS = True
-except ImportError:  # pragma: no cover - optional dependency
+except Exception:
     pl = None  # type: ignore
     _HAS_POLARS = False
 import yfinance as yf
 import requests
 from io import StringIO
-import streamlit as st
 import logging
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
@@ -45,12 +46,18 @@ import strategy_core
 from strategy_core import HybridConfig
 from portfolio_utils import cap_weights, l1_turnover
 
+# Bridge to strategy_core sanitizer to keep a single source of truth
+try:
+    from strategy_core import _sanitize_tickers as _sc_sanitize_tickers  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - fallback if module layout changes
+    def _sc_sanitize_tickers(tickers: Iterable[str]) -> list[str]:
+        return sorted({(str(x).strip().upper()) for x in (tickers or []) if str(x).strip()})
+
 warnings.filterwarnings("ignore")
 
 # =========================
 # Backtest cache helpers
 # =========================
-
 
 def _build_hybrid_cache_key(
     tickers: Iterable[str],
@@ -66,7 +73,6 @@ def _build_hybrid_cache_key(
     }
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
 
 def _run_hybrid_backtest_with_cache(
     daily_prices: pd.DataFrame,
@@ -115,7 +121,6 @@ def _run_hybrid_backtest_with_cache(
 # Optional numba helpers
 # =========================
 _Z_EPS = 1e-9
-
 
 @njit(cache=True)
 def _mad_scale(values: np.ndarray) -> tuple[float, float]:  # pragma: no cover - exercised via wrapper
@@ -169,7 +174,6 @@ def _mad_scale(values: np.ndarray) -> tuple[float, float]:  # pragma: no cover -
     std = np.sqrt(var) if var > 0.0 else 0.0
     return median, std
 
-
 @njit(cache=True)
 def _nanmean_std(values: np.ndarray) -> tuple[float, float, int]:  # pragma: no cover - exercised via wrapper
     count = 0
@@ -192,7 +196,6 @@ def _nanmean_std(values: np.ndarray) -> tuple[float, float, int]:  # pragma: no 
         variance = 0.0
 
     return mean_val, np.sqrt(variance), count
-
 
 @njit(cache=True)
 def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:  # pragma: no cover - exercised via wrapper
@@ -232,7 +235,6 @@ def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:  # pragma: no c
 
     return out
 
-
 @njit(cache=True)
 def _last_rolling_mean(values: np.ndarray, window: int) -> float:  # pragma: no cover - exercised via wrapper
     n = values.shape[0]
@@ -248,7 +250,6 @@ def _last_rolling_mean(values: np.ndarray, window: int) -> float:  # pragma: no 
         total += v
 
     return total / window
-
 
 def _zscore_series(series: pd.Series, cols: pd.Index) -> pd.Series:
     cleaned = series.replace([np.inf, -np.inf], np.nan)
@@ -285,13 +286,9 @@ def _zscore_series(series: pd.Series, cols: pd.Index) -> pd.Series:
     series_result = pd.Series(result, index=series.index)
     return series_result.reindex(cols).fillna(0.0)
 
-
 # =========================
 # Config & Secrets
 # =========================
-import os
-import logging
-from typing import Callable, Optional
 
 # Streamlit might not be available (e.g., non-UI contexts)
 try:
@@ -300,7 +297,6 @@ try:
 except Exception:
     st = None  # type: ignore
     _HAS_ST = False
-
 
 def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     """Try Streamlit secrets first; fall back to environment variables."""
@@ -313,7 +309,6 @@ def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
         except Exception:
             pass
     return os.getenv(key, default)
-
 
 GIST_ID = _get_secret("GIST_ID")
 GITHUB_TOKEN = _get_secret("GITHUB_TOKEN")
@@ -384,7 +379,6 @@ PERF: Dict[str, Any] = {
     "cache_days": 365,
 }
 
-
 def _env_flag(name: str, default: str = "0") -> bool:
     """Interpret environment variable ``name`` as a boolean flag."""
     val = os.getenv(name, default)
@@ -392,11 +386,9 @@ def _env_flag(name: str, default: str = "0") -> bool:
         return False
     return str(val).strip().lower() in {"1", "true", "yes", "on"}
 
-
 PERF.update({
     "fast_io": _env_flag("FAST_IO", "0"),
 })
-
 
 def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
     """Prefer provided info callback, then Streamlit (if available), else logging."""
@@ -418,7 +410,6 @@ def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
 
     # 3) Fallback to logging
     logging.info(msg)
-
 
 def _record_hedge_state(scope: str,
                         weight: float,
@@ -526,11 +517,9 @@ def linear_interpolate_short_gaps(
 
     return filled, imputed_mask
 
-
 def _use_polars_engine() -> bool:
     """Return True when the optimized polars path should be used."""
     return bool(PERF.get("use_polars") and _HAS_POLARS and pl is not None)
-
 
 def _prepare_polars_daily_frame(daily: pd.DataFrame) -> tuple["pl.DataFrame", list[str]]:
     """Convert a pandas daily price frame into a polars DataFrame and column list."""
@@ -554,7 +543,6 @@ def _prepare_polars_daily_frame(daily: pd.DataFrame) -> tuple["pl.DataFrame", li
     value_cols = [col for col in pl_df.columns if col != "date"]
     return pl_df.sort("date"), value_cols
 
-
 def _polars_to_pandas_indexed(df: "pl.DataFrame") -> pd.DataFrame:
     """Convert a polars frame with a date column back to a pandas DataFrame index."""
     if df.height == 0:
@@ -565,191 +553,154 @@ def _polars_to_pandas_indexed(df: "pl.DataFrame") -> pd.DataFrame:
         pdf = pdf.set_index("date")
     return pdf.sort_index()
 
+# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
 
-def _polars_zscore_from_last_row(frame: "pl.DataFrame", columns: list[str]) -> pd.Series:
-    """Compute a z-score from the final row of a polars DataFrame."""
-    if not columns:
-        return pd.Series(dtype=float)
-    if frame.height == 0:
-        return pd.Series(0.0, index=columns)
+def _to_pandas(obj):
+    """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
+    if _HAS_POLARS:
+        if isinstance(obj, pl.DataFrame):
+            return obj.to_pandas()
+        if isinstance(obj, pl.Series):
+            return obj.to_pandas()
+    return obj
 
-    last_row = frame.select([pl.col(col) for col in columns]).tail(1)
-    if last_row.height == 0:
-        return pd.Series(0.0, index=columns)
-
-    melted = last_row.melt(variable_name="ticker", value_name="value")
-    filtered = melted.filter(
-        pl.col("value").is_not_null()
-        & pl.col("value").is_not_nan()
-        & pl.col("value").is_finite()
-    )
-
-    if filtered.height == 0:
-        return pd.Series(0.0, index=columns)
-
-    values = filtered["value"]
-    std = values.std(ddof=0)
-    if std is None or std == 0 or (isinstance(std, float) and np.isnan(std)):
-        return pd.Series(0.0, index=columns)
-
-    mean = values.mean()
-    z_values = (values - mean) / (std + 1e-9)
-    z_map = dict(zip(filtered["ticker"].to_list(), z_values.to_list()))
-    return pd.Series([float(z_map.get(col, 0.0)) for col in columns], index=columns, dtype=float)
-
-
-def _polars_frame_from_series(
-    series: pd.Series | "pl.Series", columns: list[str]
-) -> "pl.DataFrame | None":
-    """Create a single-row polars frame from a 1-D series aligned to ``columns``."""
-    if not _use_polars_engine():
-        return None
-
-    if isinstance(series, pd.Series):
-        aligned = series.reindex(columns)
-        data = {col: [aligned.get(col, np.nan)] for col in columns}
-        return pl.DataFrame(data)
-
-    if _HAS_POLARS and isinstance(series, pl.Series):
-        values = series.to_list()
-        data = {
-            col: [values[idx] if idx < len(values) else None]
-            for idx, col in enumerate(columns)
-        }
-        return pl.DataFrame(data)
-
-    return None
-
-
-def _prepare_polars_matrix(
-    data: pd.DataFrame | "pl.DataFrame",
-) -> tuple["pl.DataFrame | None", list[str]]:
-    """Coerce ``data`` into a polars DataFrame alongside the usable column list."""
-    if not _use_polars_engine():
-        return None, []
-
-    if isinstance(data, pd.DataFrame):
-        df_sorted = data.sort_index()
-        return pl.from_pandas(df_sorted), list(df_sorted.columns)
-
-    if _HAS_POLARS and isinstance(data, pl.DataFrame):
-        frame = data.sort("date") if "date" in data.columns else data
-        columns = [col for col in frame.columns if col != "date"]
-        if not columns and "date" not in frame.columns:
-            columns = frame.columns
-        return frame, list(columns)
-
-    return None, []
-
-
-def _blended_momentum_z_polars(
-    monthly: pd.DataFrame | "pl.DataFrame",
-) -> pd.Series | None:
-    if not _use_polars_engine():
-        return None
-
-    monthly_pl, columns = _prepare_polars_matrix(monthly)
-    if monthly_pl is None:
-        return None
-    if monthly_pl.height < 13:
-        return pd.Series(dtype=float)
-    if not columns:
+def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
+    """
+    Blended momentum z-score using 3/6/12M horizons with weights 0.2/0.4/0.4.
+    Accepts pandas or polars DataFrame (prices at month end).
+    """
+    if monthly is None:
         return pd.Series(dtype=float)
 
-    def _returns(period: int) -> "pl.DataFrame":
-        return monthly_pl.select(
-            [
-                ((pl.col(col) / pl.col(col).shift(period)) - 1).alias(col)
-                for col in columns
-            ]
-        )
+    monthly = _to_pandas(monthly)
+    if not isinstance(monthly, pd.DataFrame) or monthly.shape[0] < 13:
+        return pd.Series(dtype=float)
 
-    r3 = _polars_zscore_from_last_row(_returns(3), columns)
-    r6 = _polars_zscore_from_last_row(_returns(6), columns)
-    r12 = _polars_zscore_from_last_row(_returns(12), columns)
+    # Ensure chronological order
+    try:
+        monthly = monthly.sort_index()
+    except Exception:
+        pass
 
-    return (
-        0.2 * r3.add(0.0, fill_value=0.0)
-        + 0.4 * r6.add(0.0, fill_value=0.0)
-        + 0.4 * r12.add(0.0, fill_value=0.0)
-    )
+    cols = monthly.columns
+    r3 = monthly.pct_change(3).iloc[-1]
+    r6 = monthly.pct_change(6).iloc[-1]
+    r12 = monthly.pct_change(12).iloc[-1]
 
+    z3 = _zscore_series(r3, cols)
+    z6 = _zscore_series(r6, cols)
+    z12 = _zscore_series(r12, cols)
 
-def _lowvol_z_polars(
+    return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
+
+def lowvol_z(
     daily: pd.DataFrame | "pl.DataFrame",
     vol_series: pd.Series | "pl.Series" | None = None,
-) -> pd.Series | None:
-    if not _use_polars_engine():
-        return None
-
-    daily_pl, columns = _prepare_polars_matrix(daily) if daily is not None else (None, [])
-
-    if vol_series is not None:
-        if not columns and isinstance(vol_series, pd.Series):
-            columns = list(vol_series.index)
-        elif not columns and _HAS_POLARS and isinstance(vol_series, pl.Series):
-            columns = [str(idx) for idx in range(len(vol_series))]
-
-        frame = _polars_frame_from_series(vol_series, columns)
-        if frame is None:
-            return None
-        return _polars_zscore_from_last_row(frame, columns)
-
-    if daily_pl is None:
-        return None
-    if not columns:
+) -> pd.Series:
+    """
+    Low-volatility factor as a z-score of 63-day rolling std of daily returns.
+    If 'vol_series' is given (precomputed vol), z-score that instead.
+    Accepts pandas or polars inputs.
+    """
+    if daily is None:
         return pd.Series(dtype=float)
-    if daily_pl.height < 80:
-        return pd.Series(0.0, index=columns)
 
-    returns_pl = daily_pl.select(
-        [((pl.col(col) / pl.col(col).shift(1)) - 1).alias(col) for col in columns]
+    daily = _to_pandas(daily)
+    vol_series = _to_pandas(vol_series)
+
+    if not isinstance(daily, pd.DataFrame):
+        return pd.Series(dtype=float)
+    cols = daily.columns
+
+    # Use precomputed vol if provided
+    if vol_series is not None:
+        return _zscore_series(pd.Series(vol_series), cols)
+
+    if daily.shape[0] < 80:  # need enough data for a stable 63d window
+        return pd.Series(0.0, index=cols)
+
+    vol = (
+        daily.pct_change()
+        .rolling(63)
+        .std()
+        .iloc[-1]
+        .replace([np.inf, -np.inf], np.nan)
     )
-    vol_pl = returns_pl.select(
-        [pl.col(col).rolling_std(window_size=63).alias(col) for col in columns]
-    )
-    return _polars_zscore_from_last_row(vol_pl, columns)
+    return _zscore_series(vol, cols)
 
-
-def _trend_z_polars(
+def trend_z(
     daily: pd.DataFrame | "pl.DataFrame",
     dist_series: pd.Series | "pl.Series" | None = None,
-) -> pd.Series | None:
-    if not _use_polars_engine():
-        return None
-
-    daily_pl, columns = _prepare_polars_matrix(daily) if daily is not None else (None, [])
-
-    if dist_series is not None:
-        if not columns and isinstance(dist_series, pd.Series):
-            columns = list(dist_series.index)
-        elif not columns and _HAS_POLARS and isinstance(dist_series, pl.Series):
-            columns = [str(idx) for idx in range(len(dist_series))]
-
-        frame = _polars_frame_from_series(dist_series, columns)
-        if frame is None:
-            return None
-        return _polars_zscore_from_last_row(frame, columns)
-
-    if daily_pl is None:
-        return None
-    if not columns:
+) -> pd.Series:
+    """
+    Trend factor as z-score of distance from 200DMA: (last / MA200 - 1).
+    If 'dist_series' is given, z-score that instead.
+    Accepts pandas or polars inputs.
+    """
+    if daily is None:
         return pd.Series(dtype=float)
-    if daily_pl.height < 220:
-        return pd.Series(0.0, index=columns)
 
-    dist_pl = daily_pl.select(
-        [
-            ((pl.col(col) / pl.col(col).rolling_mean(window_size=200)) - 1).alias(col)
-            for col in columns
-        ]
-    )
-    return _polars_zscore_from_last_row(dist_pl, columns)
+    daily = _to_pandas(daily)
+    dist_series = _to_pandas(dist_series)
 
+    if not isinstance(daily, pd.DataFrame):
+        return pd.Series(dtype=float)
+    cols = daily.columns
 
-# =========================
-# Data cleaning helpers (robust capping + interpolation)
-# =========================
+    # Use precomputed distance if provided
+    if dist_series is not None:
+        return _zscore_series(pd.Series(dist_series), cols)
+
+    if daily.shape[0] < 220:  # ensure we have >=200d + buffer
+        return pd.Series(0.0, index=cols)
+
+    ma200 = daily.rolling(200).mean().iloc[-1]
+    last = daily.iloc[-1]
+    dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
+    return _zscore_series(dist, cols)
+
+@st.cache_data(ttl=43200)
+def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
+    """Cache common signal inputs derived from daily close data."""
+    if daily is None or daily.empty:
+        empty_df = pd.DataFrame()
+        return {
+            "monthly": empty_df,
+            "r3": empty_df,
+            "r6": empty_df,
+            "r12": empty_df,
+            "vol63": empty_df,
+            "ma200": empty_df,
+            "dist200": empty_df,
+        }
+
+    daily = _ensure_unique_sorted_index(daily)
+
+    if _use_polars_engine():
+        try:
+            return _compute_signal_panels_polars(daily)
+        except Exception:
+            logging.exception("Falling back to pandas signal panel computation")
+
+    daily_sorted = daily
+    monthly = daily_sorted.resample("M").last()
+    r3 = daily_sorted.pct_change(63)
+    r6 = daily_sorted.pct_change(126)
+    r12 = daily_sorted.pct_change(252)
+    daily_returns = daily_sorted.pct_change()
+    vol63 = daily_returns.rolling(63).std()
+    ma200 = daily_sorted.rolling(200).mean()
+    dist200 = (daily_sorted / ma200 - 1).replace([np.inf, -np.inf], np.nan)
+
+    return {
+        "monthly": monthly,
+        "r3": r3,
+        "r6": r6,
+        "r12": r12,
+        "vol63": vol63,
+        "ma200": ma200,
+        "dist200": dist200,
+    }
 
 def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
     """Robust location/scale (median & MAD*1.4826) with sane fallbacks."""
@@ -769,7 +720,6 @@ def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
         std = float(r.std(ddof=0))
         scale = std if std and std > 0 else 0.0
     return med, scale
-
 
 def cap_abnormal_returns(
     prices: pd.DataFrame,
@@ -869,7 +819,6 @@ def cap_abnormal_returns(
 
     return cleaned, mask
 
-
 def clean_extreme_moves(
     prices: pd.DataFrame,
     *,
@@ -909,7 +858,6 @@ def clean_extreme_moves(
 
     return capped, combined_mask
 
-
 def fill_missing_data(
     prices: pd.DataFrame,
     *,
@@ -927,7 +875,6 @@ def fill_missing_data(
     if callable(info) and n > 0:
         info(f"🔧 Data filling: Filled {n} missing data points with interpolation")
     return filled, mask.astype(bool)
-
 
 def validate_and_clean_market_data(
     prices: pd.DataFrame,
@@ -1437,7 +1384,6 @@ def update_parameter_mapping(log: pd.DataFrame | None = None) -> None:
         "sector_cap_high": float(sector_cap_high),
     }
 
-
 # =========================
 # NEW: Regime-Based Parameter Mapping
 # =========================
@@ -1659,13 +1605,26 @@ def _safe_series(obj):
 def to_yahoo_symbol(sym: str) -> str:
     return str(sym).strip().upper().replace(".", "-")
 
+def _ensure_unique_sorted_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df with a strictly unique, sorted DatetimeIndex (keeps last duplicate)."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    try:
+        if not isinstance(df.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+            df.index = pd.to_datetime(df.index, errors="coerce")
+    except Exception:
+        pass
+
+    df = df[~df.index.duplicated(keep="last")]
+    return df.sort_index()
+
 def _chunk_tickers(tickers: List[str], size: Optional[int] = None):
     chunk_size = int(size) if size else int(PERF["yf_batch"])
     if chunk_size <= 0:
         chunk_size = 1
     for i in range(0, len(tickers), chunk_size):
         yield tickers[i : i + chunk_size]
-
 
 def _yf_download(tickers, **kwargs):
     params = dict(auto_adjust=True, progress=False, group_by="column", timeout=10)
@@ -1676,7 +1635,6 @@ def _yf_download(tickers, **kwargs):
         params.pop("group_by", None)
         params.pop("timeout", None)
         return yf.download(tickers, **params)
-
 
 def parallel_yf_download(tickers, start, end, slices: int = 2):
     """Download Yahoo Finance data in parallel date slices and merge the result."""
@@ -1796,7 +1754,6 @@ _SECTOR_OVERRIDE_PATH = Path(__file__).with_name("sector_overrides.csv")
 # Directory for parquet-based caching of downloaded price data
 PARQUET_CACHE_DIR = Path(".parquet_cache")
 
-
 def _load_sector_overrides() -> Dict[str, str]:
     if _SECTOR_OVERRIDE_PATH.exists():
         try:
@@ -1813,9 +1770,7 @@ def _load_sector_overrides() -> Dict[str, str]:
             return {}
     return {}
 
-
 _SECTOR_OVERRIDES = _load_sector_overrides()
-
 
 def _parquet_cache_path(prefix: str, tickers: List[str], start_date: str, end_date: str) -> Path:
     """Return a filesystem path for caching data as parquet.
@@ -1836,7 +1791,6 @@ def _parquet_cache_path(prefix: str, tickers: List[str], start_date: str, end_da
     key = json.dumps(key_obj, sort_keys=True)
     fname = hashlib.sha256(key.encode("utf-8")).hexdigest() + ".parquet"
     return PARQUET_CACHE_DIR / fname
-
 
 def _read_cached_dataframe(path: Path) -> Optional[pd.DataFrame]:
     """Read a cached DataFrame with graceful fallback respecting ``PERF`` toggles."""
@@ -1871,7 +1825,6 @@ def _read_cached_dataframe(path: Path) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-
 def _write_cached_dataframe(df: pd.DataFrame, path: Path) -> None:
     """Persist ``df`` to ``path`` honouring ``PERF`` hints for the storage backend."""
 
@@ -1894,7 +1847,6 @@ def _write_cached_dataframe(df: pd.DataFrame, path: Path) -> None:
         df.to_pickle(path)
     except Exception:
         pass
-
 
 def _safe_get_info(ticker: yf.Ticker, timeout: float = 5.0) -> Dict[str, Any]:
     """Fetch ``ticker.info`` with a timeout and graceful fallback."""
@@ -2027,14 +1979,21 @@ def _prepare_universe_for_backtest(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str], str]:
     """Fetches prices/volumes, applies Hybrid150 filter if needed, with enhanced data cleaning."""
     base_tickers, base_sectors, label = get_universe(universe_choice)
+    tickers = _sc_sanitize_tickers(base_tickers)
+    if "QQQ" not in tickers:
+        tickers.append("QQQ")
+    base_sectors = {t: base_sectors.get(t, "Unknown") for t in tickers if t != "QQQ"}
     if not base_tickers:
         return pd.DataFrame(), pd.DataFrame(), {}, label
 
-    close, vol = fetch_price_volume(base_tickers + ["QQQ"], start_date, end_date)
+    close, vol = fetch_price_volume(tickers, start_date, end_date)
     if close.empty or "QQQ" not in close.columns:
         return pd.DataFrame(), pd.DataFrame(), {}, label
 
     # Enhanced data validation is now built into fetch_price_volume
+    close = close.loc[:, [c for c in close.columns if c in tickers]]
+    if isinstance(vol, pd.DataFrame) and not vol.empty:
+        vol = vol.loc[:, [c for c in vol.columns if c in tickers]]
     sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns if t != "QQQ"}
 
     if label == "Hybrid Top150":
@@ -2063,10 +2022,9 @@ def _prepare_universe_for_backtest(
 # =========================
 from typing import List, Tuple
 
-
 def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
     """Return the actual start date to use when downloading data."""
-    months_back = 6 if PERF.get("fast_io") else 14
+    months_back = 14
 
     try:
         start_ts = pd.to_datetime(start_date)
@@ -2093,19 +2051,34 @@ def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
     """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
-    cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
+    safe = _sc_sanitize_tickers(tickers)
+    if "QQQ" not in safe:
+        safe.append("QQQ")
 
-    # Try local disk cache first (Parquet -> Pickle)
+    cache_path = _parquet_cache_path("market", safe, start_date, end_date)
+
+    def _maybe_add_qqq(df: pd.DataFrame) -> pd.DataFrame:
+        if "QQQ" in df.columns:
+            return df
+        try:
+            qqq_df = strategy_core.fetch_market_data(["QQQ"], start_date, end_date)
+            if not qqq_df.empty and "QQQ" in qqq_df.columns:
+                df = pd.concat([df, qqq_df[["QQQ"]]], axis=1)
+        except Exception:
+            pass
+        return df
+
     cached = _read_cached_dataframe(cache_path)
     if cached is not None:
-        return cached
+        cached = _ensure_unique_sorted_index(cached)
+        cached = cached.loc[:, cached.columns.intersection(safe)]
+        return _maybe_add_qqq(cached)
 
     try:
-        # Pull an extended window only when downstream calculations require it
         fetch_start = _resolve_fetch_start(start_date, end_date)
 
         frames: List[pd.DataFrame] = []
-        for batch in _chunk_tickers(tickers):
+        for batch in _chunk_tickers(safe):
             try:
                 raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
             except Exception:
@@ -2115,51 +2088,86 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
+
+            df = _ensure_unique_sorted_index(df)
             frames.append(df)
 
         if not frames:
             return pd.DataFrame()
 
         data = pd.concat(frames, axis=1)
+        data = _ensure_unique_sorted_index(data)
         result = data.dropna(axis=1, how="all")
+        result = result.loc[:, result.columns.intersection(safe)]
 
-        # Enhanced data cleaning pipeline (true linear interpolation on short gaps, etc.)
         if not result.empty:
             cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(result, info=logging.info)
 
-            # Log a brief cleaning summary (top 2 alerts)
+            cleaned_result = _ensure_unique_sorted_index(cleaned_result)
+            cleaned_result = cleaned_result.loc[:, cleaned_result.columns.intersection(safe)]
+
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:
                     logging.info("Data cleaning: %s", alert)
 
             _write_cached_dataframe(cleaned_result, cache_path)
-            return cleaned_result
+            return _maybe_add_qqq(cleaned_result)
 
-        # Fallback: write whatever we got
         _write_cached_dataframe(result, cache_path)
-        return result
+        return _maybe_add_qqq(result)
 
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit."""
-    cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
+    safe = _sc_sanitize_tickers(tickers)
+    if "QQQ" not in safe:
+        safe.append("QQQ")
 
-    # Try local disk cache first (Parquet -> Pickle)
+    cache_path = _parquet_cache_path("price_volume", safe, start_date, end_date)
+
     combined = _read_cached_dataframe(cache_path)
+    def _maybe_add_qqq(close_df: pd.DataFrame, vol_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if "QQQ" not in close_df.columns:
+            try:
+                qqq_close = strategy_core.fetch_market_data(["QQQ"], start_date, end_date)
+                if not qqq_close.empty and "QQQ" in qqq_close.columns:
+                    close_df = pd.concat([close_df, qqq_close[["QQQ"]]], axis=1)
+            except Exception:
+                pass
+        if "QQQ" not in vol_df.columns:
+            try:
+                qqq_vol = yf.download(
+                    "QQQ",
+                    start=start_date,
+                    end=end_date,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )["Volume"]
+                if isinstance(qqq_vol, pd.Series) and not qqq_vol.dropna().empty:
+                    vol_df = pd.concat([vol_df, qqq_vol.to_frame(name="QQQ")], axis=1)
+            except Exception:
+                pass
+        return close_df, vol_df
+
     if combined is not None:
         if isinstance(combined.columns, pd.MultiIndex):
             needed = {"Close", "Volume"}
             have = set(combined.columns.get_level_values(0))
             if needed.issubset(have):
-                return combined["Close"], combined["Volume"]
+                close = _ensure_unique_sorted_index(combined["Close"].loc[:, combined["Close"].columns.intersection(safe)])
+                vol = _ensure_unique_sorted_index(combined["Volume"].loc[:, combined["Volume"].columns.intersection(safe)])
+                return _maybe_add_qqq(close, vol)
         else:
             if {"Close", "Volume"}.issubset(combined.columns):
-                return combined["Close"], combined["Volume"]
+                combined = _ensure_unique_sorted_index(combined)
+                close = combined["Close"].loc[:, combined["Close"].columns.intersection(safe)]
+                vol = combined["Volume"].loc[:, combined["Volume"].columns.intersection(safe)]
+                return _maybe_add_qqq(close, vol)
 
     try:
         fetch_start = _resolve_fetch_start(start_date, end_date)
@@ -2167,7 +2175,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
 
-        for batch in _chunk_tickers(tickers):
+        for batch in _chunk_tickers(safe):
             try:
                 raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
             except Exception:
@@ -2189,6 +2197,9 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     close_part.columns = [batch[0]]
                     vol_part.columns = [batch[0]]
 
+            close_part = _ensure_unique_sorted_index(close_part)
+            vol_part = _ensure_unique_sorted_index(vol_part)
+
             close_frames.append(close_part)
             vol_frames.append(vol_part)
 
@@ -2197,13 +2208,20 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
         close = pd.concat(close_frames, axis=1).dropna(axis=1, how="all")
         vol = pd.concat(vol_frames, axis=1)
+
+        close = _ensure_unique_sorted_index(close)
+        vol = _ensure_unique_sorted_index(vol)
+
         vol = vol.reindex_like(close).fillna(0)
 
-        # Enhanced cleaning for prices
+        close = close.loc[:, [c for c in close.columns if c in safe]]
+        vol = vol.loc[:, [c for c in vol.columns if c in safe]]
+
         if not close.empty:
             cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
 
-            # Mild cleaning for volume: align and clip extreme spikes (99th pct)
+            cleaned_close = _ensure_unique_sorted_index(cleaned_close)
+
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
             for col in vol_aligned.columns:
                 col_data = vol_aligned[col]
@@ -2215,11 +2233,16 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 for alert in close_alerts[:1]:
                     logging.info("Price/Volume cleaning: %s", alert)
 
-            _write_cached_dataframe(pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1), cache_path)
+            cleaned_close, vol_aligned = _maybe_add_qqq(cleaned_close, vol_aligned)
+            combined_out = pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1)
+            combined_out = _ensure_unique_sorted_index(combined_out)
+            _write_cached_dataframe(combined_out, cache_path)
             return cleaned_close, vol_aligned
 
-        # Fallback: cache raw combined
-        _write_cached_dataframe(pd.concat({"Close": close, "Volume": vol}, axis=1), cache_path)
+        close, vol = _maybe_add_qqq(close, vol)
+        combined_out = pd.concat({"Close": close, "Volume": vol}, axis=1)
+        combined_out = _ensure_unique_sorted_index(combined_out)
+        _write_cached_dataframe(combined_out, cache_path)
         return close, vol
 
     except Exception as e:
@@ -2356,7 +2379,6 @@ def save_current_portfolio(df: pd.DataFrame) -> None:
             st.sidebar.warning(f"Could not save local portfolio: {e}")
         else:
             logging.warning("Could not save local portfolio: %s", e)
-
 
 def save_portfolio_if_rebalance(
     df: pd.DataFrame, price_index: Optional[pd.DatetimeIndex]
@@ -2588,180 +2610,7 @@ def _compute_signal_panels_polars(
         "dist200": dist200,
     }
 
-
 @st.cache_data(ttl=43200)
-def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
-    """Cache common signal inputs derived from daily close data."""
-    if daily is None or daily.empty:
-        empty_df = pd.DataFrame()
-        return {
-            "monthly": empty_df,
-            "r3": empty_df,
-            "r6": empty_df,
-            "r12": empty_df,
-            "vol63": empty_df,
-            "ma200": empty_df,
-            "dist200": empty_df,
-        }
-
-    if _use_polars_engine():
-        try:
-            return _compute_signal_panels_polars(daily)
-        except Exception:
-            logging.exception("Falling back to pandas signal panel computation")
-
-    daily_sorted = daily.sort_index()
-    monthly = daily_sorted.resample("M").last()
-    r3 = daily_sorted.pct_change(63)
-    r6 = daily_sorted.pct_change(126)
-    r12 = daily_sorted.pct_change(252)
-    daily_returns = daily_sorted.pct_change()
-    vol63 = daily_returns.rolling(63).std()
-    ma200 = daily_sorted.rolling(200).mean()
-    dist200 = (daily_sorted / ma200 - 1).replace([np.inf, -np.inf], np.nan)
-
-    return {
-        "monthly": monthly,
-        "r3": r3,
-        "r6": r6,
-        "r12": r12,
-        "vol63": vol63,
-        "ma200": ma200,
-        "dist200": dist200,
-    }
-
-
-# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
-
-# Optional Polars support (convert to pandas if provided)
-try:  # don't hard-require polars
-    import polars as pl  # type: ignore
-    _HAS_POLARS = True
-except Exception:
-    pl = None  # type: ignore
-    _HAS_POLARS = False
-
-
-def _to_pandas(obj):
-    """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
-    if _HAS_POLARS:
-        if isinstance(obj, pl.DataFrame):
-            return obj.to_pandas()
-        if isinstance(obj, pl.Series):
-            return obj.to_pandas()
-    return obj
-
-
-def _zscore_series(s: pd.Series, cols: Iterable[str]) -> pd.Series:
-    """Safe z-score with NaN/Inf handling; returns aligned to 'cols'."""
-    if s is None:
-        return pd.Series(0.0, index=list(cols))
-    s = pd.Series(s).replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty:
-        return pd.Series(0.0, index=list(cols))
-    std = float(s.std(ddof=0))
-    if not np.isfinite(std) or np.isclose(std, 0.0):
-        return pd.Series(0.0, index=list(cols))
-    z = (s - float(s.mean())) / (std + 1e-9)
-    return z.reindex(list(cols)).fillna(0.0)
-
-
-def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
-    """
-    Blended momentum z-score using 3/6/12M horizons with weights 0.2/0.4/0.4.
-    Accepts pandas or polars DataFrame (prices at month end).
-    """
-    if monthly is None:
-        return pd.Series(dtype=float)
-
-    monthly = _to_pandas(monthly)
-    if not isinstance(monthly, pd.DataFrame) or monthly.shape[0] < 13:
-        return pd.Series(dtype=float)
-
-    # Ensure chronological order
-    try:
-        monthly = monthly.sort_index()
-    except Exception:
-        pass
-
-    cols = monthly.columns
-    r3 = monthly.pct_change(3).iloc[-1]
-    r6 = monthly.pct_change(6).iloc[-1]
-    r12 = monthly.pct_change(12).iloc[-1]
-
-    z3 = _zscore_series(r3, cols)
-    z6 = _zscore_series(r6, cols)
-    z12 = _zscore_series(r12, cols)
-
-    return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
-
-
-def lowvol_z(
-    daily: pd.DataFrame | "pl.DataFrame",
-    vol_series: pd.Series | "pl.Series" | None = None,
-) -> pd.Series:
-    """
-    Low-volatility factor as a z-score of 63-day rolling std of daily returns.
-    If 'vol_series' is given (precomputed vol), z-score that instead.
-    Accepts pandas or polars inputs.
-    """
-    if daily is None:
-        return pd.Series(dtype=float)
-
-    daily = _to_pandas(daily)
-    vol_series = _to_pandas(vol_series)
-
-    if not isinstance(daily, pd.DataFrame):
-        return pd.Series(dtype=float)
-    cols = daily.columns
-
-    # Use precomputed vol if provided
-    if vol_series is not None:
-        return _zscore_series(pd.Series(vol_series), cols)
-
-    if daily.shape[0] < 80:  # need enough data for a stable 63d window
-        return pd.Series(0.0, index=cols)
-
-    vol = (
-        daily.pct_change()
-        .rolling(63)
-        .std()
-        .iloc[-1]
-        .replace([np.inf, -np.inf], np.nan)
-    )
-    return _zscore_series(vol, cols)
-
-
-def trend_z(
-    daily: pd.DataFrame | "pl.DataFrame",
-    dist_series: pd.Series | "pl.Series" | None = None,
-) -> pd.Series:
-    """
-    Trend factor as z-score of distance from 200DMA: (last / MA200 - 1).
-    If 'dist_series' is given, z-score that instead.
-    Accepts pandas or polars inputs.
-    """
-    if daily is None:
-        return pd.Series(dtype=float)
-
-    daily = _to_pandas(daily)
-    dist_series = _to_pandas(dist_series)
-
-    if not isinstance(daily, pd.DataFrame):
-        return pd.Series(dtype=float)
-    cols = daily.columns
-
-    # Use precomputed distance if provided
-    if dist_series is not None:
-        return _zscore_series(pd.Series(dist_series), cols)
-
-    if daily.shape[0] < 220:  # ensure we have >=200d + buffer
-        return pd.Series(0.0, index=cols)
-
-    ma200 = daily.rolling(200).mean().iloc[-1]
-    last = daily.iloc[-1]
-    dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
-    return _zscore_series(dist, cols)
 
 def composite_score(daily: pd.DataFrame, panels: Dict[str, pd.DataFrame | pd.Series] | None = None) -> pd.Series:
     panels = compute_signal_panels(daily) if panels is None else panels
@@ -2846,6 +2695,7 @@ def run_momentum_composite_param(
             comp = comp_all.iloc[-1].dropna()
         else:
             comp = pd.Series(comp_all).dropna()
+        comp_full = comp.copy()
 
         if comp.empty:
             rets.loc[m] = 0.0
@@ -2853,10 +2703,25 @@ def run_momentum_composite_param(
             prev_w = pd.Series(dtype=float)
             continue
 
-        # Restrict to positive blended momentum universe
+        # Restrict to momentum names using adaptive cutoff and fallbacks
         momz = blended_momentum_z(hist.resample("M").last())
-        comp = comp.reindex(momz.index).dropna()
-        sel  = comp[momz > 0].dropna()
+        base_comp = comp_full
+        if isinstance(momz, pd.Series) and not momz.empty:
+            comp_aligned = comp_full.reindex(momz.index).dropna()
+            aligned_momz = momz.reindex(comp_aligned.index)
+            valid_momz = aligned_momz.dropna()
+            cutoff = 0.0
+            if not valid_momz.empty:
+                median_val = float(valid_momz.median())
+                cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
+            sel = comp_aligned[aligned_momz > cutoff].dropna()
+            base_comp = comp_aligned if not comp_aligned.empty else comp_full
+        else:
+            sel = base_comp.copy()
+
+        if sel.empty:
+            sel = base_comp.nlargest(top_n)
+
         if sel.empty:
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
@@ -2874,6 +2739,9 @@ def run_momentum_composite_param(
                 picks = filtered
             else:
                 picks = sel.nlargest(top_n)  # fallback if stickiness empties set
+
+        if picks.empty:
+            picks = base_comp.nlargest(top_n)
 
         # Optional: signal decay shaping
         if use_enhanced_features:
@@ -2935,6 +2803,7 @@ def run_momentum_composite_param(
                 regime_metrics  = compute_regime_metrics(hist)
                 regime_exposure = get_regime_adjusted_exposure(regime_metrics)
                 w = w * regime_exposure
+                w = w / w.sum() if w.sum() > 0 else w
             except Exception as e:
                 logging.warning("R01 regime exposure scaling failed in simulation", exc_info=True)
 
@@ -2953,7 +2822,6 @@ def run_momentum_composite_param(
         prev_w = w
 
     return rets.fillna(0.0), tno.fillna(0.0)
-
 
 def apply_costs(gross, turnover, roundtrip_bps):
     return gross - turnover*(roundtrip_bps/10000.0)
@@ -3042,11 +2910,21 @@ def _build_isa_weights_fixed(
         else:
             raise
     comp_vec = comp_all.iloc[-1].dropna() if isinstance(comp_all, pd.DataFrame) else pd.Series(comp_all).dropna()
+    comp_vec_full = comp_vec.copy()
 
     momz = blended_momentum_z(monthly)
-    pos_idx = momz[momz > 0].index
-    comp_vec = comp_vec.reindex(pos_idx).dropna()
-    top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
+    filtered = comp_vec_full.copy()
+    if isinstance(momz, pd.Series) and not momz.empty:
+        aligned_momz = momz.reindex(filtered.index)
+        valid_momz = aligned_momz.dropna()
+        cutoff = 0.0
+        if not valid_momz.empty:
+            median_val = float(valid_momz.median())
+            cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
+        filtered = filtered[aligned_momz > cutoff].dropna()
+    if filtered.empty:
+        filtered = comp_vec_full
+    top_m = filtered.nlargest(preset["mom_topn"]) if not filtered.empty else pd.Series(dtype=float)
 
     # Stickiness filter (keep names that have persisted in the top set)
     try:
@@ -3070,6 +2948,9 @@ def _build_isa_weights_fixed(
         filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
         if not filtered.empty:
             top_m = filtered
+
+    if top_m.empty:
+        top_m = comp_vec_full.nlargest(preset["mom_topn"]) if not comp_vec_full.empty else pd.Series(dtype=float)
 
     # Raw momentum weights (scaled by sleeve weight)
     mom_raw = (top_m / top_m.sum()) * preset["mom_w"] if not top_m.empty and top_m.sum() > 0 else pd.Series(dtype=float)
@@ -3119,7 +3000,7 @@ def _build_isa_weights_fixed(
         group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
     )
 
-    return final_weights
+    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
 def check_constraint_violations(
     weights: pd.Series,
@@ -3205,6 +3086,10 @@ def generate_live_portfolio_isa_monthly(
     
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
+    base_tickers = _sc_sanitize_tickers(base_tickers)
+    if "QQQ" not in base_tickers:
+        base_tickers.append("QQQ")
+    base_sectors = {t: base_sectors.get(t, "Unknown") for t in base_tickers}
     if not base_tickers:
         return None, None, "No universe available."
 
@@ -3268,6 +3153,7 @@ def generate_live_portfolio_isa_monthly(
         try:
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
             new_w = new_w * float(regime_exposure)
+            new_w = new_w / new_w.sum() if new_w.sum() > 0 else new_w
         except Exception:
             logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
@@ -3401,7 +3287,6 @@ def generate_live_portfolio_isa_monthly(
 
     disp, raw = _format_display(final_weights)
     return disp, raw, decision
-
 
 def optimize_hybrid_strategy(prices: Optional[pd.DataFrame] = None,
                              start_date: str = "2017-07-01",
@@ -4018,7 +3903,6 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
     except Exception:
         return "Neutral", {}
 
-
 def select_optimal_universe(as_of: date | None = None) -> str:
     """Automatically choose the trading universe based on recent index momentum.
 
@@ -4073,7 +3957,6 @@ def select_optimal_universe(as_of: date | None = None) -> str:
         return "S&P500 (All)"
     else:
         return "Hybrid Top150"
-
 
 def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     """Assess market conditions and derive configuration settings.
@@ -4435,7 +4318,6 @@ def summarize_signal_alignment(metrics: Dict[str, float]) -> Dict[str, Any]:
     ok = all(v is True for v in checks.values())
     return {"ok": ok, "reason": regime_lbl, "checks": checks}
 
-
 def summarize_portfolio_construction(
     weights: pd.Series | None,
     sectors_map: Dict[str, str] | None,
@@ -4496,7 +4378,6 @@ def summarize_portfolio_construction(
 
     return out
 
-
 def summarize_health(
     monthly_returns: pd.Series,
     benchmark_monthly_returns: pd.Series | None = None,
@@ -4520,7 +4401,6 @@ def summarize_health(
 
     ok = len(issues) == 0
     return {"ok": ok, "issues": issues, "stats": stats}
-
 
 def run_trust_checks(
     weights_df: pd.DataFrame | None,
