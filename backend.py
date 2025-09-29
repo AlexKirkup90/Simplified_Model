@@ -2067,6 +2067,7 @@ from typing import List, Tuple
 def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
     """Return the actual start date to use when downloading data."""
     months_back = 6 if PERF.get("fast_io") else 14
+    months_back = max(months_back, 14)
 
     try:
         start_ts = pd.to_datetime(start_date)
@@ -2633,14 +2634,6 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
 
 # ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
 
-# Optional Polars support (convert to pandas if provided)
-try:  # don't hard-require polars
-    import polars as pl  # type: ignore
-    _HAS_POLARS = True
-except Exception:
-    pl = None  # type: ignore
-    _HAS_POLARS = False
-
 
 def _to_pandas(obj):
     """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
@@ -2650,20 +2643,6 @@ def _to_pandas(obj):
         if isinstance(obj, pl.Series):
             return obj.to_pandas()
     return obj
-
-
-def _zscore_series(s: pd.Series, cols: Iterable[str]) -> pd.Series:
-    """Safe z-score with NaN/Inf handling; returns aligned to 'cols'."""
-    if s is None:
-        return pd.Series(0.0, index=list(cols))
-    s = pd.Series(s).replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty:
-        return pd.Series(0.0, index=list(cols))
-    std = float(s.std(ddof=0))
-    if not np.isfinite(std) or np.isclose(std, 0.0):
-        return pd.Series(0.0, index=list(cols))
-    z = (s - float(s.mean())) / (std + 1e-9)
-    return z.reindex(list(cols)).fillna(0.0)
 
 
 def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
@@ -2846,6 +2825,7 @@ def run_momentum_composite_param(
             comp = comp_all.iloc[-1].dropna()
         else:
             comp = pd.Series(comp_all).dropna()
+        comp_full = comp.copy()
 
         if comp.empty:
             rets.loc[m] = 0.0
@@ -2853,10 +2833,25 @@ def run_momentum_composite_param(
             prev_w = pd.Series(dtype=float)
             continue
 
-        # Restrict to positive blended momentum universe
+        # Restrict to momentum names using adaptive cutoff and fallbacks
         momz = blended_momentum_z(hist.resample("M").last())
-        comp = comp.reindex(momz.index).dropna()
-        sel  = comp[momz > 0].dropna()
+        base_comp = comp_full
+        if isinstance(momz, pd.Series) and not momz.empty:
+            comp_aligned = comp_full.reindex(momz.index).dropna()
+            aligned_momz = momz.reindex(comp_aligned.index)
+            valid_momz = aligned_momz.dropna()
+            cutoff = 0.0
+            if not valid_momz.empty:
+                median_val = float(valid_momz.median())
+                cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
+            sel = comp_aligned[aligned_momz > cutoff].dropna()
+            base_comp = comp_aligned if not comp_aligned.empty else comp_full
+        else:
+            sel = base_comp.copy()
+
+        if sel.empty:
+            sel = base_comp.nlargest(top_n)
+
         if sel.empty:
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
@@ -2874,6 +2869,9 @@ def run_momentum_composite_param(
                 picks = filtered
             else:
                 picks = sel.nlargest(top_n)  # fallback if stickiness empties set
+
+        if picks.empty:
+            picks = base_comp.nlargest(top_n)
 
         # Optional: signal decay shaping
         if use_enhanced_features:
@@ -2935,6 +2933,7 @@ def run_momentum_composite_param(
                 regime_metrics  = compute_regime_metrics(hist)
                 regime_exposure = get_regime_adjusted_exposure(regime_metrics)
                 w = w * regime_exposure
+                w = w / w.sum() if w.sum() > 0 else w
             except Exception as e:
                 logging.warning("R01 regime exposure scaling failed in simulation", exc_info=True)
 
@@ -3042,11 +3041,21 @@ def _build_isa_weights_fixed(
         else:
             raise
     comp_vec = comp_all.iloc[-1].dropna() if isinstance(comp_all, pd.DataFrame) else pd.Series(comp_all).dropna()
+    comp_vec_full = comp_vec.copy()
 
     momz = blended_momentum_z(monthly)
-    pos_idx = momz[momz > 0].index
-    comp_vec = comp_vec.reindex(pos_idx).dropna()
-    top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
+    filtered = comp_vec_full.copy()
+    if isinstance(momz, pd.Series) and not momz.empty:
+        aligned_momz = momz.reindex(filtered.index)
+        valid_momz = aligned_momz.dropna()
+        cutoff = 0.0
+        if not valid_momz.empty:
+            median_val = float(valid_momz.median())
+            cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
+        filtered = filtered[aligned_momz > cutoff].dropna()
+    if filtered.empty:
+        filtered = comp_vec_full
+    top_m = filtered.nlargest(preset["mom_topn"]) if not filtered.empty else pd.Series(dtype=float)
 
     # Stickiness filter (keep names that have persisted in the top set)
     try:
@@ -3070,6 +3079,9 @@ def _build_isa_weights_fixed(
         filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
         if not filtered.empty:
             top_m = filtered
+
+    if top_m.empty:
+        top_m = comp_vec_full.nlargest(preset["mom_topn"]) if not comp_vec_full.empty else pd.Series(dtype=float)
 
     # Raw momentum weights (scaled by sleeve weight)
     mom_raw = (top_m / top_m.sum()) * preset["mom_w"] if not top_m.empty and top_m.sum() > 0 else pd.Series(dtype=float)
@@ -3119,7 +3131,7 @@ def _build_isa_weights_fixed(
         group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
     )
 
-    return final_weights
+    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
 def check_constraint_violations(
     weights: pd.Series,
@@ -3268,6 +3280,7 @@ def generate_live_portfolio_isa_monthly(
         try:
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
             new_w = new_w * float(regime_exposure)
+            new_w = new_w / new_w.sum() if new_w.sum() > 0 else new_w
         except Exception:
             logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
