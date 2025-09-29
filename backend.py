@@ -3135,8 +3135,10 @@ def check_constraint_violations(
     violations = []
     
     # Check name caps
+    tol = 1e-6
+
     for ticker, weight in weights.items():
-        if weight > name_cap + 0.01:  # 1% tolerance
+        if weight > name_cap + tol:
             violations.append(f"{ticker}: {weight:.1%} > {name_cap:.1%}")
     
     # Check sector caps
@@ -3144,7 +3146,7 @@ def check_constraint_violations(
     sector_sums = weights.groupby(sectors).sum()
 
     for sector, total_weight in sector_sums.items():
-        if total_weight > sector_cap + 0.01:  # 1% tolerance
+        if total_weight > sector_cap + tol:
             violations.append(f"{sector}: {total_weight:.1%} > {sector_cap:.1%}")
 
     # Optional hierarchical/group caps (e.g., Software sub-buckets)
@@ -3160,7 +3162,7 @@ def check_constraint_violations(
                 w = group_sums.get(group, 0.0)
             else:
                 w = parent_sums.get(group, 0.0)
-            if w > cap + 0.01:  # 1% tolerance
+            if w > cap + tol:
                 violations.append(f"{group}: {w:.1%} > {cap:.1%}")
     
     return violations
