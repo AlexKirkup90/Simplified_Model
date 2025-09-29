@@ -747,6 +747,163 @@ def _trend_z_polars(
     return _polars_zscore_from_last_row(dist_pl, columns)
 
 
+def _ensure_pandas(obj: Any) -> Any:
+    """Convert Polars objects to pandas equivalents when possible."""
+    if obj is None:
+        return None
+    if isinstance(obj, (pd.Series, pd.DataFrame)):
+        return obj
+    if _HAS_POLARS:
+        try:
+            if isinstance(obj, pl.DataFrame):
+                return obj.to_pandas()
+            if isinstance(obj, pl.Series):
+                return obj.to_pandas()
+        except Exception:
+            logging.debug("Polars → pandas conversion failed; leaving object unchanged", exc_info=True)
+    return obj
+
+
+def _blended_momentum_z_pandas(monthly: Any) -> pd.Series:
+    monthly_pd = _ensure_pandas(monthly)
+    if not isinstance(monthly_pd, pd.DataFrame) or monthly_pd.empty:
+        return pd.Series(dtype=float)
+
+    try:
+        monthly_pd = monthly_pd.sort_index()
+    except Exception:
+        pass
+
+    if monthly_pd.shape[0] < 13:
+        return pd.Series(dtype=float)
+
+    cols = monthly_pd.columns
+    r3 = monthly_pd.pct_change(3).iloc[-1]
+    r6 = monthly_pd.pct_change(6).iloc[-1]
+    r12 = monthly_pd.pct_change(12).iloc[-1]
+
+    z3 = _zscore_series(r3, cols)
+    z6 = _zscore_series(r6, cols)
+    z12 = _zscore_series(r12, cols)
+
+    return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
+
+
+def _lowvol_z_pandas(
+    daily: Any,
+    vol_series: Any = None,
+) -> pd.Series:
+    daily_pd = _ensure_pandas(daily)
+    vol_pd = _ensure_pandas(vol_series)
+
+    if not isinstance(daily_pd, pd.DataFrame):
+        return pd.Series(dtype=float)
+
+    cols = daily_pd.columns
+
+    if vol_pd is not None:
+        try:
+            vol_series_pd = pd.Series(vol_pd)
+        except Exception:
+            vol_series_pd = None
+        if isinstance(vol_series_pd, pd.Series):
+            return _zscore_series(vol_series_pd, cols)
+
+    if daily_pd.shape[0] < 80:
+        return pd.Series(0.0, index=cols)
+
+    vol = (
+        daily_pd.pct_change()
+        .rolling(63)
+        .std()
+        .iloc[-1]
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    return _zscore_series(vol, cols)
+
+
+def _trend_z_pandas(
+    daily: Any,
+    dist_series: Any = None,
+) -> pd.Series:
+    daily_pd = _ensure_pandas(daily)
+    dist_pd = _ensure_pandas(dist_series)
+
+    if not isinstance(daily_pd, pd.DataFrame):
+        return pd.Series(dtype=float)
+
+    cols = daily_pd.columns
+
+    if dist_pd is not None:
+        try:
+            dist_series_pd = pd.Series(dist_pd)
+        except Exception:
+            dist_series_pd = None
+        if isinstance(dist_series_pd, pd.Series):
+            return _zscore_series(dist_series_pd, cols)
+
+    if daily_pd.shape[0] < 220:
+        return pd.Series(0.0, index=cols)
+
+    ma200 = daily_pd.rolling(200).mean().iloc[-1]
+    last = daily_pd.iloc[-1]
+    dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
+    return _zscore_series(dist, cols)
+
+
+def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
+    if monthly is None:
+        return pd.Series(dtype=float)
+
+    if _use_polars_engine():
+        try:
+            polars_res = _blended_momentum_z_polars(monthly)
+            if isinstance(polars_res, pd.Series):
+                return polars_res
+            if polars_res is not None:
+                return pd.Series(polars_res)
+        except Exception:
+            logging.exception("Polars momentum z failed; falling back to pandas")
+
+    return _blended_momentum_z_pandas(monthly)
+
+
+def lowvol_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    vol_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    if daily is None:
+        return pd.Series(dtype=float)
+
+    if _use_polars_engine():
+        try:
+            polars_res = _lowvol_z_polars(daily, vol_series)
+            if isinstance(polars_res, pd.Series):
+                return polars_res
+        except Exception:
+            logging.exception("Polars low-vol z failed; falling back to pandas")
+
+    return _lowvol_z_pandas(daily, vol_series)
+
+
+def trend_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    dist_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    if daily is None:
+        return pd.Series(dtype=float)
+
+    if _use_polars_engine():
+        try:
+            polars_res = _trend_z_polars(daily, dist_series)
+            if isinstance(polars_res, pd.Series):
+                return polars_res
+        except Exception:
+            logging.exception("Polars trend z failed; falling back to pandas")
+
+    return _trend_z_pandas(daily, dist_series)
+
+
 # =========================
 # Data cleaning helpers (robust capping + interpolation)
 # =========================
@@ -2066,7 +2223,7 @@ from typing import List, Tuple
 
 def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
     """Return the actual start date to use when downloading data."""
-    months_back = 6 if PERF.get("fast_io") else 14
+    months_back = 14
 
     try:
         start_ts = pd.to_datetime(start_date)
@@ -2631,138 +2788,6 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
     }
 
 
-# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
-
-# Optional Polars support (convert to pandas if provided)
-try:  # don't hard-require polars
-    import polars as pl  # type: ignore
-    _HAS_POLARS = True
-except Exception:
-    pl = None  # type: ignore
-    _HAS_POLARS = False
-
-
-def _to_pandas(obj):
-    """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
-    if _HAS_POLARS:
-        if isinstance(obj, pl.DataFrame):
-            return obj.to_pandas()
-        if isinstance(obj, pl.Series):
-            return obj.to_pandas()
-    return obj
-
-
-def _zscore_series(s: pd.Series, cols: Iterable[str]) -> pd.Series:
-    """Safe z-score with NaN/Inf handling; returns aligned to 'cols'."""
-    if s is None:
-        return pd.Series(0.0, index=list(cols))
-    s = pd.Series(s).replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty:
-        return pd.Series(0.0, index=list(cols))
-    std = float(s.std(ddof=0))
-    if not np.isfinite(std) or np.isclose(std, 0.0):
-        return pd.Series(0.0, index=list(cols))
-    z = (s - float(s.mean())) / (std + 1e-9)
-    return z.reindex(list(cols)).fillna(0.0)
-
-
-def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
-    """
-    Blended momentum z-score using 3/6/12M horizons with weights 0.2/0.4/0.4.
-    Accepts pandas or polars DataFrame (prices at month end).
-    """
-    if monthly is None:
-        return pd.Series(dtype=float)
-
-    monthly = _to_pandas(monthly)
-    if not isinstance(monthly, pd.DataFrame) or monthly.shape[0] < 13:
-        return pd.Series(dtype=float)
-
-    # Ensure chronological order
-    try:
-        monthly = monthly.sort_index()
-    except Exception:
-        pass
-
-    cols = monthly.columns
-    r3 = monthly.pct_change(3).iloc[-1]
-    r6 = monthly.pct_change(6).iloc[-1]
-    r12 = monthly.pct_change(12).iloc[-1]
-
-    z3 = _zscore_series(r3, cols)
-    z6 = _zscore_series(r6, cols)
-    z12 = _zscore_series(r12, cols)
-
-    return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
-
-
-def lowvol_z(
-    daily: pd.DataFrame | "pl.DataFrame",
-    vol_series: pd.Series | "pl.Series" | None = None,
-) -> pd.Series:
-    """
-    Low-volatility factor as a z-score of 63-day rolling std of daily returns.
-    If 'vol_series' is given (precomputed vol), z-score that instead.
-    Accepts pandas or polars inputs.
-    """
-    if daily is None:
-        return pd.Series(dtype=float)
-
-    daily = _to_pandas(daily)
-    vol_series = _to_pandas(vol_series)
-
-    if not isinstance(daily, pd.DataFrame):
-        return pd.Series(dtype=float)
-    cols = daily.columns
-
-    # Use precomputed vol if provided
-    if vol_series is not None:
-        return _zscore_series(pd.Series(vol_series), cols)
-
-    if daily.shape[0] < 80:  # need enough data for a stable 63d window
-        return pd.Series(0.0, index=cols)
-
-    vol = (
-        daily.pct_change()
-        .rolling(63)
-        .std()
-        .iloc[-1]
-        .replace([np.inf, -np.inf], np.nan)
-    )
-    return _zscore_series(vol, cols)
-
-
-def trend_z(
-    daily: pd.DataFrame | "pl.DataFrame",
-    dist_series: pd.Series | "pl.Series" | None = None,
-) -> pd.Series:
-    """
-    Trend factor as z-score of distance from 200DMA: (last / MA200 - 1).
-    If 'dist_series' is given, z-score that instead.
-    Accepts pandas or polars inputs.
-    """
-    if daily is None:
-        return pd.Series(dtype=float)
-
-    daily = _to_pandas(daily)
-    dist_series = _to_pandas(dist_series)
-
-    if not isinstance(daily, pd.DataFrame):
-        return pd.Series(dtype=float)
-    cols = daily.columns
-
-    # Use precomputed distance if provided
-    if dist_series is not None:
-        return _zscore_series(pd.Series(dist_series), cols)
-
-    if daily.shape[0] < 220:  # ensure we have >=200d + buffer
-        return pd.Series(0.0, index=cols)
-
-    ma200 = daily.rolling(200).mean().iloc[-1]
-    last = daily.iloc[-1]
-    dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
-    return _zscore_series(dist, cols)
-
 def composite_score(daily: pd.DataFrame, panels: Dict[str, pd.DataFrame | pd.Series] | None = None) -> pd.Series:
     panels = compute_signal_panels(daily) if panels is None else panels
     monthly = panels.get("monthly", pd.DataFrame())
@@ -2846,6 +2871,7 @@ def run_momentum_composite_param(
             comp = comp_all.iloc[-1].dropna()
         else:
             comp = pd.Series(comp_all).dropna()
+        comp_full = comp.copy()
 
         if comp.empty:
             rets.loc[m] = 0.0
@@ -2853,10 +2879,25 @@ def run_momentum_composite_param(
             prev_w = pd.Series(dtype=float)
             continue
 
-        # Restrict to positive blended momentum universe
+        # Restrict to momentum names using adaptive cutoff and fallbacks
         momz = blended_momentum_z(hist.resample("M").last())
-        comp = comp.reindex(momz.index).dropna()
-        sel  = comp[momz > 0].dropna()
+        base_comp = comp_full
+        if isinstance(momz, pd.Series) and not momz.empty:
+            comp_aligned = comp_full.reindex(momz.index).dropna()
+            aligned_momz = momz.reindex(comp_aligned.index)
+            valid_momz = aligned_momz.dropna()
+            cutoff = 0.0
+            if not valid_momz.empty:
+                median_val = float(valid_momz.median())
+                cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
+            sel = comp_aligned[aligned_momz > cutoff].dropna()
+            base_comp = comp_aligned if not comp_aligned.empty else comp_full
+        else:
+            sel = base_comp.copy()
+
+        if sel.empty:
+            sel = base_comp.nlargest(top_n)
+
         if sel.empty:
             rets.loc[m] = 0.0
             tno.loc[m]  = 0.0
@@ -2874,6 +2915,9 @@ def run_momentum_composite_param(
                 picks = filtered
             else:
                 picks = sel.nlargest(top_n)  # fallback if stickiness empties set
+
+        if picks.empty:
+            picks = base_comp.nlargest(top_n)
 
         # Optional: signal decay shaping
         if use_enhanced_features:
@@ -2935,6 +2979,7 @@ def run_momentum_composite_param(
                 regime_metrics  = compute_regime_metrics(hist)
                 regime_exposure = get_regime_adjusted_exposure(regime_metrics)
                 w = w * regime_exposure
+                w = w / w.sum() if w.sum() > 0 else w
             except Exception as e:
                 logging.warning("R01 regime exposure scaling failed in simulation", exc_info=True)
 
@@ -3042,11 +3087,21 @@ def _build_isa_weights_fixed(
         else:
             raise
     comp_vec = comp_all.iloc[-1].dropna() if isinstance(comp_all, pd.DataFrame) else pd.Series(comp_all).dropna()
+    comp_vec_full = comp_vec.copy()
 
     momz = blended_momentum_z(monthly)
-    pos_idx = momz[momz > 0].index
-    comp_vec = comp_vec.reindex(pos_idx).dropna()
-    top_m = comp_vec.nlargest(preset["mom_topn"]) if not comp_vec.empty else pd.Series(dtype=float)
+    filtered = comp_vec_full.copy()
+    if isinstance(momz, pd.Series) and not momz.empty:
+        aligned_momz = momz.reindex(filtered.index)
+        valid_momz = aligned_momz.dropna()
+        cutoff = 0.0
+        if not valid_momz.empty:
+            median_val = float(valid_momz.median())
+            cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
+        filtered = filtered[aligned_momz > cutoff].dropna()
+    if filtered.empty:
+        filtered = comp_vec_full
+    top_m = filtered.nlargest(preset["mom_topn"]) if not filtered.empty else pd.Series(dtype=float)
 
     # Stickiness filter (keep names that have persisted in the top set)
     try:
@@ -3070,6 +3125,9 @@ def _build_isa_weights_fixed(
         filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
         if not filtered.empty:
             top_m = filtered
+
+    if top_m.empty:
+        top_m = comp_vec_full.nlargest(preset["mom_topn"]) if not comp_vec_full.empty else pd.Series(dtype=float)
 
     # Raw momentum weights (scaled by sleeve weight)
     mom_raw = (top_m / top_m.sum()) * preset["mom_w"] if not top_m.empty and top_m.sum() > 0 else pd.Series(dtype=float)
@@ -3119,7 +3177,7 @@ def _build_isa_weights_fixed(
         group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
     )
 
-    return final_weights
+    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
 
 def check_constraint_violations(
     weights: pd.Series,
@@ -3268,6 +3326,7 @@ def generate_live_portfolio_isa_monthly(
         try:
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
             new_w = new_w * float(regime_exposure)
+            new_w = new_w / new_w.sum() if new_w.sum() > 0 else new_w
         except Exception:
             logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
