@@ -2155,7 +2155,7 @@ from typing import List, Tuple
 
 def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
     """Return the actual start date to use when downloading data."""
-months_back = max(14, 6 if PERF.get("fast_io") else 14)
+    months_back = max(14, 6 if PERF.get("fast_io") else 14)
 
     try:
         start_ts = pd.to_datetime(start_date)
