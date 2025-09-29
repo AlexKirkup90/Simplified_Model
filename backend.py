@@ -3053,7 +3053,7 @@ def _build_isa_weights_fixed(
         stable_iter = momentum_stable_names(
             daily_close,
             top_n=preset["mom_topn"],
-            days=preset.get("stickiness_days", 7),  # <- align key name with the rest of the app
+            days=preset.get("stability_days", preset.get("stickiness_days", 7)),
             panels=panels,
         )
     except TypeError as exc:
@@ -3061,7 +3061,7 @@ def _build_isa_weights_fixed(
             stable_iter = momentum_stable_names(
                 daily_close,
                 top_n=preset["mom_topn"],
-                days=preset.get("stickiness_days", 7),
+                days=preset.get("stability_days", preset.get("stickiness_days", 7)),
             )
         else:
             raise
@@ -3197,6 +3197,7 @@ def generate_live_portfolio_isa_monthly(
 
     # build params from preset, then override with UI/session values
     params["stability_days"] = int(stickiness_days)
+    params["stickiness_days"] = int(stickiness_days)
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(mom_cap)
     
