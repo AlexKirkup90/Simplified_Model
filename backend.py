@@ -547,15 +547,21 @@ def _polars_to_pandas_indexed(df: "pl.DataFrame") -> pd.DataFrame:
     return pdf.sort_index()
 
 # ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
+# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
 
 def _to_pandas(obj):
     """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
-    if _HAS_POLARS:
-        if isinstance(obj, pl.DataFrame):
-            return obj.to_pandas()
-        if isinstance(obj, pl.Series):
-            return obj.to_pandas()
+    if obj is None:
+        return None
+    try:
+        if '_HAS_POLARS' in globals() and _HAS_POLARS and 'pl' in globals():
+            if isinstance(obj, pl.DataFrame) or isinstance(obj, pl.Series):
+                return obj.to_pandas()
+    except Exception:
+        # Fall through to return original object
+        pass
     return obj
+
 
 def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
     """
@@ -585,6 +591,7 @@ def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
     z12 = _zscore_series(r12, cols)
 
     return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
+
 
 def lowvol_z(
     daily: pd.DataFrame | "pl.DataFrame",
@@ -621,6 +628,7 @@ def lowvol_z(
     )
     return _zscore_series(vol, cols)
 
+
 def trend_z(
     daily: pd.DataFrame | "pl.DataFrame",
     dist_series: pd.Series | "pl.Series" | None = None,
@@ -651,54 +659,7 @@ def trend_z(
     last = daily.iloc[-1]
     dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
     return _zscore_series(dist, cols)
-
-@st.cache_data(ttl=43200)
-def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
-    """Cache common signal inputs derived from daily close data."""
-    if daily is None or daily.empty:
-        empty_df = pd.DataFrame()
-        return {
-            "monthly": empty_df,
-            "r3": empty_df,
-            "r6": empty_df,
-            "r12": empty_df,
-            "vol63": empty_df,
-            "ma200": empty_df,
-            "dist200": empty_df,
-        }
-
-    # If your codebase has a helper to decide when to use Polars, keep it:
-    # otherwise you can guard directly with _HAS_POLARS.
-    if '_use_polars_engine' in globals() and callable(globals()['_use_polars_engine']):
-        use_polars = _use_polars_engine()
-    else:
-        use_polars = False
-
-# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
-
-# Optional Polars support (convert to pandas if provided)
-try:  # don't hard-require polars
-    import polars as pl  # type: ignore
-    _HAS_POLARS = True
-except Exception:
-    pl = None  # type: ignore
-    _HAS_POLARS = False
-
-
-def _to_pandas(obj):
-    """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
-    if _HAS_POLARS:
-        try:
-            if isinstance(obj, pl.DataFrame):
-                return obj.to_pandas()
-            if isinstance(obj, pl.Series):
-                return obj.to_pandas()
-        except Exception:
-            # Fall through to return original object
-            pass
-    return obj
-
-
+  
 def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
     """
     Blended momentum z-score using 3/6/12M horizons with weights 0.2/0.4/0.4.
@@ -727,7 +688,6 @@ def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
     z12 = _zscore_series(r12, cols)
 
     return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
-
 
 def lowvol_z(
     daily: pd.DataFrame | "pl.DataFrame",
@@ -767,7 +727,6 @@ def lowvol_z(
     )
     return _zscore_series(vol, cols)
 
-
 def trend_z(
     daily: pd.DataFrame | "pl.DataFrame",
     dist_series: pd.Series | "pl.Series" | None = None,
@@ -779,7 +738,6 @@ def trend_z(
     """
     if daily is None:
         return pd.Series(dtype=float)
-
     daily = _to_pandas(daily)
     dist_series = _to_pandas(dist_series)
 
@@ -802,7 +760,7 @@ def trend_z(
     dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
     return _zscore_series(dist, cols)
 
-
+@st.cache_data(ttl=43200)
 def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
     """Cache common signal inputs derived from daily close data."""
     if daily is None or daily.empty:
@@ -817,10 +775,23 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
             "dist200": empty_df,
         }
 
-    # Respect an existing engine switch if your codebase defines it
-    if '_use_polars_engine' in globals() and callable(globals()['_use_polars_engine']):
-        use_polars = _use_polars_engine()
-    else:
+    # ---- Normalize index (unique, sorted, datetime) ----
+    try:
+        if "_ensure_unique_sorted_index" in globals() and callable(globals()["_ensure_unique_sorted_index"]):
+            daily = _ensure_unique_sorted_index(daily)
+        else:
+            daily = daily.copy()
+            daily.index = pd.to_datetime(daily.index, errors="coerce")
+            daily = daily[~daily.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        daily = daily.sort_index()
+
+    # ---- Prefer Polars path if engine switch exists and returns True ----
+    use_polars = False
+    try:
+        if "_use_polars_engine" in globals() and callable(globals()["_use_polars_engine"]):
+            use_polars = bool(_use_polars_engine())
+    except Exception:
         use_polars = False
 
     if use_polars:
@@ -829,7 +800,7 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
         except Exception:
             logging.exception("Falling back to pandas signal panel computation")
 
-    # --- pandas fallback ---
+    # ---- pandas fallback ----
     daily_sorted = daily.sort_index()
     monthly = daily_sorted.resample("M").last()
     r3 = daily_sorted.pct_change(63)
@@ -850,9 +821,31 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
         "dist200": dist200,
     }
 
-# =========================
-# Data cleaning helpers (robust capping + interpolation)
-# =========================
+    if _use_polars_engine():
+        try:
+            return _compute_signal_panels_polars(daily)
+        except Exception:
+            logging.exception("Falling back to pandas signal panel computation")
+
+    daily_sorted = daily
+    monthly = daily_sorted.resample("M").last()
+    r3 = daily_sorted.pct_change(63)
+    r6 = daily_sorted.pct_change(126)
+    r12 = daily_sorted.pct_change(252)
+    daily_returns = daily_sorted.pct_change()
+    vol63 = daily_returns.rolling(63).std()
+    ma200 = daily_sorted.rolling(200).mean()
+    dist200 = (daily_sorted / ma200 - 1).replace([np.inf, -np.inf], np.nan)
+
+    return {
+        "monthly": monthly,
+        "r3": r3,
+        "r6": r6,
+        "r12": r12,
+        "vol63": vol63,
+        "ma200": ma200,
+        "dist200": dist200,
+    }
 
 def _robust_return_stats(returns: pd.Series) -> tuple[float, float]:
     """Robust location/scale (median & MAD*1.4826) with sane fallbacks."""
@@ -1757,6 +1750,20 @@ def _safe_series(obj):
 def to_yahoo_symbol(sym: str) -> str:
     return str(sym).strip().upper().replace(".", "-")
 
+def _ensure_unique_sorted_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df with a strictly unique, sorted DatetimeIndex (keeps last duplicate)."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    try:
+        if not isinstance(df.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+            df.index = pd.to_datetime(df.index, errors="coerce")
+    except Exception:
+        pass
+
+    df = df[~df.index.duplicated(keep="last")]
+    return df.sort_index()
+
 def _chunk_tickers(tickers: List[str], size: Optional[int] = None):
     chunk_size = int(size) if size else int(PERF["yf_batch"])
     if chunk_size <= 0:
@@ -2184,13 +2191,11 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
     """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
     cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
 
-    # Try local disk cache first (Parquet -> Pickle)
     cached = _read_cached_dataframe(cache_path)
     if cached is not None:
-        return cached
+        return _ensure_unique_sorted_index(cached)
 
     try:
-        # Pull an extended window only when downstream calculations require it
         fetch_start = _resolve_fetch_start(start_date, end_date)
 
         frames: List[pd.DataFrame] = []
@@ -2204,19 +2209,22 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
             if isinstance(df, pd.Series):
                 df = df.to_frame()
                 df.columns = [batch[0]]
+
+            df = _ensure_unique_sorted_index(df)
             frames.append(df)
 
         if not frames:
             return pd.DataFrame()
 
         data = pd.concat(frames, axis=1)
+        data = _ensure_unique_sorted_index(data)
         result = data.dropna(axis=1, how="all")
 
-        # Enhanced data cleaning pipeline (true linear interpolation on short gaps, etc.)
         if not result.empty:
             cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(result, info=logging.info)
 
-            # Log a brief cleaning summary (top 2 alerts)
+            cleaned_result = _ensure_unique_sorted_index(cleaned_result)
+
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:
                     logging.info("Data cleaning: %s", alert)
@@ -2224,7 +2232,6 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
             _write_cached_dataframe(cleaned_result, cache_path)
             return cleaned_result
 
-        # Fallback: write whatever we got
         _write_cached_dataframe(result, cache_path)
         return result
 
@@ -2237,16 +2244,18 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
     """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit."""
     cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
 
-    # Try local disk cache first (Parquet -> Pickle)
     combined = _read_cached_dataframe(cache_path)
     if combined is not None:
         if isinstance(combined.columns, pd.MultiIndex):
             needed = {"Close", "Volume"}
             have = set(combined.columns.get_level_values(0))
             if needed.issubset(have):
-                return combined["Close"], combined["Volume"]
+                close = _ensure_unique_sorted_index(combined["Close"])
+                vol = _ensure_unique_sorted_index(combined["Volume"])
+                return close, vol
         else:
             if {"Close", "Volume"}.issubset(combined.columns):
+                combined = _ensure_unique_sorted_index(combined)
                 return combined["Close"], combined["Volume"]
 
     try:
@@ -2277,6 +2286,9 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     close_part.columns = [batch[0]]
                     vol_part.columns = [batch[0]]
 
+            close_part = _ensure_unique_sorted_index(close_part)
+            vol_part = _ensure_unique_sorted_index(vol_part)
+
             close_frames.append(close_part)
             vol_frames.append(vol_part)
 
@@ -2285,13 +2297,17 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
         close = pd.concat(close_frames, axis=1).dropna(axis=1, how="all")
         vol = pd.concat(vol_frames, axis=1)
+
+        close = _ensure_unique_sorted_index(close)
+        vol = _ensure_unique_sorted_index(vol)
+
         vol = vol.reindex_like(close).fillna(0)
 
-        # Enhanced cleaning for prices
         if not close.empty:
             cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
 
-            # Mild cleaning for volume: align and clip extreme spikes (99th pct)
+            cleaned_close = _ensure_unique_sorted_index(cleaned_close)
+
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
             for col in vol_aligned.columns:
                 col_data = vol_aligned[col]
@@ -2303,11 +2319,14 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 for alert in close_alerts[:1]:
                     logging.info("Price/Volume cleaning: %s", alert)
 
-            _write_cached_dataframe(pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1), cache_path)
+            combined_out = pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1)
+            combined_out = _ensure_unique_sorted_index(combined_out)
+            _write_cached_dataframe(combined_out, cache_path)
             return cleaned_close, vol_aligned
 
-        # Fallback: cache raw combined
-        _write_cached_dataframe(pd.concat({"Close": close, "Volume": vol}, axis=1), cache_path)
+        combined_out = pd.concat({"Close": close, "Volume": vol}, axis=1)
+        combined_out = _ensure_unique_sorted_index(combined_out)
+        _write_cached_dataframe(combined_out, cache_path)
         return close, vol
 
     except Exception as e:
@@ -2676,7 +2695,6 @@ def _compute_signal_panels_polars(
     }
 
 @st.cache_data(ttl=43200)
-@st.cache_data(ttl=43200)
 def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
     """Cache common signal inputs derived from daily close data."""
     if daily is None or daily.empty:
@@ -2691,12 +2709,14 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
             "dist200": empty_df,
         }
 
-    if _use_polars_engine():
+    # If your codebase has a Polars engine switch, respect it; otherwise fallback to pandas.
+    if "_use_polars_engine" in globals() and callable(globals()["_use_polars_engine"]) and _use_polars_engine():
         try:
             return _compute_signal_panels_polars(daily)
         except Exception:
             logging.exception("Falling back to pandas signal panel computation")
 
+    # --- pandas fallback ---
     daily_sorted = daily.sort_index()
     monthly = daily_sorted.resample("M").last()
     r3 = daily_sorted.pct_change(63)
@@ -2717,16 +2737,19 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
         "dist200": dist200,
     }
 
-
 # ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
 
 def _to_pandas(obj):
     """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
-    if _HAS_POLARS:
-        if isinstance(obj, pl.DataFrame):
-            return obj.to_pandas()
-        if isinstance(obj, pl.Series):
-            return obj.to_pandas()
+    if "_HAS_POLARS" in globals() and _HAS_POLARS:
+        try:
+            if isinstance(obj, pl.DataFrame):
+                return obj.to_pandas()
+            if isinstance(obj, pl.Series):
+                return obj.to_pandas()
+        except Exception:
+            # Fall through to return original object
+            pass
     return obj
 
 
@@ -2781,7 +2804,10 @@ def lowvol_z(
 
     # Use precomputed vol if provided
     if vol_series is not None:
-        return _zscore_series(pd.Series(vol_series), cols)
+        try:
+            return _zscore_series(pd.Series(vol_series), cols)
+        except Exception:
+            pass
 
     if daily.shape[0] < 80:  # need enough data for a stable 63d window
         return pd.Series(0.0, index=cols)
@@ -2817,7 +2843,10 @@ def trend_z(
 
     # Use precomputed distance if provided
     if dist_series is not None:
-        return _zscore_series(pd.Series(dist_series), cols)
+        try:
+            return _zscore_series(pd.Series(dist_series), cols)
+        except Exception:
+            pass
 
     if daily.shape[0] < 220:  # ensure we have >=200d + buffer
         return pd.Series(0.0, index=cols)
