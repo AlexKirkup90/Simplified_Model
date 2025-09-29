@@ -3186,12 +3186,16 @@ def generate_live_portfolio_isa_monthly(
     within this routine.
     """
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
-    stickiness_days = st.session_state.get("stickiness_days", preset.get("stability_days", 7))
-    sector_cap      = st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))
-    mom_cap         = st.session_state.get("name_cap", preset.get("mom_cap", 0.25))
+    base_params = STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+    params = dict(preset)
+    for key, value in base_params.items():
+        params.setdefault(key, value)
+
+    stickiness_days = st.session_state.get("stickiness_days", params.get("stability_days", 7))
+    sector_cap      = st.session_state.get("sector_cap", params.get("sector_cap", 0.30))
+    mom_cap         = st.session_state.get("name_cap", params.get("mom_cap", 0.25))
 
     # build params from preset, then override with UI/session values
-    params = dict(STRATEGY_PRESETS["ISA Dynamic (0.75)"])
     params["stability_days"] = int(stickiness_days)
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(mom_cap)

@@ -87,3 +87,22 @@ def test_fresh_portfolio_respects_caps(monkeypatch):
 
     assert raw_w.max() <= preset["mom_cap"] + 1e-12
     assert raw_w.groupby(sector_series).sum().max() <= preset["sector_cap"] + 1e-12
+
+
+def test_custom_preset_caps_respected(monkeypatch):
+    st.session_state.clear()
+    sectors = _mock_env(monkeypatch)
+    base = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
+    preset = dict(base)
+    preset["mom_cap"] = 0.12
+    preset["sector_cap"] = 0.45
+
+    disp, raw, decision = backend.generate_live_portfolio_isa_monthly(
+        preset, None, as_of=date(2024, 6, 17)
+    )
+
+    raw_w = raw["Weight"].astype(float)
+    sector_series = pd.Series(sectors)
+
+    assert raw_w.max() <= preset["mom_cap"] + 1e-12
+    assert raw_w.groupby(sector_series).sum().max() <= preset["sector_cap"] + 1e-12
