@@ -73,7 +73,39 @@ def save_backtest_cache(cache_key: str, payload: Dict[str, Any]) -> None:
 # 1) Universe & Data
 # ------------------------------
 
-_YF_BATCH_SIZE = 200
+# --- Ticker sanitation / blocklist ---
+# Keep this small & focused; extend if you find other chronic offenders.
+_TICKER_BLOCKLIST = {
+    "", "GEV", "SOLV", "EXE"  # empty + frequent non-US/illiquid/delisted symbols from NDX feeds
+}
+
+
+def _sanitize_tickers(tickers: Iterable[str]) -> list[str]:
+    """Clean raw ticker lists: strip, upper, drop empties/blocklisted/non-US suffixes, dedupe."""
+    cleaned: list[str] = []
+    for t in (tickers or []):
+        if not isinstance(t, str):
+            continue
+        s = t.strip().upper()
+        if not s or s in _TICKER_BLOCKLIST:
+            continue
+        # Drop common non-US suffixes that Yahoo often lacks in US datasets
+        if s.endswith((
+            ".L", ".PA", ".TO", ".V", ".HK", ".SW", ".MI", ".BR", ".AS", ".HE", ".CO", ".OL"
+        )):
+            continue
+        cleaned.append(s)
+    # Deduplicate while preserving insertion order
+    seen = set()
+    deduped: list[str] = []
+    for s in cleaned:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    return deduped
+
+
+_YF_BATCH_SIZE = 50
 
 
 def _chunk_tickers(tickers: List[str], size: int = _YF_BATCH_SIZE):
@@ -90,13 +122,19 @@ _NDX_LAST_SUCCESS: List[str] = []
 def _fetch_market_data_cached(
     tickers_key: tuple[str, ...], start_key: str, end_key: Optional[str]
 ) -> pd.DataFrame:
-    """Cached yfinance download for adjusted Close."""
-    tickers = list(tickers_key)
+    """Cached yfinance download for adjusted Close (robust to bad tickers / rate limits)."""
+    tickers = _sanitize_tickers(list(tickers_key))
     if not tickers:
         return pd.DataFrame()
 
-    frames: List[pd.DataFrame] = []
-    for batch in _chunk_tickers(tickers):
+    frames: list[pd.DataFrame] = []
+    bad: set[str] = set()
+
+    for batch in _chunk_tickers(tickers, size=_YF_BATCH_SIZE):
+        batch = [t for t in batch if t]
+        if not batch:
+            continue
+
         try:
             data = yf.download(
                 batch,
@@ -105,30 +143,63 @@ def _fetch_market_data_cached(
                 auto_adjust=True,
                 progress=False,
                 group_by="ticker",
+                threads=False,
             )["Close"]
         except TypeError:
-            # older yfinance versions without group_by arg
             data = yf.download(
                 batch,
                 start=start_key,
                 end=end_key,
                 auto_adjust=True,
                 progress=False,
+                threads=False,
             )["Close"]
+        except Exception:
+            for t in batch:
+                try:
+                    ser = yf.download(
+                        t,
+                        start=start_key,
+                        end=end_key,
+                        auto_adjust=True,
+                        progress=False,
+                        threads=False,
+                    )["Close"]
+                    if isinstance(ser, pd.Series) and not ser.dropna().empty:
+                        frames.append(ser.to_frame(name=t))
+                    else:
+                        bad.add(t)
+                except Exception:
+                    bad.add(t)
+            continue
 
         if isinstance(data, pd.Series):
-            data = data.to_frame()
-            data.columns = [batch[0]]
+            if not data.dropna().empty:
+                frames.append(data.to_frame(name=batch[0]))
+            else:
+                bad.add(batch[0])
+            continue
 
-        frames.append(data)
+        if isinstance(data, pd.DataFrame):
+            df = data.dropna(how="all", axis=1)
+            if not df.empty:
+                frames.append(df)
+            for t in set(batch) - set(df.columns):
+                bad.add(t)
 
     if not frames:
         return pd.DataFrame()
 
     df = pd.concat(frames, axis=1)
-    if df.shape[1] == 1 and len(tickers) == 1:
-        df.columns = [tickers[0]]
-    return df.dropna(how="all", axis=1)
+    df = df.dropna(how="all", axis=1)
+
+    min_rows = 120
+    if df.shape[0] >= min_rows:
+        good_cols = [c for c in df.columns if df[c].count() >= min_rows // 2]
+        df = df[good_cols]
+
+    df = df.loc[:, sorted(df.columns)]
+    return df
 
 
 def get_nasdaq_100_plus_tickers(
@@ -171,21 +242,42 @@ def get_nasdaq_100_plus_tickers(
     tickers = _NDX_CONSTITUENT_CACHE.get(date_str, [])
     if "SQ" in extras:
         extras = [x for x in extras if x != "SQ"]  # renamed/acquired
-    return sorted(set(tickers + extras))
+
+    tickers = _sanitize_tickers(tickers + extras)
+
+    if "QQQ" not in tickers:
+        tickers.append("QQQ")
+
+    return sorted(set(tickers))
 
 
 def fetch_market_data(
     tickers: Iterable[str], start_date: str, end_date: Optional[str] = None
 ) -> pd.DataFrame:
     """Fetch daily split/dividend-adjusted close prices (cached)."""
-    tickers_tuple = tuple(pd.Index(tickers).astype(str)) if tickers else tuple()
+    tickers_tuple = tuple(_sanitize_tickers(tickers)) if tickers else tuple()
     if not tickers_tuple:
         return pd.DataFrame()
 
     start_key = pd.to_datetime(start_date).strftime("%Y-%m-%d")
     end_key = pd.to_datetime(end_date).strftime("%Y-%m-%d") if end_date else None
     df = _fetch_market_data_cached(tickers_tuple, start_key, end_key)
-    return df.copy()  # defensive copy so callers can't mutate cache
+    if "QQQ" not in df.columns:
+        try:
+            qqq = yf.download(
+                "QQQ",
+                start=start_key,
+                end=end_key,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )["Close"]
+            if isinstance(qqq, pd.Series) and not qqq.dropna().empty:
+                df = pd.concat([df, qqq.to_frame(name="QQQ")], axis=1)
+        except Exception:
+            pass
+
+    return df.copy()
 
 
 # ------------------------------

@@ -46,6 +46,13 @@ import strategy_core
 from strategy_core import HybridConfig
 from portfolio_utils import cap_weights, l1_turnover
 
+# Bridge to strategy_core sanitizer to keep a single source of truth
+try:
+    from strategy_core import _sanitize_tickers as _sc_sanitize_tickers  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - fallback if module layout changes
+    def _sc_sanitize_tickers(tickers: Iterable[str]) -> list[str]:
+        return sorted({(str(x).strip().upper()) for x in (tickers or []) if str(x).strip()})
+
 warnings.filterwarnings("ignore")
 
 # =========================
@@ -547,7 +554,6 @@ def _polars_to_pandas_indexed(df: "pl.DataFrame") -> pd.DataFrame:
     return pdf.sort_index()
 
 # ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
-# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
 
 def _to_pandas(obj):
     """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
@@ -614,7 +620,11 @@ def lowvol_z(
 
     # Use precomputed vol if provided
     if vol_series is not None:
-        return _zscore_series(pd.Series(vol_series), cols)
+        try:
+            return _zscore_series(pd.Series(vol_series), cols)
+        except Exception:
+            # fall through to compute from daily
+            pass
 
     if daily.shape[0] < 80:  # need enough data for a stable 63d window
         return pd.Series(0.0, index=cols)
@@ -650,7 +660,11 @@ def trend_z(
 
     # Use precomputed distance if provided
     if dist_series is not None:
-        return _zscore_series(pd.Series(dist_series), cols)
+        try:
+            return _zscore_series(pd.Series(dist_series), cols)
+        except Exception:
+            # fall through to compute from daily
+            pass
 
     if daily.shape[0] < 220:  # ensure we have >=200d + buffer
         return pd.Series(0.0, index=cols)
@@ -707,12 +721,13 @@ def lowvol_z(
     if not isinstance(daily, pd.DataFrame):
         return pd.Series(dtype=float)
     cols = daily.columns
-
+    
     # Use precomputed vol if provided
     if vol_series is not None:
         try:
             return _zscore_series(pd.Series(vol_series), cols)
         except Exception:
+            # fall through to compute from daily
             pass
 
     if daily.shape[0] < 80:  # need enough data for a stable 63d window
@@ -750,6 +765,7 @@ def trend_z(
         try:
             return _zscore_series(pd.Series(dist_series), cols)
         except Exception:
+            # fall through to compute from daily
             pass
 
     if daily.shape[0] < 220:  # ensure we have >=200d + buffer
@@ -820,7 +836,7 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
         "ma200": ma200,
         "dist200": dist200,
     }
-
+  
     if _use_polars_engine():
         try:
             return _compute_signal_panels_polars(daily)
@@ -2124,14 +2140,21 @@ def _prepare_universe_for_backtest(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str], str]:
     """Fetches prices/volumes, applies Hybrid150 filter if needed, with enhanced data cleaning."""
     base_tickers, base_sectors, label = get_universe(universe_choice)
+    tickers = _sc_sanitize_tickers(base_tickers)
+    if "QQQ" not in tickers:
+        tickers.append("QQQ")
+    base_sectors = {t: base_sectors.get(t, "Unknown") for t in tickers if t != "QQQ"}
     if not base_tickers:
         return pd.DataFrame(), pd.DataFrame(), {}, label
 
-    close, vol = fetch_price_volume(base_tickers + ["QQQ"], start_date, end_date)
+    close, vol = fetch_price_volume(tickers, start_date, end_date)
     if close.empty or "QQQ" not in close.columns:
         return pd.DataFrame(), pd.DataFrame(), {}, label
 
     # Enhanced data validation is now built into fetch_price_volume
+    close = close.loc[:, [c for c in close.columns if c in tickers]]
+    if isinstance(vol, pd.DataFrame) and not vol.empty:
+        vol = vol.loc[:, [c for c in vol.columns if c in tickers]]
     sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns if t != "QQQ"}
 
     if label == "Hybrid Top150":
@@ -2189,17 +2212,34 @@ def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
     """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
-    cache_path = _parquet_cache_path("market", tickers, start_date, end_date)
+    safe = _sc_sanitize_tickers(tickers)
+    if "QQQ" not in safe:
+        safe.append("QQQ")
+
+    cache_path = _parquet_cache_path("market", safe, start_date, end_date)
+
+    def _maybe_add_qqq(df: pd.DataFrame) -> pd.DataFrame:
+        if "QQQ" in df.columns:
+            return df
+        try:
+            qqq_df = strategy_core.fetch_market_data(["QQQ"], start_date, end_date)
+            if not qqq_df.empty and "QQQ" in qqq_df.columns:
+                df = pd.concat([df, qqq_df[["QQQ"]]], axis=1)
+        except Exception:
+            pass
+        return df
 
     cached = _read_cached_dataframe(cache_path)
     if cached is not None:
-        return _ensure_unique_sorted_index(cached)
+        cached = _ensure_unique_sorted_index(cached)
+        cached = cached.loc[:, cached.columns.intersection(safe)]
+        return _maybe_add_qqq(cached)
 
     try:
         fetch_start = _resolve_fetch_start(start_date, end_date)
 
         frames: List[pd.DataFrame] = []
-        for batch in _chunk_tickers(tickers):
+        for batch in _chunk_tickers(safe):
             try:
                 raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
             except Exception:
@@ -2219,21 +2259,23 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         data = pd.concat(frames, axis=1)
         data = _ensure_unique_sorted_index(data)
         result = data.dropna(axis=1, how="all")
+        result = result.loc[:, result.columns.intersection(safe)]
 
         if not result.empty:
             cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(result, info=logging.info)
 
             cleaned_result = _ensure_unique_sorted_index(cleaned_result)
+<            cleaned_result = cleaned_result.loc[:, cleaned_result.columns.intersection(safe)]
 
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:
                     logging.info("Data cleaning: %s", alert)
 
             _write_cached_dataframe(cleaned_result, cache_path)
-            return cleaned_result
+            return _maybe_add_qqq(cleaned_result)
 
         _write_cached_dataframe(result, cache_path)
-        return result
+        return _maybe_add_qqq(result)
 
     except Exception as e:
         st.error(f"Failed to download market data: {e}")
@@ -2242,21 +2284,56 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit."""
-    cache_path = _parquet_cache_path("price_volume", tickers, start_date, end_date)
+    safe = _sc_sanitize_tickers(tickers)
+    if "QQQ" not in safe:
+        safe.append("QQQ")
+
+    cache_path = _parquet_cache_path("price_volume", safe, start_date, end_date)
 
     combined = _read_cached_dataframe(cache_path)
-    if combined is not None:
+    def _maybe_add_qqq(close_df: pd.DataFrame, vol_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if "QQQ" not in close_df.columns:
+            try:
+                qqq_close = strategy_core.fetch_market_data(["QQQ"], start_date, end_date)
+                if not qqq_close.empty and "QQQ" in qqq_close.columns:
+                    close_df = pd.concat([close_df, qqq_close[["QQQ"]]], axis=1)
+            except Exception:
+                pass
+        if "QQQ" not in vol_df.columns:
+            try:
+                qqq_vol = yf.download(
+                    "QQQ",
+                    start=start_date,
+                    end=end_date,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )["Volume"]
+                if isinstance(qqq_vol, pd.Series) and not qqq_vol.dropna().empty:
+                    vol_df = pd.concat([vol_df, qqq_vol.to_frame(name="QQQ")], axis=1)
+            except Exception:
+                pass
+        return close_df, vol_df
+
+       if combined is not None:
         if isinstance(combined.columns, pd.MultiIndex):
             needed = {"Close", "Volume"}
             have = set(combined.columns.get_level_values(0))
             if needed.issubset(have):
-                close = _ensure_unique_sorted_index(combined["Close"])
-                vol = _ensure_unique_sorted_index(combined["Volume"])
-                return close, vol
+                close = _ensure_unique_sorted_index(
+                    combined["Close"].loc[:, combined["Close"].columns.intersection(safe)]
+                )
+                vol = _ensure_unique_sorted_index(
+                    combined["Volume"].loc[:, combined["Volume"].columns.intersection(safe)]
+                )
+                return _maybe_add_qqq(close, vol)
         else:
-            if {"Close", "Volume"}.issubset(combined.columns):
+            # Flat columns
+            if {"Close", "Volume"}.issubset(set(map(str, combined.columns))):
                 combined = _ensure_unique_sorted_index(combined)
-                return combined["Close"], combined["Volume"]
+                close = combined["Close"].loc[:, combined["Close"].columns.intersection(safe)]
+                vol = combined["Volume"].loc[:, combined["Volume"].columns.intersection(safe)]
+                return _maybe_add_qqq(close, vol)
 
     try:
         fetch_start = _resolve_fetch_start(start_date, end_date)
@@ -2264,7 +2341,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         close_frames: List[pd.DataFrame] = []
         vol_frames: List[pd.DataFrame] = []
 
-        for batch in _chunk_tickers(tickers):
+        for batch in _chunk_tickers(safe):
             try:
                 raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
             except Exception:
@@ -2303,6 +2380,9 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
 
         vol = vol.reindex_like(close).fillna(0)
 
+        close = close.loc[:, [c for c in close.columns if c in safe]]
+        vol = vol.loc[:, [c for c in vol.columns if c in safe]]
+        
         if not close.empty:
             cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
 
@@ -2319,11 +2399,14 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 for alert in close_alerts[:1]:
                     logging.info("Price/Volume cleaning: %s", alert)
 
+            cleaned_close, vol_aligned = _maybe_add_qqq(cleaned_close, vol_aligned)
+            
             combined_out = pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1)
             combined_out = _ensure_unique_sorted_index(combined_out)
             _write_cached_dataframe(combined_out, cache_path)
             return cleaned_close, vol_aligned
 
+        close, vol = _maybe_add_qqq(close, vol)
         combined_out = pd.concat({"Close": close, "Volume": vol}, axis=1)
         combined_out = _ensure_unique_sorted_index(combined_out)
         _write_cached_dataframe(combined_out, cache_path)
@@ -2736,6 +2819,7 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
         "ma200": ma200,
         "dist200": dist200,
     }
+
 
 # ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
 
@@ -3330,6 +3414,10 @@ def generate_live_portfolio_isa_monthly(
     
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
+    base_tickers = _sc_sanitize_tickers(base_tickers)
+    if "QQQ" not in base_tickers:
+        base_tickers.append("QQQ")
+    base_sectors = {t: base_sectors.get(t, "Unknown") for t in base_tickers}
     if not base_tickers:
         return None, None, "No universe available."
 
