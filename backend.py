@@ -2223,7 +2223,8 @@ from typing import List, Tuple
 
 def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
     """Return the actual start date to use when downloading data."""
-    months_back = 14
+months_back = 6 if PERF.get("fast_io") else 14
+months_back = max(months_back, 14)
 
     try:
         start_ts = pd.to_datetime(start_date)
@@ -2788,6 +2789,115 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
     }
 
 
+# ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
+
+def _to_pandas(obj):
+    """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
+    if _HAS_POLARS:
+        if isinstance(obj, pl.DataFrame):
+            return obj.to_pandas()
+        if isinstance(obj, pl.Series):
+            return obj.to_pandas()
+    return obj
+
+
+def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
+    """
+    Blended momentum z-score using 3/6/12M horizons with weights 0.2/0.4/0.4.
+    Accepts pandas or polars DataFrame (prices at month end).
+    """
+    if monthly is None:
+        return pd.Series(dtype=float)
+
+    monthly = _to_pandas(monthly)
+    if not isinstance(monthly, pd.DataFrame) or monthly.shape[0] < 13:
+        return pd.Series(dtype=float)
+
+    # Ensure chronological order
+    try:
+        monthly = monthly.sort_index()
+    except Exception:
+        pass
+
+    cols = monthly.columns
+    r3 = monthly.pct_change(3).iloc[-1]
+    r6 = monthly.pct_change(6).iloc[-1]
+    r12 = monthly.pct_change(12).iloc[-1]
+
+    z3 = _zscore_series(r3, cols)
+    z6 = _zscore_series(r6, cols)
+    z12 = _zscore_series(r12, cols)
+
+    return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
+
+
+def lowvol_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    vol_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    """
+    Low-volatility factor as a z-score of 63-day rolling std of daily returns.
+    If 'vol_series' is given (precomputed vol), z-score that instead.
+    Accepts pandas or polars inputs.
+    """
+    if daily is None:
+        return pd.Series(dtype=float)
+
+    daily = _to_pandas(daily)
+    vol_series = _to_pandas(vol_series)
+
+    if not isinstance(daily, pd.DataFrame):
+        return pd.Series(dtype=float)
+    cols = daily.columns
+
+    # Use precomputed vol if provided
+    if vol_series is not None:
+        return _zscore_series(pd.Series(vol_series), cols)
+
+    if daily.shape[0] < 80:  # need enough data for a stable 63d window
+        return pd.Series(0.0, index=cols)
+
+    vol = (
+        daily.pct_change()
+        .rolling(63)
+        .std()
+        .iloc[-1]
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    return _zscore_series(vol, cols)
+
+
+def trend_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    dist_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    """
+    Trend factor as z-score of distance from 200DMA: (last / MA200 - 1).
+    If 'dist_series' is given, z-score that instead.
+    Accepts pandas or polars inputs.
+    """
+    if daily is None:
+        return pd.Series(dtype=float)
+
+    daily = _to_pandas(daily)
+    dist_series = _to_pandas(dist_series)
+
+    if not isinstance(daily, pd.DataFrame):
+        return pd.Series(dtype=float)
+    cols = daily.columns
+
+    # Use precomputed distance if provided
+    if dist_series is not None:
+        return _zscore_series(pd.Series(dist_series), cols)
+
+    if daily.shape[0] < 220:  # ensure we have >=200d + buffer
+        return pd.Series(0.0, index=cols)
+
+    ma200 = daily.rolling(200).mean().iloc[-1]
+    last = daily.iloc[-1]
+    dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
+    return _zscore_series(dist, cols)
+  
 def composite_score(daily: pd.DataFrame, panels: Dict[str, pd.DataFrame | pd.Series] | None = None) -> pd.Series:
     panels = compute_signal_panels(daily) if panels is None else panels
     monthly = panels.get("monthly", pd.DataFrame())
