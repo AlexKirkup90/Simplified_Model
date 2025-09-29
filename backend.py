@@ -747,6 +747,163 @@ def _trend_z_polars(
     return _polars_zscore_from_last_row(dist_pl, columns)
 
 
+def _ensure_pandas(obj: Any) -> Any:
+    """Convert Polars objects to pandas equivalents when possible."""
+    if obj is None:
+        return None
+    if isinstance(obj, (pd.Series, pd.DataFrame)):
+        return obj
+    if _HAS_POLARS:
+        try:
+            if isinstance(obj, pl.DataFrame):
+                return obj.to_pandas()
+            if isinstance(obj, pl.Series):
+                return obj.to_pandas()
+        except Exception:
+            logging.debug("Polars → pandas conversion failed; leaving object unchanged", exc_info=True)
+    return obj
+
+
+def _blended_momentum_z_pandas(monthly: Any) -> pd.Series:
+    monthly_pd = _ensure_pandas(monthly)
+    if not isinstance(monthly_pd, pd.DataFrame) or monthly_pd.empty:
+        return pd.Series(dtype=float)
+
+    try:
+        monthly_pd = monthly_pd.sort_index()
+    except Exception:
+        pass
+
+    if monthly_pd.shape[0] < 13:
+        return pd.Series(dtype=float)
+
+    cols = monthly_pd.columns
+    r3 = monthly_pd.pct_change(3).iloc[-1]
+    r6 = monthly_pd.pct_change(6).iloc[-1]
+    r12 = monthly_pd.pct_change(12).iloc[-1]
+
+    z3 = _zscore_series(r3, cols)
+    z6 = _zscore_series(r6, cols)
+    z12 = _zscore_series(r12, cols)
+
+    return 0.2 * z3 + 0.4 * z6 + 0.4 * z12
+
+
+def _lowvol_z_pandas(
+    daily: Any,
+    vol_series: Any = None,
+) -> pd.Series:
+    daily_pd = _ensure_pandas(daily)
+    vol_pd = _ensure_pandas(vol_series)
+
+    if not isinstance(daily_pd, pd.DataFrame):
+        return pd.Series(dtype=float)
+
+    cols = daily_pd.columns
+
+    if vol_pd is not None:
+        try:
+            vol_series_pd = pd.Series(vol_pd)
+        except Exception:
+            vol_series_pd = None
+        if isinstance(vol_series_pd, pd.Series):
+            return _zscore_series(vol_series_pd, cols)
+
+    if daily_pd.shape[0] < 80:
+        return pd.Series(0.0, index=cols)
+
+    vol = (
+        daily_pd.pct_change()
+        .rolling(63)
+        .std()
+        .iloc[-1]
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    return _zscore_series(vol, cols)
+
+
+def _trend_z_pandas(
+    daily: Any,
+    dist_series: Any = None,
+) -> pd.Series:
+    daily_pd = _ensure_pandas(daily)
+    dist_pd = _ensure_pandas(dist_series)
+
+    if not isinstance(daily_pd, pd.DataFrame):
+        return pd.Series(dtype=float)
+
+    cols = daily_pd.columns
+
+    if dist_pd is not None:
+        try:
+            dist_series_pd = pd.Series(dist_pd)
+        except Exception:
+            dist_series_pd = None
+        if isinstance(dist_series_pd, pd.Series):
+            return _zscore_series(dist_series_pd, cols)
+
+    if daily_pd.shape[0] < 220:
+        return pd.Series(0.0, index=cols)
+
+    ma200 = daily_pd.rolling(200).mean().iloc[-1]
+    last = daily_pd.iloc[-1]
+    dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
+    return _zscore_series(dist, cols)
+
+
+def blended_momentum_z(monthly: pd.DataFrame | "pl.DataFrame") -> pd.Series:
+    if monthly is None:
+        return pd.Series(dtype=float)
+
+    if _use_polars_engine():
+        try:
+            polars_res = _blended_momentum_z_polars(monthly)
+            if isinstance(polars_res, pd.Series):
+                return polars_res
+            if polars_res is not None:
+                return pd.Series(polars_res)
+        except Exception:
+            logging.exception("Polars momentum z failed; falling back to pandas")
+
+    return _blended_momentum_z_pandas(monthly)
+
+
+def lowvol_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    vol_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    if daily is None:
+        return pd.Series(dtype=float)
+
+    if _use_polars_engine():
+        try:
+            polars_res = _lowvol_z_polars(daily, vol_series)
+            if isinstance(polars_res, pd.Series):
+                return polars_res
+        except Exception:
+            logging.exception("Polars low-vol z failed; falling back to pandas")
+
+    return _lowvol_z_pandas(daily, vol_series)
+
+
+def trend_z(
+    daily: pd.DataFrame | "pl.DataFrame",
+    dist_series: pd.Series | "pl.Series" | None = None,
+) -> pd.Series:
+    if daily is None:
+        return pd.Series(dtype=float)
+
+    if _use_polars_engine():
+        try:
+            polars_res = _trend_z_polars(daily, dist_series)
+            if isinstance(polars_res, pd.Series):
+                return polars_res
+        except Exception:
+            logging.exception("Polars trend z failed; falling back to pandas")
+
+    return _trend_z_pandas(daily, dist_series)
+
+
 # =========================
 # Data cleaning helpers (robust capping + interpolation)
 # =========================
@@ -2066,8 +2223,8 @@ from typing import List, Tuple
 
 def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
     """Return the actual start date to use when downloading data."""
-    months_back = 6 if PERF.get("fast_io") else 14
-    months_back = max(months_back, 14)
+months_back = 6 if PERF.get("fast_io") else 14
+months_back = max(months_back, 14)
 
     try:
         start_ts = pd.to_datetime(start_date)
@@ -2634,7 +2791,6 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
 
 # ---------- Factor z-score helpers (Pandas-first, optional Polars input) ----------
 
-
 def _to_pandas(obj):
     """Convert Polars DataFrame/Series to pandas if needed; otherwise return as-is."""
     if _HAS_POLARS:
@@ -2741,7 +2897,7 @@ def trend_z(
     last = daily.iloc[-1]
     dist = (last / ma200 - 1.0).replace([np.inf, -np.inf], np.nan)
     return _zscore_series(dist, cols)
-
+  
 def composite_score(daily: pd.DataFrame, panels: Dict[str, pd.DataFrame | pd.Series] | None = None) -> pd.Series:
     panels = compute_signal_panels(daily) if panels is None else panels
     monthly = panels.get("monthly", pd.DataFrame())
