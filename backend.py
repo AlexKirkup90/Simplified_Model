@@ -3200,6 +3200,19 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
     med = median_dollar_volume(close_df, vol_df, window=60)
     return med[med >= min_dollar].index.tolist()
 
+def _prune_price_history(daily_close: pd.DataFrame, min_days: int = 220) -> pd.DataFrame:
+    """Remove tickers lacking ``min_days`` of finite price history."""
+    if daily_close is None:
+        return pd.DataFrame()
+
+    if daily_close.empty:
+        return daily_close.copy()
+
+    threshold = min(int(min_days), len(daily_close))
+    finite_counts = daily_close.apply(lambda s: np.isfinite(s).sum())
+    keep_cols = finite_counts[finite_counts >= threshold].index
+    return daily_close.loc[:, list(keep_cols)].copy()
+
 def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
     """Fetch basic fundamental metrics for the given tickers."""
     rows = []
@@ -3485,6 +3498,9 @@ def generate_live_portfolio_isa_monthly(
     if not keep:
         return None, None, "No tickers pass quality filter."
     close = close[keep]
+    close = _prune_price_history(close)
+    if close.empty:
+        raise ValueError("No tickers have sufficient price history after applying filters.")
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
     # Expose the price index for downstream processes (e.g. save gating)
@@ -3834,6 +3850,11 @@ def run_backtest_isa_dynamic(
             return None, None, None, None, None, pd.DataFrame()
         daily = daily[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
+
+    daily = _prune_price_history(daily)
+    if daily.empty:
+        raise ValueError("No tickers have sufficient price history after applying filters.")
+    sectors_map = {t: sectors_map.get(t, "Unknown") for t in daily.columns}
 
     optimization_cfg: Optional[HybridConfig] = None
     search_diagnostics = pd.DataFrame()
