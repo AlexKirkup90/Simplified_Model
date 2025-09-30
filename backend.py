@@ -2284,58 +2284,81 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit."""
+    """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit.
+
+    Returns
+    -------
+    close_df : DataFrame
+        Adjusted Close prices (columns=tickers).
+    vol_df   : DataFrame
+        Raw Volume (columns=tickers) aligned to close_df.
+    """
+    # ---- sanitize + ensure QQQ in the universe ----
     safe = _sc_sanitize_tickers(tickers)
     if "QQQ" not in safe:
         safe.append("QQQ")
 
     cache_path = _parquet_cache_path("price_volume", safe, start_date, end_date)
 
-    combined = _read_cached_dataframe(cache_path)
+    # ---- local helper: ensure QQQ exists in both frames (best-effort) ----
     def _maybe_add_qqq(close_df: pd.DataFrame, vol_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        # Add QQQ Close if missing
         if "QQQ" not in close_df.columns:
             try:
                 qqq_close = strategy_core.fetch_market_data(["QQQ"], start_date, end_date)
-                if not qqq_close.empty and "QQQ" in qqq_close.columns:
+                if isinstance(qqq_close, pd.DataFrame) and not qqq_close.empty and "QQQ" in qqq_close.columns:
                     close_df = pd.concat([close_df, qqq_close[["QQQ"]]], axis=1)
             except Exception:
                 pass
+
+        # Add QQQ Volume if missing
         if "QQQ" not in vol_df.columns:
             try:
-                qqq_vol = yf.download(
+                qqq_raw = yf.download(
                     "QQQ",
                     start=start_date,
                     end=end_date,
                     auto_adjust=False,
                     progress=False,
                     threads=False,
-                )["Volume"]
-                if isinstance(qqq_vol, pd.Series) and not qqq_vol.dropna().empty:
-                    vol_df = pd.concat([vol_df, qqq_vol.to_frame(name="QQQ")], axis=1)
+                )
+                if isinstance(qqq_raw, pd.DataFrame) and "Volume" in qqq_raw.columns:
+                    qqq_vol = qqq_raw["Volume"]
+                    if isinstance(qqq_vol, pd.Series) and not qqq_vol.dropna().empty:
+                        vol_df = pd.concat([vol_df, qqq_vol.to_frame(name="QQQ")], axis=1)
             except Exception:
                 pass
+
         return close_df, vol_df
 
-       if combined is not None:
+    # ---- cache hit: return quickly if we can ----
+    combined = _read_cached_dataframe(cache_path)
+    if combined is not None:
+        # yfinance-style cached layout: either MultiIndex (Close/Volume) or flat columns
         if isinstance(combined.columns, pd.MultiIndex):
             needed = {"Close", "Volume"}
             have = set(combined.columns.get_level_values(0))
             if needed.issubset(have):
-                close = _ensure_unique_sorted_index(
-                    combined["Close"].loc[:, combined["Close"].columns.intersection(safe)]
-                )
-                vol = _ensure_unique_sorted_index(
-                    combined["Volume"].loc[:, combined["Volume"].columns.intersection(safe)]
-                )
+                close = _ensure_unique_sorted_index(combined["Close"])
+                vol = _ensure_unique_sorted_index(combined["Volume"])
+                # prune to safe tickers
+                close = close.loc[:, close.columns.intersection(safe)]
+                vol = vol.loc[:, vol.columns.intersection(safe)]
                 return _maybe_add_qqq(close, vol)
         else:
-            # Flat columns
-            if {"Close", "Volume"}.issubset(set(map(str, combined.columns))):
+            # Flat: expect two top-level columns 'Close' and 'Volume'
+            flat_cols = set(map(str, combined.columns))
+            if {"Close", "Volume"}.issubset(flat_cols):
                 combined = _ensure_unique_sorted_index(combined)
-                close = combined["Close"].loc[:, combined["Close"].columns.intersection(safe)]
-                vol = combined["Volume"].loc[:, combined["Volume"].columns.intersection(safe)]
+                close = combined["Close"]
+                vol = combined["Volume"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.loc[:, close.columns.intersection(safe)]
+                if isinstance(vol, pd.DataFrame):
+                    vol = vol.loc[:, vol.columns.intersection(safe)]
                 return _maybe_add_qqq(close, vol)
 
+    # ---- no cache or unusable cache: download ----
     try:
         fetch_start = _resolve_fetch_start(start_date, end_date)
 
@@ -2343,12 +2366,14 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         vol_frames: List[pd.DataFrame] = []
 
         for batch in _chunk_tickers(safe):
+            # Robust download (parallel, then fallback)
             try:
                 raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
             except Exception:
                 raw = _yf_download(batch, start=fetch_start, end=end_date)
 
-            df = raw[["Close", "Volume"]]
+            # Expect either MultiIndex with ['Close','Volume'] or flat DataFrame with those cols
+            df = raw[["Close", "Volume"]] if isinstance(raw, pd.DataFrame) else raw
             if isinstance(df, pd.Series):
                 df = df.to_frame()
 
@@ -2360,6 +2385,7 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     continue
                 close_part = df[["Close"]].copy()
                 vol_part = df[["Volume"]].copy()
+                # Single-ticker normalization
                 if len(batch) == 1:
                     close_part.columns = [batch[0]]
                     vol_part.columns = [batch[0]]
@@ -2373,26 +2399,28 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         if not close_frames:
             return pd.DataFrame(), pd.DataFrame()
 
+        # Concatenate & align
         close = pd.concat(close_frames, axis=1).dropna(axis=1, how="all")
         vol = pd.concat(vol_frames, axis=1)
 
         close = _ensure_unique_sorted_index(close)
         vol = _ensure_unique_sorted_index(vol)
-
         vol = vol.reindex_like(close).fillna(0)
 
-        close = close.loc[:, [c for c in close.columns if c in safe]]
-        vol = vol.loc[:, [c for c in vol.columns if c in safe]]
-        
+        # Restrict to safe tickers
+        close = close.loc[:, close.columns.intersection(safe)]
+        vol = vol.loc[:, vol.columns.intersection(safe)]
+
+        # ---- clean prices; winsorize volumes; write cache ----
         if not close.empty:
             cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
-
             cleaned_close = _ensure_unique_sorted_index(cleaned_close)
 
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
+            # Light winsorization of volume spikes to tame outliers for plotting/use
             for col in vol_aligned.columns:
                 col_data = vol_aligned[col]
-                if len(col_data.dropna()) > 0:
+                if col_data.notna().any():
                     q99 = col_data.quantile(0.99)
                     vol_aligned[col] = col_data.clip(lower=0, upper=q99)
 
@@ -2400,13 +2428,15 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 for alert in close_alerts[:1]:
                     logging.info("Price/Volume cleaning: %s", alert)
 
+            # Ensure QQQ present
             cleaned_close, vol_aligned = _maybe_add_qqq(cleaned_close, vol_aligned)
-            
+
             combined_out = pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1)
             combined_out = _ensure_unique_sorted_index(combined_out)
             _write_cached_dataframe(combined_out, cache_path)
             return cleaned_close, vol_aligned
 
+        # Fallback: no cleaning possible, still ensure QQQ & cache
         close, vol = _maybe_add_qqq(close, vol)
         combined_out = pd.concat({"Close": close, "Volume": vol}, axis=1)
         combined_out = _ensure_unique_sorted_index(combined_out)
