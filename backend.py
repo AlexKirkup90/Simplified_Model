@@ -2255,17 +2255,18 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
         if not frames:
             return pd.DataFrame()
-
+            
         data = pd.concat(frames, axis=1)
         data = _ensure_unique_sorted_index(data)
         result = data.dropna(axis=1, how="all")
         result = result.loc[:, result.columns.intersection(safe)]
 
         if not result.empty:
-            cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(result, info=logging.info)
-
+            cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(
+                result, info=logging.info
+            )
             cleaned_result = _ensure_unique_sorted_index(cleaned_result)
-<            cleaned_result = cleaned_result.loc[:, cleaned_result.columns.intersection(safe)]
+            cleaned_result = cleaned_result.loc[:, cleaned_result.columns.intersection(safe)]
 
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:
