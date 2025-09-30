@@ -3413,6 +3413,65 @@ def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
     display_fmt["Weight"] = display_fmt["Weight"].map("{:.2%}".format)
     return display_fmt, display_df
 
+
+def _store_live_prune_meta(meta: Dict[str, Any]) -> None:
+    """Persist the latest price-history pruning metadata for UI diagnostics."""
+
+    try:
+        eligible_raw = list(meta.get("eligible_tickers") or [])
+        dropped_raw = list(meta.get("dropped_tickers") or [])
+
+        def _filter(items: List[str]) -> List[str]:
+            seen: dict[str, None] = {}
+            out: List[str] = []
+            for item in items:
+                if item in {"QQQ", HEDGE_TICKER_LABEL}:
+                    continue
+                if item not in seen:
+                    seen[item] = None
+                    out.append(item)
+            return out
+
+        eligible = _filter(eligible_raw)
+        dropped = _filter(dropped_raw)
+        st.session_state["live_prune_meta"] = {
+            "eligible_tickers": list(eligible),
+            "eligible_count": int(len(eligible)),
+            "dropped_tickers": list(dropped),
+        }
+    except Exception:
+        # Streamlit session state may be unavailable in some non-UI contexts
+        return
+
+
+def _prune_price_history(
+    prices: Optional[pd.DataFrame],
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Drop unusable price columns and return (pruned_prices, metadata)."""
+
+    if prices is None:
+        empty = pd.DataFrame()
+        meta = {"eligible_tickers": [], "eligible_count": 0, "dropped_tickers": []}
+        return empty, meta
+
+    original_cols = list(getattr(prices, "columns", []))
+    if not original_cols:
+        meta = {"eligible_tickers": [], "eligible_count": 0, "dropped_tickers": []}
+        return prices.copy(), meta
+
+    pruned = prices.copy()
+    # Drop columns that are entirely missing; retain the remainder unchanged
+    valid_cols = pruned.columns[pruned.notna().any()].tolist()
+    pruned = pruned.loc[:, valid_cols]
+
+    dropped = sorted({c for c in original_cols if c not in valid_cols})
+    meta = {
+        "eligible_tickers": valid_cols,
+        "eligible_count": len(valid_cols),
+        "dropped_tickers": dropped,
+    }
+    return pruned, meta
+
 def generate_live_portfolio_isa_monthly(
     preset: Dict,
     prev_portfolio: Optional[pd.DataFrame],
@@ -3427,6 +3486,8 @@ def generate_live_portfolio_isa_monthly(
     Cap trimming leaves residual cash until the final exposure scaling performed
     within this routine.
     """
+    _store_live_prune_meta({"eligible_tickers": [], "dropped_tickers": []})
+
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     base_params = STRATEGY_PRESETS["ISA Dynamic (0.75)"]
     params = dict(preset)
@@ -3450,6 +3511,7 @@ def generate_live_portfolio_isa_monthly(
         base_tickers.append("QQQ")
     base_sectors = {t: base_sectors.get(t, "Unknown") for t in base_tickers}
     if not base_tickers:
+        _store_live_prune_meta({"eligible_tickers": [], "dropped_tickers": []})
         return None, None, "No universe available."
 
     today = as_of or date.today()
@@ -3458,6 +3520,10 @@ def generate_live_portfolio_isa_monthly(
     end   = today.strftime("%Y-%m-%d")
     close, vol = fetch_price_volume(base_tickers, start, end)
     if close.empty:
+        _store_live_prune_meta({
+            "eligible_tickers": [],
+            "dropped_tickers": [t for t in base_tickers if t != "QQQ"],
+        })
         return None, None, "No price data."
 
     # Special: Hybrid Top150 → reduce by 60d median dollar volume
@@ -3473,6 +3539,10 @@ def generate_live_portfolio_isa_monthly(
     if min_dollar_volume > 0:
         keep = filter_by_liquidity(close, vol, min_dollar_volume)
         if not keep:
+            _store_live_prune_meta({
+                "eligible_tickers": [],
+                "dropped_tickers": [t for t in close.columns if t != "QQQ"],
+            })
             return None, None, "No tickers pass liquidity filter."
         close = close[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
@@ -3483,9 +3553,19 @@ def generate_live_portfolio_isa_monthly(
     fundamentals = fetch_fundamental_metrics(close.columns.tolist())
     keep = fundamental_quality_filter(fundamentals, min_profitability=min_prof, max_leverage=max_lev)
     if not keep:
+        _store_live_prune_meta({
+            "eligible_tickers": [],
+            "dropped_tickers": [t for t in close.columns if t != "QQQ"],
+        })
         return None, None, "No tickers pass quality filter."
     close = close[keep]
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
+
+    close, prune_meta = _prune_price_history(close)
+    sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
+    _store_live_prune_meta(prune_meta)
+    if close.empty:
+        return None, None, "No eligible tickers after price history pruning."
 
     # Expose the price index for downstream processes (e.g. save gating)
     st.session_state["latest_price_index"] = close.index
