@@ -329,13 +329,29 @@ def build_momentum_weights(
 ) -> Tuple[pd.Series, pd.Series]:
     """Compute momentum weights at the *last* month-end; returns (weights, selected_scores)."""
     scores = momentum_signals(monthly_prices, lookback_m)
-    scores = scores[scores > 0]
-    if scores.empty:
+    positive = scores[scores > 0]
+    top_source = positive if not positive.empty else scores
+    top = pd.to_numeric(top_source, errors="coerce").dropna()
+    top = top.nlargest(top_n)
+    if top.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float)
-    top = scores.nlargest(top_n)
-    raw = top / top.sum()
+
+    total = top.sum()
+    if total > 0:
+        raw = top / total
+    else:
+        raw = pd.Series(1.0 / len(top), index=top.index) if len(top) else pd.Series(dtype=float)
+
     capped = cap_weights(raw, cap=cap)
-    final_w = capped / capped.sum()
+    capped_total = capped.sum()
+    if capped_total > 0:
+        final_w = capped / capped_total
+    else:
+        final_w = (
+            pd.Series(1.0 / len(capped), index=capped.index)
+            if len(capped)
+            else pd.Series(dtype=float)
+        )
     return final_w, top
 
 
@@ -385,17 +401,29 @@ def run_backtest_momentum(
         if get_constituents is not None:
             members = set(get_constituents(dt))
             scores = scores.loc[scores.index.intersection(members)]
-        scores = scores[scores > 0]
+        positive = scores[scores > 0]
+        usable = positive if not positive.empty else scores
+        usable = pd.to_numeric(usable, errors="coerce").dropna()
+        top = usable.nlargest(top_n)
 
-        if scores.empty:
+        if top.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0 if prev is None else float(l1_turnover(prev, pd.Series(dtype=float)))
             prev = None
             continue
 
-        top = scores.nlargest(top_n)
-        raw = top / top.sum()
+        total = top.sum()
+        if total > 0:
+            raw = top / total
+        else:
+            raw = pd.Series(1.0 / len(top), index=top.index) if len(top) else pd.Series(dtype=float)
+
         w = cap_weights(raw, cap=cap)
+        cap_total = w.sum()
+        if cap_total > 0:
+            w = w / cap_total
+        else:
+            w = pd.Series(1.0 / len(w), index=w.index) if len(w) else pd.Series(dtype=float)
 
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
@@ -445,13 +473,29 @@ def build_predictive_weights(
 ) -> Tuple[pd.Series, pd.Series]:
     """Compute weights from :func:`predictive_signals`; returns (weights, selected_scores)."""
     scores = predictive_signals(monthly_prices, lookback_m)
-    scores = scores[scores > 0]
-    if scores.empty:
+    positive = scores[scores > 0]
+    top_source = positive if not positive.empty else scores
+    top = pd.to_numeric(top_source, errors="coerce").dropna()
+    top = top.nlargest(top_n)
+    if top.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float)
-    top = scores.nlargest(top_n)
-    raw = top / top.sum() if top.sum() != 0 else pd.Series(1.0 / len(top), index=top.index)
+
+    total = top.sum()
+    if total > 0:
+        raw = top / total
+    else:
+        raw = pd.Series(1.0 / len(top), index=top.index) if len(top) else pd.Series(dtype=float)
+
     capped = cap_weights(raw, cap=cap)
-    final_w = capped / capped.sum()
+    capped_total = capped.sum()
+    if capped_total > 0:
+        final_w = capped / capped_total
+    else:
+        final_w = (
+            pd.Series(1.0 / len(capped), index=capped.index)
+            if len(capped)
+            else pd.Series(dtype=float)
+        )
     return final_w, top
 
 
@@ -484,18 +528,29 @@ def run_backtest_predictive(
         if get_constituents is not None:
             members = set(get_constituents(dt))
             scores = scores.loc[scores.index.intersection(members)]
-        scores = scores[scores > 0]
+        positive = scores[scores > 0]
+        usable = positive if not positive.empty else scores
+        usable = pd.to_numeric(usable, errors="coerce").dropna()
+        top = usable.nlargest(top_n)
 
-        if scores.empty:
+        if top.empty:
             rets.loc[dt] = 0.0
             tno.loc[dt] = 0.0
             prev = None
             continue
 
-        top = scores.nlargest(top_n)
-        raw = top / top.sum()
+        total = top.sum()
+        if total > 0:
+            raw = top / total
+        else:
+            raw = pd.Series(1.0 / len(top), index=top.index) if len(top) else pd.Series(dtype=float)
+
         w = cap_weights(raw, cap=cap)
-        w = w / w.sum()
+        cap_total = w.sum()
+        if cap_total > 0:
+            w = w / cap_total
+        else:
+            w = pd.Series(1.0 / len(w), index=w.index) if len(w) else pd.Series(dtype=float)
 
         valid = w.index.intersection(future.columns)
         if get_constituents is not None:
