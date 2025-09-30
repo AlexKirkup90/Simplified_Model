@@ -1780,18 +1780,56 @@ def to_yahoo_symbol(sym: str) -> str:
     return str(sym).strip().upper().replace(".", "-")
 
 def _ensure_unique_sorted_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Return df with a strictly unique, sorted DatetimeIndex (keeps last duplicate)."""
-    if not isinstance(df, pd.DataFrame) or df.empty:
+    """Return a copy with datetime index coerced, deduped (keep last), and sorted."""
+    if df is None or not hasattr(df, "empty") or df.empty:
         return df
 
+    out = df.copy()
     try:
-        if not isinstance(df.index, (pd.DatetimeIndex, pd.PeriodIndex)):
-            df.index = pd.to_datetime(df.index, errors="coerce")
+        out.index = pd.to_datetime(out.index, errors="coerce")
     except Exception:
         pass
 
-    df = df[~df.index.duplicated(keep="last")]
-    return df.sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    return out.sort_index()
+
+
+def _normalize_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Upper-case, trim, and dedupe ticker columns (keep last)."""
+    if df is None or not hasattr(df, "empty") or df.empty:
+        return df
+
+    out = df.copy()
+    try:
+        cols = [str(col).strip().upper() for col in out.columns]
+        out.columns = pd.Index(cols)
+    except Exception:
+        return out
+
+    return out.loc[:, ~out.columns.duplicated(keep="last")]
+
+
+def _soft_prune_history(
+    df: pd.DataFrame,
+    *,
+    min_days: int = 180,
+    max_missing_frac: float = 0.60,
+) -> pd.DataFrame:
+    """Leniently drop sparse tickers; keep top history coverage if all pruned."""
+    if df is None or not hasattr(df, "empty") or df.empty:
+        return df
+
+    total = df.shape[0]
+    valid = df.notna().sum()
+    miss_frac = 1.0 - (valid / max(total, 1))
+    keep = (valid >= min_days) & (miss_frac <= max_missing_frac)
+    kept = df.loc[:, keep]
+
+    if kept.empty and df.shape[1] > 0:
+        top = valid.sort_values(ascending=False).head(min(50, len(valid))).index
+        kept = df.loc[:, top]
+
+    return kept
 
 def _chunk_tickers(tickers: List[str], size: Optional[int] = None):
     chunk_size = int(size) if size else int(PERF["yf_batch"])
@@ -2203,21 +2241,18 @@ def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
     try:
         start_ts = pd.to_datetime(start_date)
     except Exception:
-        # If parsing fails, fall back to the provided start string.
         return start_date
 
-    extend_window = False
+    extend = False
     if end_date:
         try:
             end_ts = pd.to_datetime(end_date)
+            if pd.notna(end_ts):
+                extend = (end_ts - start_ts).days >= REGIME_MA
         except Exception:
-            end_ts = None
-        if end_ts is not None and not pd.isna(end_ts):
-            # Extend only when the requested window is long enough to
-            # benefit downstream rolling calculations (e.g., 200DMA).
-            extend_window = (end_ts - start_ts) >= pd.Timedelta(days=REGIME_MA)
+            extend = False
 
-    if extend_window:
+    if extend:
         start_ts = start_ts - pd.DateOffset(months=months_back)
 
     return start_ts.strftime("%Y-%m-%d")
@@ -2297,26 +2332,19 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
 @st.cache_data(ttl=43200)
 def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Download Close & Volume for tickers, clean/prune, and cache combined frame to disk & Streamlit.
+    """Download Close & Volume for tickers with lenient pruning and safe alignment."""
 
-    Returns
-    -------
-    close_df : DataFrame
-        Adjusted Close prices (columns=tickers).
-    vol_df   : DataFrame
-        Raw Volume (columns=tickers) aligned to close_df.
-    """
-    # ---- sanitize + ensure QQQ in the universe ----
-    safe = _sc_sanitize_tickers(tickers)
+    safe = sorted(set(_sc_sanitize_tickers(tickers)))
     if "QQQ" not in safe:
         safe.append("QQQ")
 
     cache_path = _parquet_cache_path("price_volume", safe, start_date, end_date)
 
-    # ---- local helper: ensure QQQ exists in both frames (best-effort) ----
     def _maybe_add_qqq(close_df: pd.DataFrame, vol_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        # Add QQQ Close if missing
-        if "QQQ" not in close_df.columns:
+        if close_df is None or vol_df is None:
+            return close_df, vol_df
+
+        if "QQQ" not in getattr(close_df, "columns", []):
             try:
                 qqq_close = strategy_core.fetch_market_data(["QQQ"], start_date, end_date)
                 if isinstance(qqq_close, pd.DataFrame) and not qqq_close.empty and "QQQ" in qqq_close.columns:
@@ -2324,10 +2352,9 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
             except Exception:
                 pass
 
-        # Add QQQ Volume if missing
-        if "QQQ" not in vol_df.columns:
+        if "QQQ" not in getattr(vol_df, "columns", []):
             try:
-                qqq_raw = yf.download(
+                qqq = yf.download(
                     "QQQ",
                     start=start_date,
                     end=end_date,
@@ -2335,131 +2362,123 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     progress=False,
                     threads=False,
                 )
-                if isinstance(qqq_raw, pd.DataFrame) and "Volume" in qqq_raw.columns:
-                    qqq_vol = qqq_raw["Volume"]
-                    if isinstance(qqq_vol, pd.Series) and not qqq_vol.dropna().empty:
-                        vol_df = pd.concat([vol_df, qqq_vol.to_frame(name="QQQ")], axis=1)
+                if isinstance(qqq, pd.DataFrame) and "Volume" in qqq.columns:
+                    vol_df = pd.concat([vol_df, qqq["Volume"].to_frame("QQQ")], axis=1)
             except Exception:
                 pass
 
         return close_df, vol_df
 
-    # ---- cache hit: return quickly if we can ----
     combined = _read_cached_dataframe(cache_path)
     if combined is not None:
-        # yfinance-style cached layout: either MultiIndex (Close/Volume) or flat columns
+        combined = _ensure_unique_sorted_index(combined)
         if isinstance(combined.columns, pd.MultiIndex):
-            needed = {"Close", "Volume"}
-            have = set(combined.columns.get_level_values(0))
-            if needed.issubset(have):
-                close = _ensure_unique_sorted_index(combined["Close"])
-                vol = _ensure_unique_sorted_index(combined["Volume"])
-                # prune to safe tickers
+            levels = set(combined.columns.get_level_values(0))
+            if {"Close", "Volume"}.issubset(levels):
+                close = _normalize_ticker_columns(combined["Close"])
+                vol = _normalize_ticker_columns(combined["Volume"])
                 close = close.loc[:, close.columns.intersection(safe)]
                 vol = vol.loc[:, vol.columns.intersection(safe)]
-                return _maybe_add_qqq(close, vol)
+                close, vol = _maybe_add_qqq(close, vol)
+                close = _normalize_ticker_columns(_ensure_unique_sorted_index(close))
+                vol = _normalize_ticker_columns(_ensure_unique_sorted_index(vol))
+                vol = vol.reindex(index=close.index)
+                vol = vol.reindex(columns=close.columns).fillna(0)
+                return close, vol
         else:
-            # Flat: expect two top-level columns 'Close' and 'Volume'
-            flat_cols = set(map(str, combined.columns))
-            if {"Close", "Volume"}.issubset(flat_cols):
-                combined = _ensure_unique_sorted_index(combined)
+            flat = set(map(str, combined.columns))
+            if {"Close", "Volume"}.issubset(flat):
                 close = combined["Close"]
                 vol = combined["Volume"]
-                if isinstance(close, pd.DataFrame):
-                    close = close.loc[:, close.columns.intersection(safe)]
-                if isinstance(vol, pd.DataFrame):
-                    vol = vol.loc[:, vol.columns.intersection(safe)]
-                return _maybe_add_qqq(close, vol)
+                if isinstance(close, pd.Series):
+                    close = close.to_frame()
+                if isinstance(vol, pd.Series):
+                    vol = vol.to_frame()
+                close = _normalize_ticker_columns(_ensure_unique_sorted_index(close))
+                vol = _normalize_ticker_columns(_ensure_unique_sorted_index(vol))
+                close = close.loc[:, close.columns.intersection(safe)]
+                vol = vol.loc[:, vol.columns.intersection(safe)]
+                close, vol = _maybe_add_qqq(close, vol)
+                close = _normalize_ticker_columns(_ensure_unique_sorted_index(close))
+                vol = _normalize_ticker_columns(_ensure_unique_sorted_index(vol))
+                vol = vol.reindex(index=close.index)
+                vol = vol.reindex(columns=close.columns).fillna(0)
+                return close, vol
 
-    # ---- no cache or unusable cache: download ----
     try:
         fetch_start = _resolve_fetch_start(start_date, end_date)
-
-        close_frames: List[pd.DataFrame] = []
-        vol_frames: List[pd.DataFrame] = []
+        close_parts: List[pd.DataFrame] = []
+        vol_parts: List[pd.DataFrame] = []
 
         for batch in _chunk_tickers(safe):
-            # Robust download (parallel, then fallback)
             try:
                 raw = parallel_yf_download(batch, start=fetch_start, end=end_date)
             except Exception:
                 raw = _yf_download(batch, start=fetch_start, end=end_date)
 
-            # Expect either MultiIndex with ['Close','Volume'] or flat DataFrame with those cols
-            df = raw[["Close", "Volume"]] if isinstance(raw, pd.DataFrame) else raw
+            df = raw[["Close", "Volume"]] if isinstance(raw, pd.DataFrame) else pd.DataFrame()
             if isinstance(df, pd.Series):
                 df = df.to_frame()
 
             if isinstance(df.columns, pd.MultiIndex):
-                close_part = df["Close"]
-                vol_part = df["Volume"]
+                close_chunk = df["Close"]
+                vol_chunk = df["Volume"]
             else:
                 if "Close" not in df.columns or "Volume" not in df.columns:
                     continue
-                close_part = df[["Close"]].copy()
-                vol_part = df[["Volume"]].copy()
-                # Single-ticker normalization
+                close_chunk = df[["Close"]].copy()
+                vol_chunk = df[["Volume"]].copy()
                 if len(batch) == 1:
-                    close_part.columns = [batch[0]]
-                    vol_part.columns = [batch[0]]
+                    close_chunk.columns = [batch[0]]
+                    vol_chunk.columns = [batch[0]]
 
-            close_part = _ensure_unique_sorted_index(close_part)
-            vol_part = _ensure_unique_sorted_index(vol_part)
+            close_chunk = _normalize_ticker_columns(_ensure_unique_sorted_index(close_chunk))
+            vol_chunk = _normalize_ticker_columns(_ensure_unique_sorted_index(vol_chunk))
+            close_parts.append(close_chunk)
+            vol_parts.append(vol_chunk)
 
-            close_frames.append(close_part)
-            vol_frames.append(vol_part)
-
-        if not close_frames:
+        if not close_parts:
             return pd.DataFrame(), pd.DataFrame()
 
-        # Concatenate & align
-        close = pd.concat(close_frames, axis=1).dropna(axis=1, how="all")
-        vol = pd.concat(vol_frames, axis=1)
+        close = pd.concat(close_parts, axis=1)
+        vol = pd.concat(vol_parts, axis=1)
 
-        close = _ensure_unique_sorted_index(close)
-        vol = _ensure_unique_sorted_index(vol)
-        vol = vol.reindex_like(close).fillna(0)
+        close = _normalize_ticker_columns(_ensure_unique_sorted_index(close))
+        vol = _normalize_ticker_columns(_ensure_unique_sorted_index(vol))
 
-        # Restrict to safe tickers
         close = close.loc[:, close.columns.intersection(safe)]
         vol = vol.loc[:, vol.columns.intersection(safe)]
 
-        # ---- clean prices; winsorize volumes; write cache ----
-        if not close.empty:
-            cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
-            cleaned_close = _ensure_unique_sorted_index(cleaned_close)
+        vol = vol.reindex(index=close.index)
+        vol = vol.reindex(columns=close.columns).fillna(0)
 
-            vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
-            # Light winsorization of volume spikes to tame outliers for plotting/use
-            for col in vol_aligned.columns:
-                col_data = vol_aligned[col]
-                if col_data.notna().any():
-                    q99 = col_data.quantile(0.99)
-                    vol_aligned[col] = col_data.clip(lower=0, upper=q99)
+        close = _soft_prune_history(close, min_days=180, max_missing_frac=0.60)
+        vol = vol.reindex(columns=close.columns).fillna(0)
 
-            if close_alerts:
-                for alert in close_alerts[:1]:
-                    logging.info("Price/Volume cleaning: %s", alert)
+        if not vol.empty:
+            q99 = vol.quantile(0.99, axis=0).replace([np.inf, -np.inf], np.nan)
+            vol = vol.clip(lower=0)
+            for col in vol.columns:
+                thr = q99.get(col)
+                if pd.notna(thr):
+                    vol[col] = vol[col].clip(upper=float(thr))
 
-            # Ensure QQQ present
-            cleaned_close, vol_aligned = _maybe_add_qqq(cleaned_close, vol_aligned)
-
-            combined_out = pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1)
-            combined_out = _ensure_unique_sorted_index(combined_out)
-            _write_cached_dataframe(combined_out, cache_path)
-            return cleaned_close, vol_aligned
-
-        # Fallback: no cleaning possible, still ensure QQQ & cache
         close, vol = _maybe_add_qqq(close, vol)
+        close = _normalize_ticker_columns(_ensure_unique_sorted_index(close))
+        vol = _normalize_ticker_columns(_ensure_unique_sorted_index(vol))
+        vol = vol.reindex(index=close.index)
+        vol = vol.reindex(columns=close.columns).fillna(0)
+
         combined_out = pd.concat({"Close": close, "Volume": vol}, axis=1)
         combined_out = _ensure_unique_sorted_index(combined_out)
         _write_cached_dataframe(combined_out, cache_path)
+
         return close, vol
 
     except Exception as e:
         st.error(f"Failed to download price/volume: {e}")
         return pd.DataFrame(), pd.DataFrame()
-      
+
 # =========================
 # Persistence (Gist + Local) - Unchanged
 # =========================
@@ -3118,6 +3137,9 @@ def run_momentum_composite_param(
             sel = base_comp.copy()
 
         if sel.empty:
+            sel = base_comp.dropna()
+
+        if sel.empty:
             sel = base_comp.nlargest(top_n)
 
         if sel.empty:
@@ -3239,19 +3261,6 @@ def filter_by_liquidity(close_df: pd.DataFrame, vol_df: pd.DataFrame, min_dollar
     med = median_dollar_volume(close_df, vol_df, window=60)
     return med[med >= min_dollar].index.tolist()
 
-def _prune_price_history(daily_close: pd.DataFrame, min_days: int = 220) -> pd.DataFrame:
-    """Remove tickers lacking ``min_days`` of finite price history."""
-    if daily_close is None:
-        return pd.DataFrame()
-
-    if daily_close.empty:
-        return daily_close.copy()
-
-    threshold = min(int(min_days), len(daily_close))
-    finite_counts = daily_close.apply(lambda s: np.isfinite(s).sum())
-    keep_cols = finite_counts[finite_counts >= threshold].index
-    return daily_close.loc[:, list(keep_cols)].copy()
-
 def fetch_fundamental_metrics(tickers: List[str]) -> pd.DataFrame:
     """Fetch basic fundamental metrics for the given tickers."""
     rows = []
@@ -3334,7 +3343,7 @@ def _build_isa_weights_fixed(
             cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
         filtered = filtered[aligned_momz > cutoff].dropna()
     if filtered.empty:
-        filtered = comp_vec_full
+        filtered = comp_vec_full.dropna()
     top_m = filtered.nlargest(preset["mom_topn"]) if not filtered.empty else pd.Series(dtype=float)
 
     # Stickiness filter (keep names that have persisted in the top set)
@@ -3496,7 +3505,7 @@ def _store_live_prune_meta(meta: Dict[str, Any]) -> None:
         return
 
 
-def _prune_price_history(
+def _prune_price_history_with_meta(
     prices: Optional[pd.DataFrame],
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Drop unusable price columns and return (pruned_prices, metadata)."""
@@ -3611,12 +3620,12 @@ def generate_live_portfolio_isa_monthly(
         })
         return None, None, "No tickers pass quality filter."
     close = close[keep]
-    close = _prune_price_history(close)
+    close = _soft_prune_history(close, min_days=180, max_missing_frac=0.60)
     if close.empty:
         raise ValueError("No tickers have sufficient price history after applying filters.")
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
 
-    close, prune_meta = _prune_price_history(close)
+    close, prune_meta = _prune_price_history_with_meta(close)
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
     _store_live_prune_meta(prune_meta)
     if close.empty:
@@ -3970,7 +3979,7 @@ def run_backtest_isa_dynamic(
         daily = daily[keep]
         sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep}
 
-    daily = _prune_price_history(daily)
+    daily = _soft_prune_history(daily, min_days=180, max_missing_frac=0.60)
     if daily.empty:
         raise ValueError("No tickers have sufficient price history after applying filters.")
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in daily.columns}
