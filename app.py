@@ -208,6 +208,28 @@ if go:
                 as_of=date.today(),
                 use_enhanced_features=st.session_state.get("use_enhanced_features", True),
             )
+            if (
+                (live_disp is None or getattr(live_disp, "empty", False))
+                and (live_raw is None or getattr(live_raw, "empty", False))
+            ):
+                st.warning(
+                    "Live portfolio came back empty. Likely no eligible tickers after cleaning/gating."
+                )
+                prune_meta = st.session_state.get("live_prune_meta", {})
+                eligible = prune_meta.get("eligible_tickers") or []
+                dropped = prune_meta.get("dropped_tickers") or []
+                if eligible:
+                    preview = ", ".join(eligible[:10])
+                    suffix = "…" if len(eligible) > 10 else ""
+                    st.caption(
+                        f"{len(eligible)} tickers remained after price-history pruning: {preview}{suffix}"
+                    )
+                elif dropped:
+                    preview = ", ".join(dropped[:10])
+                    suffix = "…" if len(dropped) > 10 else ""
+                    st.caption(
+                        f"All {len(dropped)} tickers were removed by price-history pruning: {preview}{suffix}"
+                    )
         except Exception as e:
             st.error(f"Portfolio generation failed: {e}")
             st.code(traceback.format_exc())
