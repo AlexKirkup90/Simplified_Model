@@ -791,6 +791,19 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
             "dist200": empty_df,
         }
 
+    daily = daily.dropna(how="all", axis=1)
+    if daily.shape[1] == 0:
+        empty_df = pd.DataFrame()
+        return {
+            "monthly": empty_df,
+            "r3": empty_df,
+            "r6": empty_df,
+            "r12": empty_df,
+            "vol63": empty_df,
+            "ma200": empty_df,
+            "dist200": empty_df,
+        }
+
     # ---- Normalize index (unique, sorted, datetime) ----
     try:
         if "_ensure_unique_sorted_index" in globals() and callable(globals()["_ensure_unique_sorted_index"]):
@@ -2735,6 +2748,19 @@ def kpi_row(name: str,
 def _compute_signal_panels_polars(
     daily: pd.DataFrame,
 ) -> Dict[str, pd.DataFrame | pd.Series]:
+    daily = daily.dropna(how="all", axis=1)
+    if daily.shape[1] == 0:
+        empty_df = pd.DataFrame(index=daily.index)
+        return {
+            "monthly": empty_df,
+            "r3": empty_df,
+            "r6": empty_df,
+            "r12": empty_df,
+            "vol63": empty_df,
+            "ma200": empty_df,
+            "dist200": empty_df,
+        }
+
     pl_daily, value_cols = _prepare_polars_daily_frame(daily)
 
     if not value_cols:
@@ -2812,6 +2838,19 @@ def _compute_signal_panels_polars(
 def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Series]:
     """Cache common signal inputs derived from daily close data."""
     if daily is None or daily.empty:
+        empty_df = pd.DataFrame()
+        return {
+            "monthly": empty_df,
+            "r3": empty_df,
+            "r6": empty_df,
+            "r12": empty_df,
+            "vol63": empty_df,
+            "ma200": empty_df,
+            "dist200": empty_df,
+        }
+
+    daily = daily.dropna(how="all", axis=1)
+    if daily.shape[1] == 0:
         empty_df = pd.DataFrame()
         return {
             "monthly": empty_df,
