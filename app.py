@@ -523,6 +523,7 @@ with tab2:
             corr = hedge_details.get("correlation")
             breadth = hedge_details.get("breadth_pos_6m")
             qqq_above = hedge_details.get("qqq_above_200dma")
+            hedge_reason = hedge_details.get("reason")
 
             help_bits = []
             if corr is not None:
@@ -531,6 +532,8 @@ with tab2:
                 help_bits.append("QQQ above 200DMA" if qqq_above >= 1 else "QQQ below 200DMA")
             if breadth is not None and not np.isnan(breadth):
                 help_bits.append(f"Breadth (6M > 0): {breadth:.0%}")
+            if hedge_reason:
+                help_bits.append(hedge_reason)
             help_text = "; ".join(help_bits) if help_bits else "Hedge overlay based on regime metrics."
 
             st.metric(
@@ -539,6 +542,8 @@ with tab2:
                 delta="Active" if hedge_weight > 0 else "Inactive",
                 help=help_text,
             )
+            if hedge_reason:
+                st.caption(hedge_reason)
 
         # Feature badge
         if use_enhanced_features:
@@ -556,6 +561,10 @@ with tab2:
 
         if st.session_state.get("diversification_fallback_applied"):
             st.info("Diversification fallback applied (max name cap 15%, HHI reduced).")
+            notes = st.session_state.get("diversification_breadth_notes", {})
+            if isinstance(notes, dict) and notes:
+                with st.expander("Diversification safeguards"):
+                    st.json(notes)
 
         dbg = st.session_state.get("eligibility_debug", [])
         if dbg:
@@ -898,32 +907,38 @@ with tab4:
         if str(metrics.get("hy_oas_status", "")).lower() == "missing":
             st.warning("HY OAS unavailable — not used this run.")
 
-        # Enhanced regime guidance
+        regime_label = str(metrics.get("regime", label))
+        regime_score = float(metrics.get("regime_score", np.nan))
         breadth = float(metrics.get("breadth_pos_6m", np.nan))
-        vol10   = float(metrics.get("qqq_vol_10d", np.nan))
+        vol10 = float(metrics.get("qqq_vol_10d", np.nan))
         qqq_abv = bool(metrics.get("qqq_above_200dma", 0.0) >= 1.0)
 
-        target_equity = 1.0
-        headline = "Risk-On — full equity allocation recommended."
-        box_func = st.success
+        advice_map = {
+            "Extreme Risk-Off": (0.0, "Extreme Risk-Off — consider 100% cash.", st.error),
+            "Risk-Off": (0.5, "Risk-Off — scale to ~50% equity / 50% cash.", st.warning),
+            "Neutral": (0.75, "Neutral — maintain a balanced risk posture (~75% equity).", st.info),
+            "Risk-On": (1.0, "Risk-On — full equity allocation recommended.", st.success),
+            "Strong Risk-On": (1.1, "Strong Risk-On — consider modest leverage (110%).", st.success),
+        }
+        target_equity, headline, box_func = advice_map.get(
+            regime_label,
+            (0.75, f"{regime_label} — maintain diversified exposure (~75% equity).", st.info),
+        )
 
-        if ((not qqq_abv and (breadth < 0.35)) or (vol10 > 0.045 and not qqq_abv)):
-            target_equity = 0.0
-            headline = "Extreme Risk-Off — consider 100% cash."
-            box_func = st.error
-        elif (not qqq_abv) or (breadth < 0.45) or (vol10 > 0.035):
-            target_equity = 0.50
-            headline = "Risk-Off — scale to ~50% equity / 50% cash."
-            box_func = st.warning
-        elif breadth > 0.65 and vol10 < 0.025:
-            target_equity = 1.1
-            headline = "Strong Risk-On — consider modest leverage (110%)."
-            box_func = st.success
+        if not np.isnan(regime_score):
+            if regime_score <= 35 and target_equity > 0.5:
+                target_equity = 0.5
+                headline = "Risk-Off — scale to ~50% equity / 50% cash."
+                box_func = st.warning
+            elif regime_score >= 80 and target_equity < 1.0:
+                target_equity = 1.0
+                headline = "Risk-On — full equity allocation recommended."
+                box_func = st.success
 
         box_func(
             f"**Enhanced Regime Advice:** {headline}  \n"
             f"**Targets:** equity **{target_equity*100:.0f}%**, cash **{max(0, 100-target_equity*100):.0f}%**.  \n"
-            f"_Context — Breadth (6m>0): {breadth:.0%} • 10-day vol: {vol10:.2%} • QQQ >200DMA: {'Yes' if qqq_abv else 'No'}_"
+            f"_Regime: {regime_label} (score {regime_score if not np.isnan(regime_score) else 'n/a'}) • Breadth (6m>0): {breadth:.0%} • 10-day vol: {vol10:.2%} • QQQ >200DMA: {'Yes' if qqq_abv else 'No'}_"
         )
         
         # Regime history visualization
@@ -979,7 +994,22 @@ with tab5:
                 st.caption(f"Skipped symbols (no data): {skipped}")
 
             if expl is None or expl.empty:
-                st.info("No changes to explain.")
+                reasons = st.session_state.get("eligibility_reasons", {})
+                if reasons:
+                    st.warning("No allocation changes, but several symbols were filtered out:")
+                    reason_rows = (
+                        pd.DataFrame(
+                            [
+                                {"Ticker": ticker, "Reason": reason}
+                                for ticker, reason in list(reasons.items())[:20]
+                            ]
+                        )
+                    )
+                    st.dataframe(reason_rows, use_container_width=True)
+                    if len(reasons) > 20:
+                        st.caption(f"…and {len(reasons) - 20} additional exclusions.")
+                else:
+                    st.info("No changes to explain.")
             else:
                 # Enhanced formatting for display
                 show = expl.copy()
@@ -1023,8 +1053,12 @@ with tab6:
         # Get QQQ for comparison
         qqq_returns = qqq_cum.pct_change().dropna() if qqq_cum is not None else None
         
-        # Calculate health metrics
-        health_metrics = backend.get_strategy_health_metrics(returns_series, qqq_returns)
+        # Calculate health metrics (prefer auto-run snapshot if available)
+        stored_health = st.session_state.get("latest_health_metrics")
+        if isinstance(stored_health, dict) and stored_health:
+            health_metrics = stored_health
+        else:
+            health_metrics = backend.get_strategy_health_metrics(returns_series, qqq_returns)
         
         # Display health dashboard
         st.markdown("#### 📊 Health Dashboard")
@@ -1179,13 +1213,18 @@ with tab7:
     name_cap   = float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25)))
     sector_cap = float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30)))
 
-    report = backend.run_trust_checks(
-        weights_df=weights_df,
-        metrics=metrics,
-        turnover_series=turnover_series,
-        name_cap=name_cap,
-        sector_cap=sector_cap,
-    )
+    cached_report = st.session_state.get("latest_trust_checks")
+    if (weights_df is None or getattr(weights_df, "empty", False)) and isinstance(cached_report, dict):
+        report = cached_report
+    else:
+        report = backend.run_trust_checks(
+            weights_df=weights_df,
+            metrics=metrics,
+            turnover_series=turnover_series,
+            name_cap=name_cap,
+            sector_cap=sector_cap,
+        )
+        st.session_state["latest_trust_checks"] = report
 
     details = report.get("details", {}) if isinstance(report, dict) else {}
     signal = details.get("signal", {})

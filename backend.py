@@ -461,6 +461,7 @@ def _record_hedge_state(scope: str,
         "qqq_above_200dma": regime_metrics.get("qqq_above_200dma"),
         "breadth_pos_6m": regime_metrics.get("breadth_pos_6m"),
         "timestamp": datetime.utcnow().isoformat(),
+        "reason": describe_hedge_state(weight, correlation, regime_metrics),
     }
     st.session_state[f"latest_{scope}_hedge"] = summary
 
@@ -1320,6 +1321,65 @@ def enforce_diversification(
     return expanded * (scale / total)
 
 
+def apply_diversification_safety_net(
+    weights: pd.Series,
+    comp_scores: pd.Series | None,
+    daily_close: pd.DataFrame | None,
+    min_names: int = 8,
+    etf_candidates: tuple[str, ...] = ("QQQ", "SPY", "VTI"),
+) -> tuple[pd.Series, bool, Dict[str, str]]:
+    """Broaden the allocation when too few names survive gating.
+
+    Returns (adjusted_weights, applied?, details)
+    """
+
+    if weights is None or weights.empty or min_names <= 0:
+        return weights, False, {}
+
+    applied = False
+    notes: Dict[str, str] = {}
+    series = weights.copy().astype(float)
+    current = int(series[series > 0].shape[0])
+    total = float(series.sum()) or 1.0
+
+    if current < min_names and comp_scores is not None and not comp_scores.empty:
+        need = max(0, min_names - current)
+        pool = pd.Series(comp_scores).drop(index=series.index, errors="ignore").dropna()
+        pool = pool.replace([np.inf, -np.inf], np.nan).dropna()
+        if not pool.empty:
+            extras = pool.nlargest(max(need, min(5, len(pool))))
+            if not extras.empty:
+                blend = min(0.40, 0.12 * need)
+                expanded = extras / extras.sum()
+                series = series * (1 - blend)
+                series = series.add(expanded * total * blend, fill_value=0.0)
+                applied = True
+                notes["secondary_pool"] = (
+                    f"Added {len(extras)} secondary picks to avoid concentration (blend {blend:.0%})."
+                )
+
+    if series[series > 0].shape[0] < min_names:
+        stub = None
+        cols = list(getattr(daily_close, "columns", []))
+        for candidate in etf_candidates:
+            if candidate in series.index or candidate in cols:
+                stub = candidate
+                break
+        if stub is not None:
+            blend = min(0.30, 0.08 * max(0, min_names - series[series > 0].shape[0]))
+            if blend > 0:
+                series = series * (1 - blend)
+                series.loc[stub] = series.get(stub, 0.0) + total * blend
+                applied = True
+                notes["etf_overlay"] = (
+                    f"Blended {stub} overlay ({blend:.0%}) to maintain diversification."
+                )
+
+    if applied:
+        series = series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return series, applied, notes
+
+
 # --- Enhanced sector bucketing -----------------------------------------------
 
 def get_enhanced_sector_map(tickers: list[str], base_map: dict[str, str] | None = None) -> dict[str, str]:
@@ -1846,6 +1906,45 @@ def build_hedge_weight(portfolio_returns: pd.Series,
 
     scale = min(1.0, (corr - corr_threshold) / max(1e-6, 1 - corr_threshold))
     return float(np.clip(scale * hedge_size, 0.0, hedge_size))
+
+
+def describe_hedge_state(
+    weight: float,
+    correlation: float | None,
+    regime_metrics: Dict[str, float],
+    corr_threshold: float = 0.8,
+) -> str:
+    """Provide a human-readable explanation for the hedge decision."""
+
+    corr_txt = "n/a" if correlation is None or pd.isna(correlation) else f"{float(correlation):.2f}"
+    breadth = regime_metrics.get("breadth_pos_6m")
+    qqq_above = regime_metrics.get("qqq_above_200dma")
+    vol10 = regime_metrics.get("qqq_vol_10d")
+
+    bearish_flags: list[str] = []
+    if qqq_above is not None and qqq_above < 1.0:
+        bearish_flags.append("QQQ below 200DMA")
+    if breadth is not None and breadth < 0.40:
+        bearish_flags.append("breadth < 40% winners")
+    if vol10 is not None and vol10 > 0.035:
+        bearish_flags.append("10d vol elevated")
+
+    if weight <= 0:
+        reasons: list[str] = []
+        if correlation is None or pd.isna(correlation):
+            reasons.append("insufficient data for correlation")
+        elif float(correlation) < corr_threshold:
+            reasons.append(f"correlation {float(correlation):.2f} < {corr_threshold:.2f}")
+        if not bearish_flags:
+            reasons.append("risk metrics benign")
+        detail = "; ".join(reasons) if reasons else "conditions not met"
+        return f"Hedge inactive: {detail} (corr={corr_txt})."
+
+    triggers = bearish_flags or ["bearish regime signals"]
+    trigger_text = "; ".join(triggers)
+    return (
+        f"Hedge active ({weight:.1%}): corr {corr_txt} ≥ {corr_threshold:.2f}; {trigger_text}."
+    )
 
 # =========================
 # Helpers (Enhanced)
@@ -3785,6 +3884,27 @@ def _build_isa_weights_fixed(
     else:
         combined_raw = combined_raw / combined_raw.sum() if combined_raw.sum() > 0 else combined_raw
 
+    breadth_floor = int(preset.get("breadth_floor", 0))
+    min_names = breadth_floor if breadth_floor > 0 else int(max(8, round(0.6 * preset.get("mom_topn", 12))))
+    combined_raw, broadened, breadth_notes = apply_diversification_safety_net(
+        combined_raw,
+        comp_vec_full,
+        daily_close,
+        min_names=min_names,
+    )
+    if broadened:
+        combined_raw = combined_raw.sort_values(ascending=False)
+        if _HAS_ST:
+            try:
+                st.session_state["diversification_breadth_notes"] = breadth_notes
+            except Exception:
+                pass
+    elif _HAS_ST:
+        try:
+            st.session_state.pop("diversification_breadth_notes", None)
+        except Exception:
+            pass
+
     # Enhanced sector map (uses your base sectors_map) + hierarchical caps for Software sub-buckets
     enhanced_sectors = get_enhanced_sector_map(list(combined_raw.index), base_map=sectors_map)
     group_caps = build_group_caps(enhanced_sectors)  # <- adds Software parent (30%) + sub-caps (e.g., 18%)
@@ -3808,6 +3928,12 @@ def _build_isa_weights_fixed(
     )
 
     _log_pipeline_counts(len(final_weights))
+
+    try:
+        final_weights.attrs["breadth_fallback_applied"] = bool(broadened)
+    except Exception:
+        # pandas <1.5 may lack attrs; safe to ignore
+        pass
 
     return final_weights
 
@@ -3892,6 +4018,29 @@ def _store_live_prune_meta(meta: Dict[str, Any]) -> None:
     except Exception:
         # Streamlit session state may be unavailable in some non-UI contexts
         return
+
+
+def _store_eligibility_reasons(reasons: Dict[str, str]) -> None:
+    """Persist exclusion reasons so the UI can surface them in Explainability."""
+
+    if not reasons:
+        try:
+            st.session_state.pop("eligibility_reasons", None)
+        except Exception:
+            pass
+        return
+
+    # Deduplicate by ticker while keeping most recent reason
+    ordered: Dict[str, str] = {}
+    for ticker, reason in reasons.items():
+        if ticker in {"QQQ", HEDGE_TICKER_LABEL}:
+            continue
+        ordered[ticker] = reason
+
+    try:
+        st.session_state["eligibility_reasons"] = ordered
+    except Exception:
+        pass
 
 
 def _debug_stage(label: str, obj) -> None:
@@ -4106,10 +4255,13 @@ def generate_live_portfolio_isa_monthly(
     min_prof = float(st.session_state.get("min_profitability", 0.0))
     max_lev = float(st.session_state.get("max_leverage", 2.0))
 
+    exclusion_reasons: Dict[str, str] = {}
+
     def _apply_primary_filters(
         min_dollar_volume_val: float,
         min_profitability_val: float,
     ) -> tuple[pd.DataFrame, dict[str, str], dict[str, Any]]:
+        nonlocal exclusion_reasons
         local_close = close_base.copy()
         local_vol = vol_base.copy()
         local_sectors = {t: sectors_base.get(t, "Unknown") for t in local_close.columns}
@@ -4127,6 +4279,14 @@ def generate_live_portfolio_isa_monthly(
             keep = [t for t in keep if t in local_close.columns]
             liq_pool = [t for t in keep if t != "QQQ"]
             _debug_stage("liquidity gate", liq_pool)
+            removed_liq = [t for t in equities_initial if t not in keep and t != "QQQ"]
+            if removed_liq:
+                thresh_txt = f"${min_dollar_volume_val:,.0f}" if min_dollar_volume_val >= 1e5 else f"{min_dollar_volume_val:,.0f}"
+                for ticker in removed_liq:
+                    exclusion_reasons.setdefault(
+                        ticker,
+                        f"{ticker} excluded: failed liquidity filter (median $ volume < {thresh_txt}).",
+                    )
             if keep:
                 keep_ordered = list(dict.fromkeys(keep))
                 if "QQQ" in local_close.columns and "QQQ" not in keep_ordered:
@@ -4152,6 +4312,15 @@ def generate_live_portfolio_isa_monthly(
         quality_pool = [t for t in keep_quality if t in local_close.columns and t != "QQQ"]
         _debug_stage("quality/MA gate", quality_pool if keep_quality else [t for t in local_close.columns if t != "QQQ"])
         if keep_quality:
+            removed_quality = [
+                t for t in local_close.columns if t not in keep_quality and t != "QQQ"
+            ]
+            if removed_quality and min_profitability_val > 0:
+                for ticker in removed_quality:
+                    exclusion_reasons.setdefault(
+                        ticker,
+                        "{} excluded: failed profitability/leverage filter.".format(ticker),
+                    )
             keep_ordered = list(dict.fromkeys(keep_quality))
             if "QQQ" in local_close.columns and "QQQ" not in keep_ordered:
                 keep_ordered.append("QQQ")
@@ -4165,13 +4334,26 @@ def generate_live_portfolio_isa_monthly(
             meta = {"eligible_tickers": [], "eligible_count": 0, "dropped_tickers": equities_initial}
             return local_close, local_sectors, meta
 
+        before_soft = set(local_close.columns)
         local_close = _soft_prune_history(local_close, min_days=180, max_missing_frac=0.60)
+        removed_soft = [t for t in before_soft if t not in local_close.columns and t != "QQQ"]
+        for ticker in removed_soft:
+            exclusion_reasons.setdefault(
+                ticker,
+                f"{ticker} excluded: insufficient history (<180 trading days).",
+            )
         if local_close.empty:
             meta = {"eligible_tickers": [], "eligible_count": 0, "dropped_tickers": equities_initial}
             _debug_stage("data survivors", [])
             return local_close, local_sectors, meta
 
         pruned_close, prune_meta = _prune_price_history_with_meta(local_close)
+        for ticker in prune_meta.get("dropped_tickers", []):
+            if ticker != "QQQ":
+                exclusion_reasons.setdefault(
+                    ticker,
+                    f"{ticker} excluded: dropped during price cleaning (missing recent data).",
+                )
         if pruned_close.empty:
             _debug_stage("data survivors", [])
             return pruned_close, local_sectors, prune_meta
@@ -4182,6 +4364,10 @@ def generate_live_portfolio_isa_monthly(
         return pruned_close, local_sectors, prune_meta
 
     filtered_close, filtered_sectors, prune_meta = _apply_primary_filters(min_dollar_volume, min_prof)
+    _store_eligibility_reasons(exclusion_reasons)
+    if exclusion_reasons:
+        preview = ", ".join(list(exclusion_reasons.values())[:10])
+        logging.info("Eligibility exclusions noted: %s%s", preview, "…" if len(exclusion_reasons) > 10 else "")
     survivors = [t for t in filtered_close.columns if t != "QQQ"]
     survivor_cnt = len(survivors)
     if survivor_cnt < 120 and (min_dollar_volume > 0 or min_prof > 0):
@@ -4235,6 +4421,12 @@ def generate_live_portfolio_isa_monthly(
         if _HAS_ST:
             try:
                 st.session_state["latest_regime_label"] = current_regime_label
+                latest_metrics_payload = dict(regime_metrics)
+                latest_metrics_payload["regime"] = current_regime_label
+                score, comps = _compute_regime_score(latest_metrics_payload)
+                latest_metrics_payload["regime_score"] = score
+                latest_metrics_payload["regime_components"] = comps
+                st.session_state["latest_metrics"] = latest_metrics_payload
             except Exception:
                 pass
 
@@ -4254,6 +4446,11 @@ def generate_live_portfolio_isa_monthly(
 
     if not isinstance(new_w, pd.Series):
         new_w = pd.Series(dtype=float)
+    breadth_fallback_flag = False
+    try:
+        breadth_fallback_flag = bool(new_w.attrs.get("breadth_fallback_applied", False))
+    except Exception:
+        breadth_fallback_flag = False
 
     fallback_used = False
     composite_fallback_used = False
@@ -4534,7 +4731,7 @@ def generate_live_portfolio_isa_monthly(
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
-    diversification_applied = False
+    diversification_applied = bool(breadth_fallback_flag)
     if not final_weights.empty and float(final_weights.sum() or 0.0) > 0:
         enhanced_map_final = get_enhanced_sector_map(list(final_weights.index), base_map=sectors_map)
         diversified = enforce_diversification(
@@ -4550,6 +4747,8 @@ def generate_live_portfolio_isa_monthly(
     if _HAS_ST:
         try:
             st.session_state["diversification_fallback_applied"] = diversification_applied
+            if diversification_applied and st.session_state.get("diversification_breadth_notes") is None:
+                st.session_state["diversification_breadth_notes"] = {}
         except Exception:
             pass
 
@@ -4571,11 +4770,19 @@ def generate_live_portfolio_isa_monthly(
     )
     _record_hedge_state("live", hedge_weight, corr, regime_metrics)
 
-    hedge_note = (
-        f"QQQ hedge active at {hedge_weight:.1%} short."
-        if hedge_weight > 0
-        else "QQQ hedge inactive."
-    )
+    if is_monthly and isinstance(final_weights, pd.Series) and not final_weights.empty:
+        try:
+            _auto_run_backtest_for_live_portfolio(
+                universe_choice,
+                params,
+                use_enhanced_features,
+                min_dollar_volume,
+                final_weights,
+            )
+        except Exception:
+            logging.warning("Auto backtest trigger after monthly lock failed", exc_info=True)
+
+    hedge_note = describe_hedge_state(hedge_weight, corr, regime_metrics)
     decision = (decision or "").strip()
     decision = f"{decision}\n{hedge_note}" if decision else hedge_note
 
@@ -4929,7 +5136,105 @@ def run_backtest_isa_dynamic(
         optimization_cfg,
         search_diagnostics,
     )
-    
+
+
+def _auto_run_backtest_for_live_portfolio(
+    universe_choice: str,
+    params: Dict[str, Any],
+    use_enhanced_features: bool,
+    min_dollar_volume: float,
+    weights_override: pd.Series | None = None,
+) -> None:
+    """Run the historical backtest immediately after a portfolio lock."""
+
+    if not _HAS_ST:
+        return
+
+    try:
+        history_years = int(st.session_state.get("history_years", 9))
+    except Exception:
+        history_years = 9
+
+    today = date.today()
+    try:
+        start_date = (today - relativedelta(years=history_years)).replace(day=1).strftime("%Y-%m-%d")
+    except Exception:
+        start_date = (today - relativedelta(years=history_years)).strftime("%Y-%m-%d")
+
+    auto_optimize = bool(st.session_state.get("auto_optimize", False))
+    show_net = bool(st.session_state.get("show_net", True))
+    roundtrip_bps = float(st.session_state.get("roundtrip_bps", ROUNDTRIP_BPS_DEFAULT))
+
+    try:
+        (
+            strat_cum_gross,
+            strat_cum_net,
+            qqq_cum,
+            hybrid_tno,
+            _,
+            _,
+        ) = run_backtest_isa_dynamic(
+            roundtrip_bps=roundtrip_bps,
+            min_dollar_volume=min_dollar_volume,
+            show_net=show_net,
+            start_date=start_date,
+            universe_choice=universe_choice,
+            top_n=None if auto_optimize else int(params.get("mom_topn", 12)),
+            name_cap=None if auto_optimize else float(params.get("mom_cap", 0.25)),
+            sector_cap=None if auto_optimize else float(params.get("sector_cap", 0.30)),
+            stickiness_days=int(params.get("stickiness_days", params.get("stability_days", 7))),
+            mr_topn=int(params.get("mr_topn", 3)),
+            mom_weight=None if auto_optimize else float(params.get("mom_w", 0.7)),
+            mr_weight=None if auto_optimize else float(params.get("mr_w", 0.3)),
+            use_enhanced_features=use_enhanced_features,
+            auto_optimize=auto_optimize,
+        )
+    except Exception:
+        logging.warning("Auto backtest execution failed", exc_info=True)
+        return
+
+    try:
+        st.session_state["strategy_cum_gross"] = strat_cum_gross
+        st.session_state["strategy_cum_net"] = strat_cum_net
+        st.session_state["qqq_cum"] = qqq_cum
+        st.session_state["hybrid_tno"] = hybrid_tno
+        st.session_state["latest_backtest_timestamp"] = datetime.utcnow().isoformat()
+    except Exception:
+        pass
+
+    base_curve = strat_cum_net if show_net and strat_cum_net is not None else strat_cum_gross
+    if base_curve is None:
+        return
+
+    try:
+        monthly_returns = base_curve.pct_change().dropna()
+        qqq_returns = qqq_cum.pct_change().dropna() if qqq_cum is not None else None
+        health_metrics = get_strategy_health_metrics(monthly_returns, qqq_returns)
+        st.session_state["latest_backtest_monthly_returns"] = monthly_returns
+        st.session_state["latest_health_metrics"] = health_metrics
+    except Exception:
+        logging.warning("Auto health metric refresh failed", exc_info=True)
+
+    try:
+        weights_df = st.session_state.get("latest_portfolio")
+        if weights_override is not None and isinstance(weights_override, pd.Series):
+            weights_df = pd.DataFrame({"Weight": weights_override})
+        metrics = st.session_state.get("latest_metrics", {})
+        if weights_df is not None:
+            name_cap = float(params.get("mom_cap", 0.25))
+            sector_cap = float(params.get("sector_cap", 0.30))
+            trust = run_trust_checks(
+                weights_df=weights_df,
+                metrics=metrics,
+                turnover_series=hybrid_tno,
+                name_cap=name_cap,
+                sector_cap=sector_cap,
+            )
+            st.session_state["latest_trust_checks"] = trust
+    except Exception:
+        logging.warning("Auto trust check refresh failed", exc_info=True)
+
+
 # =========================
 # Diff engine (for Plan tab) - Unchanged
 # =========================
@@ -5860,7 +6165,11 @@ def diagnose_strategy_issues(current_returns: pd.Series,
 # =========================
 # TRUST CHECKS (Signal, Construction, Health)
 # =========================
-def summarize_signal_alignment(metrics: Dict[str, float]) -> Dict[str, Any]:
+def summarize_signal_alignment(
+    metrics: Dict[str, float],
+    weights: pd.Series | None = None,
+    hedge_weight: float = 0.0,
+) -> Dict[str, Any]:
     """Quick pass/fail style view for regime vs market reality."""
     if not metrics:
         return {"ok": False, "reason": "no-metrics", "checks": {}}
@@ -5870,6 +6179,15 @@ def summarize_signal_alignment(metrics: Dict[str, float]) -> Dict[str, Any]:
     vol10      = float(metrics.get("qqq_vol_10d", np.nan))
     vix_ts     = float(metrics.get("vix_term_structure", np.nan))
     regime_lbl = str(metrics.get("regime", "Unknown"))
+    regime_score = float(metrics.get("regime_score", np.nan))
+
+    exposure = np.nan
+    if weights is not None and len(weights) > 0:
+        try:
+            w = pd.Series(weights).dropna().astype(float)
+            exposure = float(w[w > 0].sum())
+        except Exception:
+            exposure = np.nan
 
     checks = {
         "qqq_above_200dma": (qqq_above >= 1.0),
@@ -5883,8 +6201,26 @@ def summarize_signal_alignment(metrics: Dict[str, float]) -> Dict[str, Any]:
         checks["breadth_strong"] = (not np.isnan(breadth) and breadth >= 0.60)
         checks["vol_strong"] = (not np.isnan(vol10) and vol10 < 0.025)
 
+    if not np.isnan(exposure):
+        hedge_used = hedge_weight > 0.01
+        if regime_lbl in {"Risk-Off", "Extreme Risk-Off"}:
+            cap = 0.50 if regime_lbl == "Extreme Risk-Off" else 0.65
+            checks["exposure_vs_regime"] = exposure <= cap or hedge_used
+        elif regime_lbl == "Neutral":
+            checks["exposure_vs_regime"] = 0.60 <= exposure <= 0.90
+        elif "strong" in regime_lbl.lower() or (not np.isnan(regime_score) and regime_score >= 70):
+            checks["exposure_vs_regime"] = exposure >= 0.95 and not hedge_used
+        else:
+            checks["exposure_vs_regime"] = exposure >= 0.80
+
     ok = all(v is True for v in checks.values())
-    return {"ok": ok, "reason": regime_lbl, "checks": checks}
+    return {
+        "ok": ok,
+        "reason": regime_lbl,
+        "checks": checks,
+        "exposure": exposure,
+        "hedge_weight": hedge_weight,
+    }
 
 def summarize_portfolio_construction(
     weights: pd.Series | None,
@@ -5903,6 +6239,8 @@ def summarize_portfolio_construction(
     w = pd.Series(weights).dropna().astype(float)
     total_exp = float(w.sum())
     max_w = float(w.max()) if len(w) else 0.0
+    breadth = int((w[w > 0]).count())
+    cash_buffer = max(0.0, 1.0 - total_exp)
 
     # Constraint violations (uses your existing checker)
     violations = []
@@ -5932,6 +6270,8 @@ def summarize_portfolio_construction(
         "max_name_weight": max_w,
         "avg_turnover_last_12m": tpy,
         "exposure_target_range": (0.95, 1.05),
+        "breadth": breadth,
+        "cash_buffer": cash_buffer,
     }
     if name_cap is not None and name_cap <= 0.15 and max_w <= (name_cap + 1e-9):
         out["stats"]["name_cap_bonus"] = True
@@ -5948,6 +6288,13 @@ def summarize_portfolio_construction(
         out["ok"] = False
     if tpy is not None and tpy > 1.0:  # >100% monthly (0.5*L1 def)
         out["issues"].append("excessive-turnover")
+        out["ok"] = False
+    breadth_floor = max(6, int(round((1.0 / max(name_cap or 0.25, 1e-6)) * 0.6)))
+    if breadth < breadth_floor:
+        out["issues"].append(f"limited-breadth ({breadth} names)")
+        out["ok"] = False
+    if cash_buffer > 0.20:
+        out["issues"].append("excess-cash")
         out["ok"] = False
 
     return out
@@ -6027,7 +6374,13 @@ def run_trust_checks(
         pass
 
     # 1) Signal alignment
-    sig = summarize_signal_alignment(metrics or {})
+    hedge_weight = 0.0
+    if _HAS_ST:
+        try:
+            hedge_weight = float(st.session_state.get("latest_live_hedge", {}).get("weight") or 0.0)
+        except Exception:
+            hedge_weight = 0.0
+    sig = summarize_signal_alignment(metrics or {}, weights, hedge_weight)
 
     # 2) Portfolio construction
     constr = summarize_portfolio_construction(weights, sectors_map, name_cap, sector_cap, turnover_series)
