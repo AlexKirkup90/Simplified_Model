@@ -63,6 +63,9 @@ YF_ALIASES = {
 }
 
 
+_MACRO_MISSING_LOGGED: set[str] = set()
+
+
 def _alias_tickers(tickers: Iterable[str]) -> list[str]:
     return [YF_ALIASES.get(str(t).strip().upper(), str(t).strip().upper()) for t in (tickers or [])]
 
@@ -2295,6 +2298,7 @@ def calculate_portfolio_correlation_to_market(
     market_returns: pd.Series = None,
     *,
     return_metadata: bool = False,
+    min_points: int = 6,
 ) -> float | tuple[float, Dict[str, Any]]:
     """Calculate correlation between portfolio and benchmark.
 
@@ -2331,7 +2335,7 @@ def calculate_portfolio_correlation_to_market(
 
     # Portfolio series
     port = pd.Series(portfolio_returns).astype(float).dropna()
-    metadata: Dict[str, Any] = {"fallback": False, "points": 0, "status": "ok"}
+    metadata: Dict[str, Any] = {"fallback": False, "points": 0, "status": "ok", "n": 0}
     if port.empty:
         metadata.update({"fallback": True, "status": "missing"})
         if return_metadata:
@@ -2365,16 +2369,19 @@ def calculate_portfolio_correlation_to_market(
         return None
 
     # Align to the portfolio index and fill benchmark gaps conservatively
-    market_aligned = mkt_m.reindex(port_m.index).ffill()
-    aligned = pd.DataFrame({"portfolio": port_m, "market": market_aligned}).dropna()
-    metadata["points"] = int(len(aligned))
+    idx = port_m.index.intersection(mkt_m.index)
+    if len(idx) == 0:
+        metadata.update({"fallback": True, "status": "missing"})
+        if return_metadata:
+            return None, metadata
+        return None
 
-    if len(aligned) < 6:
+    aligned = pd.DataFrame({"portfolio": port_m.loc[idx], "market": mkt_m.loc[idx]}).dropna()
+    metadata["points"] = metadata["n"] = int(len(aligned))
+
+    if len(aligned) < max(int(min_points), 1):
         metadata.update({"fallback": True, "status": "insufficient_data"})
-        logging.warning(
-            "Hedge correlation fallback: insufficient overlap (n=%d)",
-            metadata["points"],
-        )
+        logging.info("Hedge correlation fallback: insufficient overlap (n=%d)", metadata["n"])
         if return_metadata:
             return None, metadata
         return None
@@ -2390,10 +2397,7 @@ def calculate_portfolio_correlation_to_market(
     corr = aligned["portfolio"].corr(aligned["market"])
     if pd.isna(corr):
         metadata.update({"fallback": True, "status": "insufficient_data"})
-        logging.warning(
-            "Hedge correlation fallback: correlation returned NaN (n=%d)",
-            metadata["points"],
-        )
+        logging.info("Hedge correlation fallback: correlation returned NaN (n=%d)", metadata["n"])
         if return_metadata:
             return None, metadata
         return None
@@ -2499,8 +2503,59 @@ def describe_hedge_state(
 # =========================
 # Helpers (Enhanced)
 # =========================
+def _sanitize_series(
+    obj: pd.Series | pd.DataFrame | None,
+    col_preference: tuple[str, ...] = ("Adj Close", "Close", "Value"),
+) -> pd.Series:
+    """Normalize Yahoo/FRED responses into a 1-D float Series with a DatetimeIndex."""
+
+    if obj is None:
+        return pd.Series(dtype=float)
+
+    if isinstance(obj, pd.Series):
+        s = obj.copy()
+    elif isinstance(obj, pd.DataFrame):
+        for col in col_preference:
+            if col in obj.columns:
+                s = obj[col].copy()
+                break
+        else:
+            num = obj.select_dtypes(include=["float", "int"])
+            if num.shape[1] == 0:
+                return pd.Series(dtype=float)
+            s = num.iloc[:, 0].copy()
+    else:
+        return pd.Series(dtype=float)
+
+    try:
+        s.index = pd.to_datetime(s.index, errors="coerce")
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        s = s.sort_index()
+
+    return pd.Series(s, dtype=float).dropna()
+
+
 def _safe_series(obj):
-    return obj.squeeze() if isinstance(obj, pd.DataFrame) else obj
+    return _sanitize_series(obj)
+
+
+def _yf_series(ticker: str, start: str, end: str) -> pd.Series:
+    """Download a single-ticker series from Yahoo and sanitize to 1-D."""
+
+    try:
+        df = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        return _sanitize_series(df, col_preference=("Adj Close", "Close"))
+    except Exception as e:
+        logging.warning("Failed to download %s: %s", ticker, e)
+        return pd.Series(dtype=float)
 
 def to_yahoo_symbol(sym: str) -> str:
     return str(sym).strip().upper().replace(".", "-")
@@ -6193,6 +6248,56 @@ def _above_200dma(px: pd.Series) -> float:
     return float(last > ma)
 
 
+def fetch_macro_series(start: str, end: str) -> Dict[str, Any]:
+    """Fetch macro series used by regime scoring with shape-safe handling."""
+
+    out: Dict[str, Any] = {
+        "vix": pd.Series(dtype=float),
+        "vix3m": pd.Series(dtype=float),
+        "hy_oas": pd.Series(dtype=float),
+        "vix_status": "ok",
+        "vix3m_status": "ok",
+        "hy_oas_status": "ok",
+    }
+
+    vix = _yf_series("^VIX", start, end)
+    if vix.empty:
+        out["vix_status"] = "missing"
+        if "^VIX" not in _MACRO_MISSING_LOGGED:
+            logging.warning("Macro fetch missing ^VIX data; using neutral defaults")
+            _MACRO_MISSING_LOGGED.add("^VIX")
+    out["vix"] = vix
+
+    vix3m = _yf_series("^VIX3M", start, end)
+    if vix3m.empty:
+        out["vix3m_status"] = "missing"
+        if "^VIX3M" not in _MACRO_MISSING_LOGGED:
+            logging.warning("Macro fetch missing ^VIX3M data; using neutral defaults")
+            _MACRO_MISSING_LOGGED.add("^VIX3M")
+    out["vix3m"] = vix3m
+
+    hy = pd.Series(dtype=float)
+    try:
+        try:
+            import pandas_datareader.data as pdr  # type: ignore
+
+            hy = _sanitize_series(pdr.DataReader("BAMLH0A0HYM2", "fred", start, end))
+        except Exception:
+            hy = pd.Series(dtype=float)
+    except Exception as exc:
+        logging.info("HY OAS fetch failed: %s", exc)
+        hy = pd.Series(dtype=float)
+
+    if hy.empty:
+        out["hy_oas_status"] = "missing"
+        if "BAMLH0A0HYM2" not in _MACRO_MISSING_LOGGED:
+            logging.warning("Macro fetch missing BAMLH0A0HYM2 data; using neutral defaults")
+            _MACRO_MISSING_LOGGED.add("BAMLH0A0HYM2")
+    out["hy_oas"] = hy
+
+    return out
+
+
 def _metric_or_default(metrics: Dict[str, float], key: str, default: float) -> float:
     val = metrics.get(key, np.nan)
     if pd.notna(val):
@@ -6355,21 +6460,46 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
     if qqq.empty:
         logging.warning("Regime metrics could not source QQQ or SPY; hedge inputs will be NaN")
 
-    vix = _safe_fetch("^VIX")
-    vix3m = _safe_fetch("^VIX3M")
-    hy_oas = _safe_fetch("BAMLH0A0HYM2")
+    macros = fetch_macro_series(start, end)
 
-    vix_ts = _vix_term_structure(vix, vix3m)
-    hy_oas_status = "ok"
+    vix_ts_status = "ok"
+    vix_ts_score = 50.0
+    vix_ts = 1.0
+    vix = macros.get("vix", pd.Series(dtype=float))
+    vix3m = macros.get("vix3m", pd.Series(dtype=float))
+    if vix.empty or vix3m.empty:
+        vix_ts_status = "missing"
+        vix_ts = 1.0
+    else:
+        aligned = pd.concat(
+            [
+                vix.rename("vix"),
+                vix3m.rename("vix3m"),
+            ],
+            axis=1,
+        ).dropna()
+        ratio = _vix_term_structure(aligned["vix"], aligned["vix3m"]) if not aligned.empty else np.nan
+        if pd.notna(ratio):
+            vix_ts = float(ratio)
+            vix_ts_score = float(_ratio_to_score(ratio, good_low=True, lo=0.8, hi=1.2))
+        else:
+            vix_ts_status = "insufficient_data"
+            vix_ts = 1.0
+
+    hy_oas_status = macros.get("hy_oas_status", "ok")
     hy_oas_last = np.nan
     hy_oas_score = 50.0
-    if hy_oas is None or hy_oas.dropna().empty:
+    hy_oas = macros.get("hy_oas", pd.Series(dtype=float))
+    if hy_oas is None or hy_oas.empty:
         hy_oas_status = "missing"
     else:
-        hy_oas = hy_oas.dropna()
-        hy_oas_last = _safe_last(hy_oas)
-        if pd.notna(hy_oas_last):
-            hy_oas_score = map_spread_to_score(hy_oas_last)
+        hy_aligned = hy_oas.reindex(universe_prices_daily.index).ffill().dropna()
+        if hy_aligned.empty:
+            hy_oas_status = "missing"
+        else:
+            hy_oas_last = _safe_last(hy_aligned)
+            if pd.notna(hy_oas_last):
+                hy_oas_score = float(map_spread_to_score(hy_oas_last))
 
     # Universe breadth above 200DMA (ignore tickers without sufficient history)
     above_flags: list[float] = []
@@ -6400,6 +6530,11 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
         if not six_m.empty:
             pos_6m = float((six_m > 0).mean())
 
+    if vix_ts_status != "ok":
+        logging.info("VIX term structure using neutral defaults (%s)", vix_ts_status)
+    if hy_oas_status != "ok":
+        logging.info("HY OAS score using neutral defaults (%s)", hy_oas_status)
+
     metrics = {
         "universe_above_200dma": pct_above_ma,
         "qqq_above_200dma": qqq_above_ma,
@@ -6407,6 +6542,10 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
         "breadth_pos_6m": pos_6m,
         "qqq_50dma_slope_10d": qqq_slope_50,
         "vix_term_structure": vix_ts,
+        "vix_ts_status": vix_ts_status,
+        "vix_ts_score": vix_ts_score,
+        "vix_status": macros.get("vix_status", "ok"),
+        "vix3m_status": macros.get("vix3m_status", "ok"),
         "hy_oas": hy_oas_last,
         "hy_oas_status": hy_oas_status,
         "hy_oas_score": hy_oas_score,
