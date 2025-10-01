@@ -207,32 +207,95 @@ def _serialize_frame(frame: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def standardize_backtest_payload(payload: Mapping[str, Any] | None) -> Dict[str, Any]:
-    """Return a JSON-friendly representation of backtest artefacts.
+def standardize_backtest_payload(
+    strategy_cum_gross: pd.Series | None,
+    strategy_cum_net: pd.Series | None,
+    qqq_cum: pd.Series | None,
+    hybrid_tno: pd.Series | None,
+    show_net: bool,
+) -> Dict[str, Any]:
+    """Normalise backtest artefacts into JSON-safe dictionaries.
 
-    The helper gracefully handles pandas objects without evaluating them in a
-    boolean context, preventing ambiguous truth-value errors when Series are
-    empty. Scalars are converted to native Python types so that downstream
-    caching layers (e.g., Streamlit session state) can safely serialise the
-    payload.
+    This helper provides a single canonical payload that downstream UI code can
+    consume without having to reason about pandas objects or truthiness
+    semantics. Series are converted into ``{"index": [...], "values": [...]}``
+    dictionaries with stringified indices and float values so they can be
+    safely stashed inside ``st.session_state``.
     """
 
-    if payload is None:
-        return {}
+    def _ser_to_dict(obj: pd.Series | None) -> Dict[str, list[Any]]:
+        if obj is None:
+            return {"index": [], "values": []}
+        ser = pd.Series(obj).dropna()
+        if ser.empty:
+            return {"index": [], "values": []}
+        return {
+            "index": [str(idx) for idx in ser.index],
+            "values": [float(v) for v in ser.astype(float).values],
+        }
 
-    out: Dict[str, Any] = {}
-    for key, value in payload.items():
-        if isinstance(value, pd.Series):
-            out[key] = _serialize_series(value)
-            continue
-        if isinstance(value, pd.DataFrame):
-            out[key] = _serialize_frame(value)
-            continue
-        if isinstance(value, (list, tuple, np.ndarray)):
-            out[key] = [_as_native_scalar(v) for v in list(value)]
-            continue
-        out[key] = _as_native_scalar(value)
-    return out
+    base = strategy_cum_net if (show_net and strategy_cum_net is not None) else strategy_cum_gross
+    base_series = pd.Series(base).dropna() if base is not None else pd.Series(dtype=float)
+    bench_series = pd.Series(qqq_cum).dropna() if qqq_cum is not None else pd.Series(dtype=float)
+
+    strat_rets = base_series.pct_change().dropna()
+    bench_rets = bench_series.pct_change().dropna()
+
+    return {
+        "equity_strategy": _ser_to_dict(base_series),
+        "equity_strategy_gross": _ser_to_dict(strategy_cum_gross),
+        "equity_strategy_net": _ser_to_dict(strategy_cum_net),
+        "equity_bench": _ser_to_dict(qqq_cum),
+        "turnover": _ser_to_dict(hybrid_tno),
+        "rets_strategy": _ser_to_dict(strat_rets),
+        "rets_bench": _ser_to_dict(bench_rets),
+    }
+
+
+def deserialize_backtest_series(payload: Mapping[str, Any] | None) -> pd.Series:
+    """Convert a canonical payload segment back into a pandas Series."""
+
+    if not isinstance(payload, Mapping):
+        return pd.Series(dtype=float)
+    try:
+        idx = pd.to_datetime(list(payload.get("index", [])))
+        vals = pd.to_numeric(pd.Series(payload.get("values", [])), errors="coerce")
+        series = pd.Series(vals.values, index=idx)
+        return series.dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def compute_hedge_metadata(
+    portfolio_rets: pd.Series | None,
+    bench_rets: pd.Series | None,
+    min_overlap: int = 12,
+) -> Dict[str, Any]:
+    """Compute hedge diagnostics with explicit overlap enforcement."""
+
+    if portfolio_rets is None or bench_rets is None:
+        return {"correlation": None, "overlap": 0}
+
+    a = pd.Series(portfolio_rets).dropna()
+    b = pd.Series(bench_rets).dropna()
+    if a.empty or b.empty:
+        return {"correlation": None, "overlap": 0}
+
+    aligned = a.to_frame("a").join(b.to_frame("b"), how="inner").dropna()
+    overlap = len(aligned)
+    if overlap < min_overlap:
+        if overlap > 0:
+            logging.warning(
+                "Hedge correlation skipped – only %d overlapping observations (min=%d)",
+                overlap,
+                min_overlap,
+            )
+        return {"correlation": None, "overlap": overlap}
+
+    corr = float(aligned["a"].corr(aligned["b"]))
+    if np.isnan(corr):
+        corr = None
+    return {"correlation": corr, "overlap": overlap}
 
 # =========================
 # Optional numba helpers
@@ -5379,26 +5442,47 @@ def _auto_run_backtest_for_live_portfolio(
         st.session_state["qqq_cum"] = qqq_cum
         st.session_state["hybrid_tno"] = hybrid_tno
         st.session_state["latest_backtest_timestamp"] = datetime.utcnow().isoformat()
-        st.session_state["latest_backtest_payload"] = standardize_backtest_payload(
-            {
-                "strategy_cum_gross": strat_cum_gross,
-                "strategy_cum_net": strat_cum_net,
-                "benchmark_cum": qqq_cum,
-                "turnover": hybrid_tno,
-            }
+        bt_payload = standardize_backtest_payload(
+            strategy_cum_gross=strat_cum_gross,
+            strategy_cum_net=strat_cum_net,
+            qqq_cum=qqq_cum,
+            hybrid_tno=hybrid_tno,
+            show_net=show_net,
         )
+        st.session_state["bt"] = bt_payload
+        st.session_state["latest_backtest_payload"] = bt_payload
     except Exception:
         pass
 
     base_curve = strat_cum_net if show_net and strat_cum_net is not None else strat_cum_gross
-    if base_curve is None:
+    try:
+        portfolio_rets = (
+            pd.Series(base_curve).pct_change().dropna() if base_curve is not None else pd.Series(dtype=float)
+        )
+    except Exception:
+        portfolio_rets = pd.Series(dtype=float)
+
+    try:
+        qqq_returns = pd.Series(qqq_cum).pct_change().dropna() if qqq_cum is not None else pd.Series(dtype=float)
+    except Exception:
+        qqq_returns = pd.Series(dtype=float)
+
+    hedge_meta = compute_hedge_metadata(portfolio_rets, qqq_returns, min_overlap=12)
+    if _HAS_ST:
+        try:
+            st.session_state["latest_backtest_hedge"] = {
+                **st.session_state.get("latest_backtest_hedge", {}),
+                **hedge_meta,
+            }
+        except Exception:
+            pass
+
+    if portfolio_rets.empty:
         return
 
     try:
-        monthly_returns = base_curve.pct_change().dropna()
-        qqq_returns = qqq_cum.pct_change().dropna() if qqq_cum is not None else None
-        health_metrics = get_strategy_health_metrics(monthly_returns, qqq_returns)
-        st.session_state["latest_backtest_monthly_returns"] = monthly_returns
+        health_metrics = get_strategy_health_metrics(portfolio_rets, qqq_returns if not qqq_returns.empty else None)
+        st.session_state["latest_backtest_monthly_returns"] = portfolio_rets
         st.session_state["latest_health_metrics"] = health_metrics
     except Exception:
         logging.warning("Auto health metric refresh failed", exc_info=True)
@@ -6570,27 +6654,50 @@ def run_trust_checks(
             hedge_weight = 0.0
     sig = summarize_signal_alignment(metrics or {}, weights, hedge_weight)
 
+    if turnover_series is None or len(getattr(turnover_series, "index", [])) == 0:
+        if _HAS_ST:
+            try:
+                bt_payload = st.session_state.get("bt", {})
+                turnover_series = deserialize_backtest_series(bt_payload.get("turnover"))
+            except Exception:
+                turnover_series = None
+    else:
+        turnover_series = pd.Series(turnover_series)
+
     # 2) Portfolio construction
     constr = summarize_portfolio_construction(weights, sectors_map, name_cap, sector_cap, turnover_series)
 
     # 3) Health (use the same series you show in Performance tab)
-    # Pull what the app saved in session
-    base_cum = st.session_state.get("strategy_cum_net")
-    if base_cum is None:
-        base_cum = st.session_state.get("strategy_cum_gross")
-    qqq_cum  = st.session_state.get("qqq_cum")
+    base_cum = pd.Series(dtype=float)
+    bench_cum = pd.Series(dtype=float)
+    if _HAS_ST:
+        try:
+            bt_payload = st.session_state.get("bt", {})
+            base_cum = deserialize_backtest_series(bt_payload.get("equity_strategy"))
+            bench_cum = deserialize_backtest_series(bt_payload.get("equity_bench"))
+        except Exception:
+            base_cum = pd.Series(dtype=float)
+            bench_cum = pd.Series(dtype=float)
 
-    def _to_monthly(series):
-        if series is None or len(series) == 0:
+    def _to_monthly(series: pd.Series | None) -> pd.Series:
+        if series is None:
             return pd.Series(dtype=float)
-        r = pd.Series(series).pct_change().dropna()
-        r.index = pd.to_datetime(r.index, errors="coerce")
-        r = r[~r.index.isna()]
-        return (1 + r).resample("M").prod() - 1
+        ser = pd.Series(series).dropna()
+        if ser.empty:
+            return pd.Series(dtype=float)
+        rets = ser.pct_change().dropna()
+        if rets.empty:
+            return pd.Series(dtype=float)
+        rets.index = pd.to_datetime(rets.index, errors="coerce")
+        rets = rets[~rets.index.isna()]
+        if rets.empty:
+            return pd.Series(dtype=float)
+        return (1 + rets).resample("M").prod() - 1
 
+    bench_monthly = _to_monthly(bench_cum)
     health = summarize_health(
         _to_monthly(base_cum),
-        _to_monthly(qqq_cum) if qqq_cum is not None else None
+        bench_monthly if not bench_monthly.empty else None,
     )
 
     summary = trust_checks_summary(sig.get("ok", False), constr.get("ok", False), health.get("ok", False))
