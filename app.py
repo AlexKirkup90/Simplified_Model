@@ -266,6 +266,39 @@ if go:
                 use_enhanced_features=st.session_state.get("use_enhanced_features", True),
                 auto_optimize=auto_optimize,
             )
+            try:
+                def _mk_cum(x):
+                    if x is None:
+                        return None
+                    if isinstance(x, pd.Series):
+                        cleaned = x.dropna()
+                        if (
+                            not cleaned.empty
+                            and cleaned.abs().max() <= 0.6
+                            and (cleaned.index.freq is not None or cleaned.index.inferred_freq is not None)
+                        ):
+                            return (1 + x.fillna(0)).cumprod()
+                        return x
+                    return None
+
+                strat_gross_candidate = _mk_cum(strategy_cum_gross)
+                if strat_gross_candidate is None and isinstance(auto_diag, dict):
+                    strat_gross_candidate = _mk_cum(auto_diag.get("hybrid_equity"))
+                strategy_cum_gross = strat_gross_candidate or _mk_cum(
+                    auto_diag.get("hybrid_equity") if isinstance(auto_diag, dict) else None
+                )
+                strategy_cum_net = _mk_cum(strategy_cum_net)
+                qqq_cum = _mk_cum(qqq_cum)
+
+                if (
+                    strategy_cum_gross is None
+                    and isinstance(auto_diag, dict)
+                    and "hybrid_rets_gross" in auto_diag
+                ):
+                    rets = auto_diag["hybrid_rets_gross"]
+                    strategy_cum_gross = (1 + rets.fillna(0)).cumprod()
+            except Exception as exc:
+                st.warning(f"Standardizing backtest outputs failed: {exc}")
             if strategy_cum_gross is not None:
                 st.session_state["strategy_cum_gross"] = strategy_cum_gross
             if strategy_cum_net is not None:
@@ -369,6 +402,8 @@ with tab2:
     else:
         # Decision banner
         st.info(decision)
+        if st.session_state.get("fallback_used"):
+            st.warning("🛟 Fallback composite allocation applied (sector-spread safety net).")
 
         hedge_details = st.session_state.get("latest_live_hedge", {})
         if hedge_details:
@@ -462,6 +497,31 @@ with tab2:
                 st.table(pd.DataFrame({"Issue": violations}))
             else:
                 st.success("No constraint violations")
+
+            cap_info = st.session_state.get("cap_debug_info")
+            if cap_info:
+                with st.expander("Constraint trims (post-cap breakdown)"):
+                    top_weights = pd.Series(cap_info.get("top_weights", {}))
+                    if not top_weights.empty:
+                        st.markdown("**Top weights after caps:**")
+                        st.dataframe(top_weights.map(lambda x: f"{x:.2%}"), use_container_width=True)
+
+                    sector_before = pd.Series(cap_info.get("sector_before", {}))
+                    sector_after = pd.Series(cap_info.get("sector_after", {}))
+                    if not sector_after.empty:
+                        st.markdown("**Sector weights (before vs after caps):**")
+                        sector_df = pd.DataFrame({
+                            "Before": sector_before.map(lambda x: f"{x:.2%}"),
+                            "After": sector_after.map(lambda x: f"{x:.2%}"),
+                        }).fillna("—")
+                        st.dataframe(sector_df, use_container_width=True)
+
+                    pre_sum = cap_info.get("pre_cap_sum")
+                    post_sum = cap_info.get("post_cap_sum")
+                    if pre_sum is not None and post_sum is not None:
+                        st.caption(
+                            f"Exposure sum before caps: {pre_sum:.2%} → after caps: {post_sum:.2%}."
+                        )
 
         # Gated save action – only visible on rebalance days
         if is_rebalance_day and st.button("💾 Save Portfolio"):
@@ -962,6 +1022,24 @@ with tab7:
         st.session_state["hybrid_tno"] = hybrid_tno
     except Exception:
         turnover_series = st.session_state.get("hybrid_tno")
+
+    metrics = metrics or {}
+
+    def _nz(x, neutral=0.0):
+        try:
+            val = float(x)
+            if np.isfinite(val):
+                return val
+            return neutral
+        except Exception:
+            return neutral
+
+    metrics["breadth_pos_6m"] = _nz(metrics.get("breadth_pos_6m"), 0.45)
+    metrics["qqq_vol_10d"] = _nz(metrics.get("qqq_vol_10d"), 0.03)
+    metrics["vix_term_structure"] = _nz(metrics.get("vix_term_structure"), 1.05)
+
+    if turnover_series is None or getattr(turnover_series, "empty", True):
+        turnover_series = pd.Series([0.08], index=[pd.Timestamp.today().normalize()])
 
     name_cap   = float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25)))
     sector_cap = float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30)))
