@@ -27,6 +27,7 @@ def test_correlation_none_when_overlap_short():
     assert meta["fallback"] is True
     assert meta["status"] == "insufficient_data"
     assert meta["points"] == 5
+    assert meta["n"] == 5
 
 
 def test_correlation_none_when_series_degenerate():
@@ -43,3 +44,4 @@ def test_correlation_none_when_series_degenerate():
     assert corr is None
     assert meta["status"] == "degenerate_series"
     assert meta["fallback"] is True
+    assert meta["n"] == 6

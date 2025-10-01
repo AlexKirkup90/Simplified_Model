@@ -63,13 +63,19 @@ def test_hy_oas_missing_sets_neutral_score(monkeypatch):
     idx = pd.date_range("2020-01-01", periods=260, freq="B")
     prices = pd.DataFrame({"AAPL": np.linspace(100, 150, len(idx))}, index=idx)
 
-    def fake_benchmark(ticker, start, end):
-        data = pd.Series(np.linspace(100, 120, len(idx)), index=idx)
-        if ticker == "BAMLH0A0HYM2":
-            return pd.Series(dtype=float)
-        return data
+    base = pd.Series(np.linspace(15, 20, len(idx)), index=idx)
 
-    monkeypatch.setattr(backend, "get_benchmark_series", fake_benchmark)
+    def fake_macro(start, end):
+        return {
+            "vix": base,
+            "vix3m": base * 1.1,
+            "hy_oas": pd.Series(dtype=float),
+            "vix_status": "ok",
+            "vix3m_status": "ok",
+            "hy_oas_status": "missing",
+        }
+
+    monkeypatch.setattr(backend, "fetch_macro_series", fake_macro)
 
     metrics = backend.compute_regime_metrics(prices)
     assert metrics["hy_oas_status"] == "missing"
