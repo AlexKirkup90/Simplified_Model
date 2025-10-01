@@ -1,8 +1,11 @@
+import pathlib
+import sys
+import types
+
 import numpy as np
 import pandas as pd
 import pytest
 import streamlit as st
-import sys, pathlib, types
 
 # Provide empty secrets so backend import does not fail
 st.secrets = types.SimpleNamespace(get=lambda *args, **kwargs: None)
@@ -13,7 +16,7 @@ import backend
 
 def test_calculate_portfolio_correlation_resamples_to_monthly():
     # Three months of daily returns
-    index = pd.date_range("2023-01-01", periods=90, freq="D")
+    index = pd.date_range("2023-01-01", periods=220, freq="D")
     rng = np.random.default_rng(seed=42)
     market_daily = rng.normal(0.001, 0.01, len(index))
     portfolio_daily = market_daily + rng.normal(0, 0.005, len(index))
@@ -39,6 +42,7 @@ def test_calculate_portfolio_correlation_fallback_metadata():
         return_metadata=True,
     )
 
-    assert corr == 0.0
+    assert corr is None
     assert meta["fallback"] is True
     assert meta["points"] <= 2
+    assert meta["status"] == "insufficient_data"

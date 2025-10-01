@@ -558,11 +558,36 @@ HEDGE_MAX_DEFAULT       = 0.20
 HEDGE_TICKER_LABEL      = "QQQ (Hedge)"
 HEDGE_TICKER_ALIASES    = {HEDGE_TICKER_LABEL, "QQQ_HEDGE", "QQQ-HEDGE"}
 
-MIN_ELIGIBLE_FALLBACK   = 12
+MIN_ELIGIBLE_FALLBACK   = 15
 LEADERSHIP_SLICE_DEFAULT = 0.30
 CORE_SPY_SLICE_DEFAULT   = 0.20
 FALLBACK_CORE_TICKER     = "SPY"
-FALLBACK_LEADERSHIP_ETFS = ["QQQ", "XLK", "XLC", "XLV", "XLY", "XLI"]
+FALLBACK_LEADERSHIP_ETFS = [
+    "QQQ",
+    "XLK",
+    "XLC",
+    "XLV",
+    "XLY",
+    "XLI",
+    "XLF",
+    "XLE",
+    "XLP",
+    "XLU",
+]
+FALLBACK_BROAD_ETFS = ["QQQ", "SPY", "VOO", "RSP", "VTI"]
+FALLBACK_SECTOR_ETFS = [
+    "XLK",
+    "XLC",
+    "XLV",
+    "XLY",
+    "XLI",
+    "XLF",
+    "XLE",
+    "XLP",
+    "XLU",
+    "XLRE",
+    "XLB",
+]
 
 # Defaults for regime-based exposure adjustments
 VIX_TS_THRESHOLD_DEFAULT = 1.0   # VIX3M / VIX ratio; <1 implies stress
@@ -644,7 +669,8 @@ def _record_hedge_state(scope: str,
                         weight: float,
                         correlation: float | None,
                         regime_metrics: Dict[str, float],
-                        correlation_fallback: bool = False) -> None:
+                        correlation_fallback: bool = False,
+                        corr_status: str | None = None) -> None:
     """Persist the latest hedge details for UI/reporting purposes."""
     if not _HAS_ST:
         return
@@ -657,11 +683,13 @@ def _record_hedge_state(scope: str,
         "breadth_pos_6m": regime_metrics.get("breadth_pos_6m"),
         "timestamp": datetime.utcnow().isoformat(),
         "correlation_fallback": bool(correlation_fallback),
+        "corr_status": corr_status or ("fallback" if correlation_fallback else "ok"),
         "reason": describe_hedge_state(
             weight,
             correlation,
             regime_metrics,
             correlation_fallback=correlation_fallback,
+            corr_status=corr_status,
         ),
     }
     st.session_state[f"latest_{scope}_hedge"] = summary
@@ -1824,24 +1852,36 @@ def _determine_equity_target(
     metrics = dict(regime_metrics or {})
     label = (regime_label or metrics.get("regime") or "").strip() or LATEST_REGIME_LABEL
 
-    target = float(
-        np.clip(get_regime_adjusted_exposure(metrics) if metrics else base_target, 0.0, 1.0)
-    )
+    try:
+        regime_score = float(metrics.get("regime_score", np.nan))
+    except Exception:
+        regime_score = np.nan
+
+    if not np.isnan(regime_score):
+        regime_score = float(np.clip(regime_score, 0.0, 100.0))
+        target = 0.10 + (regime_score / 100.0) * 1.0
+    else:
+        baseline = get_regime_adjusted_exposure(metrics) if metrics else base_target
+        try:
+            baseline = float(baseline)
+        except Exception:
+            baseline = float(base_target)
+        if baseline <= 0:
+            baseline = 0.6
+        # Map the historical 0.0-1.2 exposure range into the new 0.10-1.10 band.
+        target = float(np.interp(baseline, [0.0, 1.2], [0.10, 1.10]))
 
     normalized_label = label.lower()
     if "extreme" in normalized_label and "risk-off" in normalized_label:
-        target = min(target, 0.25)
-    elif normalized_label == "risk-off":
-        target = min(target, 0.45)
+        target = min(target, 0.35)
+    elif normalized_label == "risk-off" or (not np.isnan(regime_score) and regime_score <= 35.0):
+        target = min(target, 0.50)
     elif normalized_label == "neutral":
-        target = min(target, 0.65)
-    elif normalized_label == "risk-on":
-        target = min(max(target, 0.75), 0.95)
+        target = min(max(target, 0.60), 0.90)
+    elif normalized_label == "risk-on" or (not np.isnan(regime_score) and regime_score >= 70.0):
+        target = max(target, 0.85)
 
-    if base_target > 0:
-        target = min(target, float(base_target))
-
-    return float(np.clip(target, 0.0, 1.0))
+    return float(np.clip(target, 0.10, 1.10))
 
 
 def select_leadership_etfs(metrics: Mapping[str, float] | None) -> list[str]:
@@ -1857,10 +1897,15 @@ def select_leadership_etfs(metrics: Mapping[str, float] | None) -> list[str]:
     except Exception:
         slope = 0.0
 
+    ordered: list[str] = []
     if qqq_above >= 1.0 and slope >= 0.0:
-        return ["QQQ"]
+        ordered.append("QQQ")
 
-    ordered = list(dict.fromkeys(FALLBACK_LEADERSHIP_ETFS))
+    # Core leadership set with growth tilt
+    for ticker in FALLBACK_LEADERSHIP_ETFS:
+        if ticker not in ordered:
+            ordered.append(ticker)
+
     if qqq_above < 0.5:
         # When leadership is weak, prefer a more defensive blend
         defensive = ["XLV", "XLU", "XLP"]
@@ -1872,7 +1917,73 @@ def select_leadership_etfs(metrics: Mapping[str, float] | None) -> list[str]:
     if slope > 0.0 and "QQQ" not in ordered:
         ordered.insert(0, "QQQ")
 
-    return ordered[:3] if len(ordered) >= 3 else ordered
+    # Round out with broad-market ETFs and remaining sectors to reach ≥10 names
+    for ticker in FALLBACK_BROAD_ETFS:
+        if ticker not in ordered:
+            ordered.append(ticker)
+    for ticker in FALLBACK_SECTOR_ETFS:
+        if ticker not in ordered:
+            ordered.append(ticker)
+
+    if len(ordered) < 10:
+        # Pad with cash-like placeholders (ignored later if already present)
+        extra = [t for t in ["IWF", "IWD", "MDY"] if t not in ordered]
+        ordered.extend(extra)
+
+    return ordered[: max(10, len(ordered))]
+
+
+def _ensure_min_positions(
+    weights: pd.Series,
+    equity_target: float,
+    min_n: int,
+    per_name_cap: float,
+    candidate_order: list[str],
+) -> tuple[pd.Series, list[str]]:
+    """Pad/cap weights to guarantee minimum breadth at the desired exposure."""
+
+    eq_target = float(max(equity_target, 0.0))
+    per_cap = float(max(per_name_cap, 0.0))
+    series = pd.Series(weights).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    series = series[series > 0]
+
+    if eq_target <= 0 or min_n <= 0:
+        return series.sort_values(ascending=False), []
+
+    added: list[str] = []
+    current = len(series)
+    needed = max(0, int(min_n) - current)
+    if needed > 0:
+        pool = [t for t in candidate_order if t not in series.index]
+        to_add = pool[:needed]
+        added.extend(to_add)
+        if to_add:
+            placeholder = pd.Series(eq_target / float(current + len(to_add) or 1), index=to_add, dtype=float)
+            series = pd.concat([series, placeholder])
+
+    if series.empty:
+        return series, added
+
+    total = float(series.sum())
+    if total <= 0:
+        share = eq_target / float(len(series))
+        series[:] = share
+    else:
+        series = series * (eq_target / total)
+
+    cap_limit = per_cap
+    if eq_target <= 0.50:
+        cap_limit = max(per_cap, 0.20)
+    else:
+        cap_limit = min(per_cap, 0.10) if per_cap > 0 else 0.10
+
+    capped = cap_weights(series / eq_target, cap=cap_limit)
+    series = capped * eq_target
+
+    # Numerical cleanup
+    series = series[series > 0]
+    series = series.sort_values(ascending=False)
+    return series, added
 
 
 def compose_graceful_fallback(
@@ -1884,7 +1995,7 @@ def compose_graceful_fallback(
     eligible_pool: int,
     leadership_slice: float,
     core_slice: float,
-) -> tuple[pd.Series, bool, float, float]:
+) -> tuple[pd.Series, bool, float, float, Dict[str, Any]]:
     """Blend leadership ETFs, core exposure, and stock sleeve under stress."""
 
     min_names = int(max(0, min_names))
@@ -1896,6 +2007,16 @@ def compose_graceful_fallback(
     stocks = stocks[stocks > 0]
     stock_count = int(len(stocks))
     current_equity = float(stocks.sum())
+
+    fallback_meta: Dict[str, Any] = {
+        "components": [],
+        "added": [],
+        "candidate_pool": [],
+        "equity_target": float(equity_target),
+        "leadership_slice": float(leadership_slice),
+        "core_slice": float(core_slice),
+        "per_name_cap": 0.10,
+    }
 
     fallback_required = (
         equity_target <= 0.0
@@ -1913,15 +2034,20 @@ def compose_graceful_fallback(
         core_slice *= scale
 
     if not fallback_required:
+        fallback_meta["components"] = list(stocks.sort_values(ascending=False).index)
         if current_equity > 0 and not np.isclose(current_equity, equity_target):
             stocks = stocks * (equity_target / current_equity)
         cash_weight = max(0.0, 1.0 - float(stocks.sum()))
-        return stocks.sort_values(ascending=False), False, equity_target, cash_weight
+        return stocks.sort_values(ascending=False), False, equity_target, cash_weight, fallback_meta
+
+    per_name_cap = 0.10
+    fallback_meta["per_name_cap"] = per_name_cap
 
     leadership_weight = equity_target * leadership_slice
     core_weight = equity_target * core_slice
 
     leadership_tickers = select_leadership_etfs(regime_metrics)
+    fallback_meta["candidate_pool"] = list(leadership_tickers)
     leadership_series = pd.Series(dtype=float)
     if leadership_weight > 0 and leadership_tickers:
         weights = pd.Series(1.0, index=leadership_tickers, dtype=float)
@@ -1941,9 +2067,33 @@ def compose_graceful_fallback(
     combined = combined.groupby(level=0).sum()
     combined = combined[combined > 0].sort_values(ascending=False)
 
-    cash_weight = max(0.0, 1.0 - float(combined.sum()))
+    candidate_order: list[str] = []
+    candidate_order.extend(leadership_tickers)
+    for ticker in FALLBACK_BROAD_ETFS:
+        if ticker not in candidate_order:
+            candidate_order.append(ticker)
+    for ticker in FALLBACK_SECTOR_ETFS:
+        if ticker not in candidate_order:
+            candidate_order.append(ticker)
+    fallback_meta["candidate_pool"] = list(candidate_order)
 
-    return combined.sort_values(ascending=False), True, equity_target, cash_weight
+    combined, added = _ensure_min_positions(
+        combined,
+        equity_target,
+        min_names,
+        per_name_cap,
+        candidate_order,
+    )
+    fallback_meta["added"] = added
+    fallback_meta["components"] = list(combined.index)
+
+    cash_weight = max(0.0, 1.0 - float(combined.sum())) if equity_target <= 1.0 else 0.0
+
+    if len(combined) < min_names:
+        # Use cash as final filler if ETF supply was insufficient
+        cash_weight = max(cash_weight, float(min_names - len(combined)) * 0.0)
+
+    return combined.sort_values(ascending=False), True, equity_target, cash_weight, fallback_meta
 
 ######################################################################
 # Parameter mapping updater
@@ -2181,12 +2331,12 @@ def calculate_portfolio_correlation_to_market(
 
     # Portfolio series
     port = pd.Series(portfolio_returns).astype(float).dropna()
-    metadata: Dict[str, Any] = {"fallback": False, "points": 0}
+    metadata: Dict[str, Any] = {"fallback": False, "points": 0, "status": "ok"}
     if port.empty:
-        metadata["fallback"] = True
+        metadata.update({"fallback": True, "status": "missing"})
         if return_metadata:
-            return 0.0, metadata
-        return 0.0
+            return None, metadata
+        return None
 
     # Market series (fetch QQQ if not provided)
     if market_returns is None:
@@ -2196,11 +2346,11 @@ def calculate_portfolio_correlation_to_market(
             qqq_px = get_benchmark_series("QQQ", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
             mkt = qqq_px.pct_change().dropna()
         except Exception:
-            metadata["fallback"] = True
+            metadata.update({"fallback": True, "status": "missing"})
             logging.warning("Hedge correlation fallback: unable to source benchmark series")
             if return_metadata:
-                return 0.0, metadata
-            return 0.0
+                return None, metadata
+            return None
     else:
         mkt = pd.Series(market_returns).astype(float).dropna()
 
@@ -2209,40 +2359,48 @@ def calculate_portfolio_correlation_to_market(
     mkt_m  = _to_monthly_returns(mkt)
 
     if port_m.empty or mkt_m.empty:
-        metadata["fallback"] = True
+        metadata.update({"fallback": True, "status": "missing"})
         if return_metadata:
-            return 0.0, metadata
-        return 0.0
+            return None, metadata
+        return None
 
     # Align to the portfolio index and fill benchmark gaps conservatively
     market_aligned = mkt_m.reindex(port_m.index).ffill()
     aligned = pd.DataFrame({"portfolio": port_m, "market": market_aligned}).dropna()
     metadata["points"] = int(len(aligned))
 
-    if len(aligned) < 3:
-        metadata["fallback"] = True
+    if len(aligned) < 6:
+        metadata.update({"fallback": True, "status": "insufficient_data"})
         logging.warning(
             "Hedge correlation fallback: insufficient overlap (n=%d)",
             metadata["points"],
         )
         if return_metadata:
-            return 0.0, metadata
-        return 0.0
+            return None, metadata
+        return None
+
+    port_std = float(aligned["portfolio"].std(ddof=0))
+    mkt_std = float(aligned["market"].std(ddof=0))
+    if np.isclose(port_std, 0.0) or np.isclose(mkt_std, 0.0):
+        metadata.update({"fallback": True, "status": "degenerate_series"})
+        if return_metadata:
+            return None, metadata
+        return None
 
     corr = aligned["portfolio"].corr(aligned["market"])
     if pd.isna(corr):
-        metadata["fallback"] = True
+        metadata.update({"fallback": True, "status": "insufficient_data"})
         logging.warning(
             "Hedge correlation fallback: correlation returned NaN (n=%d)",
             metadata["points"],
         )
         if return_metadata:
-            return 0.0, metadata
-        return 0.0
+            return None, metadata
+        return None
 
     corr_value = float(corr)
     if return_metadata:
-        metadata["fallback"] = False
+        metadata.update({"fallback": False, "status": "ok"})
         return corr_value, metadata
     return corr_value
 
@@ -2266,7 +2424,9 @@ def build_hedge_weight(portfolio_returns: pd.Series,
     if precomputed_correlation is None:
         corr = calculate_portfolio_correlation_to_market(portfolio_returns)
     else:
-        corr = float(precomputed_correlation)
+        corr = float(precomputed_correlation) if precomputed_correlation is not None else None
+    if corr is None:
+        return 0.0
     if pd.isna(corr):
         logging.warning("Hedge correlation unavailable – defaulting to 0.0 for sizing")
         corr = 0.0
@@ -2296,6 +2456,7 @@ def describe_hedge_state(
     regime_metrics: Dict[str, float],
     corr_threshold: float = 0.8,
     correlation_fallback: bool = False,
+    corr_status: str | None = None,
 ) -> str:
     """Provide a human-readable explanation for the hedge decision."""
 
@@ -2317,7 +2478,10 @@ def describe_hedge_state(
         if correlation_fallback:
             reasons.append("correlation unavailable (fallback applied)")
         elif correlation is None or pd.isna(correlation):
-            reasons.append("insufficient data for correlation")
+            status_note = "insufficient data for correlation"
+            if corr_status and corr_status != "ok":
+                status_note = corr_status.replace("_", " ")
+            reasons.append(status_note)
         elif float(correlation) < corr_threshold:
             reasons.append(f"correlation {float(correlation):.2f} < {corr_threshold:.2f}")
         if not bearish_flags:
@@ -5047,7 +5211,7 @@ def generate_live_portfolio_isa_monthly(
 
     hedge_weight = 0.0
     corr = np.nan
-    corr_meta: Dict[str, Any] = {"fallback": False}
+    corr_meta: Dict[str, Any] = {"fallback": False, "status": "ok", "points": 0}
     portfolio_recent = pd.Series(dtype=float)
     try:
         cfg_live = HybridConfig(
@@ -5085,7 +5249,8 @@ def generate_live_portfolio_isa_monthly(
             precomputed_correlation=corr,
         )
     except Exception:
-        corr_meta = {"fallback": True}
+        corr = None
+        corr_meta = {"fallback": True, "status": "error", "points": 0}
         logging.warning("H02 hedge overlay failed in allocation", exc_info=True)
 
     # Trigger vs previous portfolio (health of current)
@@ -5165,7 +5330,13 @@ def generate_live_portfolio_isa_monthly(
     base_equity_target = float(final_weights.sum()) if isinstance(final_weights, pd.Series) else 0.0
     if base_equity_target <= 0:
         base_equity_target = target_equity
-    blended_weights, graceful_fallback, equity_target_used, cash_weight = compose_graceful_fallback(
+    (
+        blended_weights,
+        graceful_fallback,
+        equity_target_used,
+        cash_weight,
+        fallback_meta,
+    ) = compose_graceful_fallback(
         final_weights,
         regime_metrics,
         current_regime_label,
@@ -5176,6 +5347,14 @@ def generate_live_portfolio_isa_monthly(
         core_slice,
     )
     final_weights = blended_weights.astype(float)
+
+    if _HAS_ST:
+        try:
+            st.session_state["fallback_components"] = list(fallback_meta.get("components", []))
+            st.session_state["fallback_details"] = fallback_meta
+            st.session_state["fallback_equity_target"] = float(equity_target_used)
+        except Exception:
+            pass
 
     for ticker in final_weights.index:
         if ticker == "CASH":
@@ -5188,6 +5367,15 @@ def generate_live_portfolio_isa_monthly(
         fallback_msg = (
             "Graceful fallback blend engaged (leadership ETF/core/cash overlay)."
         )
+        components = list(fallback_meta.get("components", []))
+        if components:
+            preview = ", ".join(components[:10])
+            logging.info(
+                "Graceful fallback components (%d): %s%s",
+                len(components),
+                preview,
+                "…" if len(components) > 10 else "",
+            )
         if decision:
             decision = f"{decision}\n{fallback_msg}"
         else:
@@ -5234,6 +5422,7 @@ def generate_live_portfolio_isa_monthly(
         corr,
         regime_metrics,
         correlation_fallback=bool(corr_meta.get("fallback")),
+        corr_status=corr_meta.get("status"),
     )
 
     if is_monthly and isinstance(final_weights, pd.Series) and not final_weights.empty:
@@ -5253,6 +5442,7 @@ def generate_live_portfolio_isa_monthly(
         corr,
         regime_metrics,
         correlation_fallback=bool(corr_meta.get("fallback")),
+        corr_status=corr_meta.get("status"),
     )
     decision = (decision or "").strip()
     decision = f"{decision}\n{hedge_note}" if decision else hedge_note
@@ -5591,7 +5781,8 @@ def run_backtest_isa_dynamic(
             hedge_returns = -hedge_weight * qqq_aligned
             hybrid_gross = hybrid_gross.add(hedge_returns, fill_value=0.0)
     except Exception:
-        corr_meta = {"fallback": True}
+        corr = None
+        corr_meta = {"fallback": True, "status": "error", "points": 0}
         logging.warning("H01 hedge overlay failed in backtest", exc_info=True)
 
     state = "active" if hedge_weight > 0 else "inactive"
@@ -5605,6 +5796,7 @@ def run_backtest_isa_dynamic(
         corr,
         regime_metrics,
         correlation_fallback=bool(corr_meta.get("fallback")),
+        corr_status=corr_meta.get("status"),
     )
 
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
