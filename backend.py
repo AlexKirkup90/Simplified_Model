@@ -57,6 +57,9 @@ except Exception:  # pragma: no cover - fallback if module layout changes
 
 warnings.filterwarnings("ignore")
 
+# Track the most recently classified market regime for downstream gating logic.
+LATEST_REGIME_LABEL: str = "Risk-On"
+
 # =========================
 # Backtest cache helpers
 # =========================
@@ -3478,6 +3481,25 @@ def _build_isa_weights_fixed(
     panels = compute_signal_panels(daily_close)
     monthly = panels.get("monthly", pd.DataFrame())
 
+    current_regime = LATEST_REGIME_LABEL
+    if _HAS_ST:
+        try:
+            current_regime = st.session_state.get("latest_regime_label", current_regime)
+        except Exception:
+            pass
+
+    n_after_prune = n_after_mom = n_after_mr = 0
+
+    def _log_pipeline_counts(final_count: int) -> None:
+        logging.info(
+            "ELIGIBLE COUNTS | after_prune=%d | after_mom_gate=%d | after_mr_gate=%d | final=%d | regime=%s",
+            int(n_after_prune),
+            int(n_after_mom),
+            int(n_after_mr),
+            int(final_count),
+            current_regime,
+        )
+
     # --- Momentum Component (NO CAPS YET) ---
     try:
         comp_all = composite_score(daily_close, panels=panels)
@@ -3488,6 +3510,7 @@ def _build_isa_weights_fixed(
             raise
     comp_vec = comp_all.iloc[-1].dropna() if isinstance(comp_all, pd.DataFrame) else pd.Series(comp_all).dropna()
     comp_vec_full = comp_vec.copy()
+    n_after_prune = len(comp_vec_full)
 
     momz = blended_momentum_z(monthly)
     mom_pool = comp_vec_full.copy()
@@ -3531,6 +3554,7 @@ def _build_isa_weights_fixed(
 
     mom_cap = float(preset.get("mom_cap", 0.25))
     mom_weight = float(preset.get("mom_w", 0.0))
+    n_after_mom = len(mom_pool)
     w_mom_core = _safe_momentum_weights(mom_pool, top_n=int(preset["mom_topn"]), name_cap=mom_cap)
     mom_raw = w_mom_core * mom_weight if not w_mom_core.empty else pd.Series(dtype=float)
 
@@ -3542,13 +3566,20 @@ def _build_isa_weights_fixed(
     else:
         long_ma = daily_close.rolling(preset["mr_ma"]).mean().iloc[-1]
     quality = (daily_close.iloc[-1] > long_ma)
-    _debug_stage("quality/MA gate", [t for t, ok in quality.items() if ok])
-    w_mr_core = _safe_mr_weights(st_ret, quality.astype(bool), top_n=int(preset["mr_topn"]))
+    quality_gate = quality.astype(bool)
+    if isinstance(quality_gate, pd.Series) and current_regime in ("Risk-Off", "Extreme Risk-Off"):
+        min_required = max(5, int(0.05 * len(quality_gate)))
+        if int(quality_gate.sum()) < min_required:
+            quality_gate[:] = True
+    _debug_stage("quality/MA gate", [t for t, ok in quality_gate.items() if ok])
+    n_after_mr = int(quality_gate.sum()) if isinstance(quality_gate, pd.Series) else 0
+    w_mr_core = _safe_mr_weights(st_ret, quality_gate, top_n=int(preset["mr_topn"]))
     mr_raw = w_mr_core * float(preset.get("mr_w", 0.0)) if not w_mr_core.empty else pd.Series(dtype=float)
 
     # --- Combine Components BEFORE Applying Caps ---
     combined_raw = mom_raw.add(mr_raw, fill_value=0.0)
     if combined_raw.empty or combined_raw.sum() <= 0:
+        _log_pipeline_counts(0)
         return combined_raw
 
     if use_enhanced_features:
@@ -3587,6 +3618,8 @@ def _build_isa_weights_fixed(
         sector_cap=preset.get("sector_cap", 0.30),
         target_equity=target_equity,
     )
+
+    _log_pipeline_counts(len(final_weights))
 
     return final_weights
 
@@ -3723,22 +3756,32 @@ def _safe_momentum_weights(scores: pd.Series, top_n: int, name_cap: float) -> pd
         return pd.Series(dtype=float)
 
     ranked = scores.dropna().sort_values(ascending=False)
-    top = ranked.head(max(1, int(top_n)))
+    if ranked.empty:
+        return pd.Series(dtype=float)
 
-    raw = top[top > 0]
-    if raw.empty or raw.sum() <= 0:
-        raw = top.clip(lower=0)
+    positive = ranked[ranked > 0]
+    pool = positive
+    if pool.empty:
+        k = max(10, int(0.10 * len(ranked)))
+        pool = ranked.head(k)
 
-    if raw.sum() <= 0:
+    if pool.empty:
+        return pd.Series(dtype=float)
+
+    top = pool.head(max(1, int(top_n)))
+    total = float(top.sum())
+    if not np.isfinite(total) or total <= 0:
         raw = pd.Series(1.0 / len(top), index=top.index)
     else:
-        raw = raw / raw.sum()
+        raw = top / total
 
     w = cap_weights(raw, cap=float(name_cap))
-    if w.sum() <= 0:
-        w = pd.Series(1.0 / len(raw), index=raw.index)
+    total_w = float(w.sum())
+    if total_w <= 0:
+        w = pd.Series(1.0 / len(top), index=top.index)
+        total_w = float(w.sum())
 
-    return (w / w.sum()).astype(float)
+    return (w / total_w).astype(float)
 
 
 def _safe_mr_weights(
@@ -3836,6 +3879,21 @@ def generate_live_portfolio_isa_monthly(
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(mom_cap)
     params.setdefault("target_equity", 0.85)
+
+    def _fallback_momentum_weights(px_daily: pd.DataFrame, top_n: int, cap: float) -> pd.Series:
+        monthly_px = px_daily.resample("M").last()
+        z = blended_momentum_z(monthly_px)
+        z = z.dropna()
+        if z.empty:
+            return pd.Series(dtype=float)
+        top = z.nlargest(top_n)
+        w = top.clip(lower=-np.inf)
+        w = w - float(w.min()) if len(w) else w
+        if w.sum() <= 0:
+            w = pd.Series(1.0, index=top.index, dtype=float)
+        w = w / w.sum()
+        w = cap_weights(w, cap=float(cap))
+        return (w / w.sum()).astype(float) if w.sum() > 0 else pd.Series(dtype=float)
 
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
@@ -3989,12 +4047,23 @@ def generate_live_portfolio_isa_monthly(
     st.session_state["latest_price_index"] = close.index
 
     regime_metrics: Dict[str, float] = {}
+    current_regime_label: str | None = None
     if len(close) > 0:
         try:
             regime_metrics = compute_regime_metrics(close)
+            current_regime_label = _classify_market_regime(regime_metrics)
         except Exception:
             logging.warning("R02 regime metric calculation failed in allocation", exc_info=True)
             regime_metrics = {}
+
+    if current_regime_label:
+        global LATEST_REGIME_LABEL
+        LATEST_REGIME_LABEL = current_regime_label
+        if _HAS_ST:
+            try:
+                st.session_state["latest_regime_label"] = current_regime_label
+            except Exception:
+                pass
 
     # Monthly lock check – always compute new weights
     is_monthly = is_rebalance_today(today, close.index)
@@ -4004,6 +4073,32 @@ def generate_live_portfolio_isa_monthly(
     new_w = _build_isa_weights_fixed(
         close, params, sectors_map, use_enhanced_features=use_enhanced_features
     )
+
+    if not isinstance(new_w, pd.Series):
+        new_w = pd.Series(dtype=float)
+
+    if new_w.empty or float(new_w.sum() or 0.0) <= 0:
+        logging.info("Fallback momentum engaged: primary selection empty after gating.")
+        if _HAS_ST:
+            try:
+                cap_val = float(st.session_state.get("name_cap", params.get("mom_cap", 0.20)))
+            except Exception:
+                cap_val = float(params.get("mom_cap", 0.20))
+        else:
+            cap_val = float(params.get("mom_cap", 0.20))
+        top_n = int(params.get("mom_topn", preset.get("mom_topn", 15)))
+        fb = _fallback_momentum_weights(close, top_n=top_n, cap=cap_val)
+        if not fb.empty:
+            new_w = fb.copy()
+
+    if new_w.empty or float(new_w.sum() or 0.0) <= 0:
+        logging.warning("All selection paths empty — using ETF stub.")
+        stub = next((etf for etf in ["QQQ", "SPY"] if etf in close.columns), None)
+        if stub:
+            new_w = pd.Series({stub: 1.0}, dtype=float)
+        else:
+            new_w = pd.Series({"CASH": 1.0}, dtype=float)
+            sectors_map.setdefault("CASH", "Cash")
 
     target_equity = float(params.get("target_equity", 0.85))
 
@@ -4773,6 +4868,49 @@ def _metric_or_default(metrics: Dict[str, float], key: str, default: float) -> f
     return default
 
 
+def _classify_market_regime(metrics: Dict[str, float]) -> str:
+    """Translate raw regime metrics into a discrete regime label."""
+
+    if not metrics:
+        return "Neutral"
+
+    breadth = float(metrics.get("breadth_pos_6m", np.nan))
+    vix_ts = float(metrics.get("vix_term_structure", np.nan))
+    vol10 = float(metrics.get("qqq_vol_10d", np.nan))
+    trend_val = metrics.get("qqq_above_200dma", np.nan)
+
+    inputs = [trend_val, breadth, vix_ts, vol10]
+    valid_count = sum(pd.notna(x) for x in inputs)
+    if valid_count < 3:
+        return "Neutral"
+
+    qqq_above_200 = pd.notna(trend_val) and float(trend_val) >= 1.0
+
+    flags = [
+        ("trend", pd.notna(trend_val) and not qqq_above_200),
+        ("breadth", pd.notna(breadth) and breadth < 0.35),
+        ("vix_ts", pd.notna(vix_ts) and vix_ts < 0.9),
+        ("vol", pd.notna(vol10) and vol10 > 0.035),
+    ]
+
+    n_red = sum(1 for _, flag in flags if flag)
+
+    strong_risk_on = (
+        pd.notna(breadth)
+        and breadth > 0.65
+        and pd.notna(vol10)
+        and vol10 < 0.025
+    )
+
+    if n_red >= 3:
+        return "Extreme Risk-Off"
+    if n_red == 2:
+        return "Risk-Off"
+    if strong_risk_on:
+        return "Strong Risk-On"
+    return "Risk-On"
+
+
 def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
     """Enhanced regime metrics calculation"""
     if universe_prices_daily.empty:
@@ -4882,33 +5020,15 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
             len(valid),
         )
 
-        # Enhanced labeling with more nuanced categories
-        breadth = scoring_inputs["breadth"]
-        qqq_abv = scoring_inputs["trend"]
-        vol10 = scoring_inputs["vol"]
+        label = _classify_market_regime(metrics)
 
-        if len(valid) < 3:
-            label = "Neutral"
-        else:
-            qqq_above_flag = pd.notna(qqq_abv) and qqq_abv >= 1.0
-            breadth_gt = lambda threshold: pd.notna(breadth) and breadth > threshold
-            vol_gt = lambda threshold: pd.notna(vol10) and vol10 > threshold
-            vol_lt = lambda threshold: pd.notna(vol10) and vol10 < threshold
-
-            if qqq_above_flag and breadth_gt(0.65) and vol_lt(0.025):
-                label = "Strong Risk-On"
-            elif qqq_above_flag and breadth_gt(0.50):
-                label = "Risk-On"
-            elif qqq_above_flag and breadth_gt(0.35):
-                label = "Cautious Risk-On"
-            elif (pd.notna(qqq_abv) and qqq_abv < 1.0) and breadth_gt(0.45):
-                label = "Mixed"
-            elif (pd.notna(qqq_abv) and qqq_abv < 1.0) and breadth_gt(0.35):
-                label = "Risk-Off"
-            elif vol_gt(0.045):
-                label = "High Volatility Risk-Off"
-            else:
-                label = "Extreme Risk-Off"
+        global LATEST_REGIME_LABEL
+        LATEST_REGIME_LABEL = label
+        if _HAS_ST:
+            try:
+                st.session_state["latest_regime_label"] = label
+            except Exception:
+                pass
 
         return label, metrics
     except Exception:
@@ -4969,6 +5089,42 @@ def select_optimal_universe(as_of: date | None = None) -> str:
     else:
         return "Hybrid Top150"
 
+
+def _estimate_hybrid150_eligible_count(as_of: date | None = None) -> int:
+    """Estimate how many Hybrid150 names survive the price-history cleaning."""
+
+    asof_ts = pd.Timestamp(as_of or date.today())
+    start = (asof_ts - relativedelta(months=18)).strftime("%Y-%m-%d")
+    end = asof_ts.strftime("%Y-%m-%d")
+
+    try:
+        tickers, _, label = get_universe("Hybrid Top150")
+        if label != "Hybrid Top150" or not tickers:
+            return 0
+
+        close_raw, vol_raw = fetch_price_volume(tickers, start, end)
+        if close_raw.empty:
+            return 0
+
+        med = median_dollar_volume(close_raw, vol_raw, window=60).sort_values(ascending=False)
+        top_list = med.head(150).index.tolist()
+        close = close_raw[top_list]
+
+        close = _soft_prune_history(close, min_days=180, max_missing_frac=0.60)
+        if close.empty:
+            return 0
+
+        pruned, _ = _prune_price_history_with_meta(close)
+        if pruned.empty:
+            return 0
+
+        survivors = [t for t in pruned.columns if t != "QQQ"]
+        return int(len(survivors))
+    except Exception:
+        logging.warning("Failed to estimate Hybrid150 eligibility", exc_info=True)
+        return 0
+
+
 def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     """Assess market conditions and derive configuration settings.
 
@@ -5005,8 +5161,25 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     regime_label, _ = get_market_regime()
     metrics["regime"] = regime_label
 
-    # Automatically determine optimal universe for the upcoming period
-    chosen_universe = select_optimal_universe(asof_ts)
+    eligible_count_h150 = _estimate_hybrid150_eligible_count(asof_ts)
+    metrics["eligible_count_hybrid150"] = int(eligible_count_h150)
+
+    base_universe = select_optimal_universe(asof_ts)
+    if regime_label in ("Risk-Off", "Extreme Risk-Off"):
+        chosen_universe = "S&P500 (All)" if eligible_count_h150 < 50 else "Hybrid Top150"
+    elif regime_label == "Neutral":
+        chosen_universe = base_universe
+    else:
+        chosen_universe = "Hybrid Top150"
+
+    logging.info(
+        "UNIVERSE choice | base=%s | regime=%s | eligible_h150=%d | final=%s",
+        base_universe,
+        regime_label,
+        eligible_count_h150,
+        chosen_universe,
+    )
+
     st.session_state["universe"] = chosen_universe
 
     # Derive settings based on key thresholds

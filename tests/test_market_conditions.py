@@ -11,7 +11,7 @@ st.secrets = types.SimpleNamespace(get=lambda *args, **kwargs: None)
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 import backend
 
-def _base_patch(monkeypatch, metrics, regime_label="Risk-On"):
+def _base_patch(monkeypatch, metrics, regime_label="Risk-On", eligible_count=100):
     def fake_get_universe(choice):
         return ["AAA", "BBB"], {"AAA": "Tech", "BBB": "Tech"}, "label"
 
@@ -30,6 +30,11 @@ def _base_patch(monkeypatch, metrics, regime_label="Risk-On"):
     monkeypatch.setattr(backend, "compute_regime_metrics", fake_compute_regime_metrics)
     monkeypatch.setattr(backend, "get_market_regime", fake_get_market_regime)
     monkeypatch.setattr(backend, "select_optimal_universe", lambda as_of=None: "S&P500 (All)")
+    monkeypatch.setattr(
+        backend,
+        "_estimate_hybrid150_eligible_count",
+        lambda as_of=None: eligible_count,
+    )
 
 
 def test_assess_market_conditions_risk_on(monkeypatch):
@@ -40,10 +45,10 @@ def test_assess_market_conditions_risk_on(monkeypatch):
         "hy_oas": 4.0,
         "qqq_above_200dma": 1.0,
     }
-    _base_patch(monkeypatch, metrics, "Risk-On")
+    _base_patch(monkeypatch, metrics, "Risk-On", eligible_count=120)
     result = backend.assess_market_conditions(date(2024, 1, 5))
     settings = result["settings"]
-    assert result["universe"] == "S&P500 (All)"
+    assert result["universe"] == "Hybrid Top150"
     assert result["metrics"]["regime"] == "Risk-On"
     assert settings["sector_cap"] == pytest.approx(0.35)
     assert settings["name_cap"] == pytest.approx(0.30)
@@ -58,7 +63,7 @@ def test_assess_market_conditions_risk_off(monkeypatch):
         "hy_oas": 7.0,
         "qqq_above_200dma": 0.0,
     }
-    _base_patch(monkeypatch, metrics, "Risk-Off")
+    _base_patch(monkeypatch, metrics, "Risk-Off", eligible_count=40)
     result = backend.assess_market_conditions(date(2024, 1, 5))
     settings = result["settings"]
     assert result["universe"] == "S&P500 (All)"
