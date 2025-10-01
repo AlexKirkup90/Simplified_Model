@@ -223,10 +223,18 @@ def standardize_backtest_payload(
     safely stashed inside ``st.session_state``.
     """
 
-    def _ser_to_dict(obj: pd.Series | None) -> Dict[str, list[Any]]:
+    def _clean_series(obj: pd.Series | None) -> pd.Series:
         if obj is None:
-            return {"index": [], "values": []}
-        ser = pd.Series(obj).dropna()
+            return pd.Series(dtype=float)
+        ser = pd.Series(obj)
+        if ser.empty:
+            return pd.Series(dtype=float)
+        ser.index = pd.to_datetime(ser.index, errors="coerce")
+        ser = ser.dropna()
+        return ser.sort_index()
+
+    def _ser_to_dict(obj: pd.Series | None) -> Dict[str, list[Any]]:
+        ser = pd.Series(dtype=float) if obj is None else pd.Series(obj)
         if ser.empty:
             return {"index": [], "values": []}
         return {
@@ -234,22 +242,60 @@ def standardize_backtest_payload(
             "values": [float(v) for v in ser.astype(float).values],
         }
 
-    base = strategy_cum_net if (show_net and strategy_cum_net is not None) else strategy_cum_gross
-    base_series = pd.Series(base).dropna() if base is not None else pd.Series(dtype=float)
-    bench_series = pd.Series(qqq_cum).dropna() if qqq_cum is not None else pd.Series(dtype=float)
+    gross_raw = _clean_series(strategy_cum_gross)
+    net_raw = _clean_series(strategy_cum_net)
+    bench_raw = _clean_series(qqq_cum)
+    tno_raw = _clean_series(hybrid_tno)
 
+    indices = [idx for idx in (gross_raw.index, net_raw.index, bench_raw.index, tno_raw.index) if len(idx) > 0]
+    if indices:
+        canonical_index = indices[0]
+        for idx in indices[1:]:
+            canonical_index = canonical_index.union(idx)
+        canonical_index = canonical_index.sort_values()
+    else:
+        canonical_index = pd.DatetimeIndex([pd.Timestamp.today().normalize()])
+
+    def _ensure_series(ser: pd.Series, fill_value: float) -> pd.Series:
+        if ser.empty:
+            filled = pd.Series(fill_value, index=canonical_index)
+            return filled.astype(float)
+        aligned = ser.reindex(canonical_index)
+        if fill_value == 1.0:
+            aligned = aligned.ffill().fillna(1.0)
+            if aligned.iloc[0] == 0 or pd.isna(aligned.iloc[0]):
+                aligned.iloc[0] = 1.0
+        else:
+            aligned = aligned.ffill().fillna(fill_value)
+        return aligned.astype(float)
+
+    strat_cum_gross = _ensure_series(gross_raw, 1.0)
+    strat_cum_net = _ensure_series(net_raw, 1.0)
+    bench_series = _ensure_series(bench_raw, 1.0)
+    turnover_series = _ensure_series(tno_raw, 0.0)
+
+    base_series = strat_cum_net if show_net else strat_cum_gross
     strat_rets = base_series.pct_change().dropna()
     bench_rets = bench_series.pct_change().dropna()
 
-    return {
+    payload = {
         "equity_strategy": _ser_to_dict(base_series),
-        "equity_strategy_gross": _ser_to_dict(strategy_cum_gross),
-        "equity_strategy_net": _ser_to_dict(strategy_cum_net),
-        "equity_bench": _ser_to_dict(qqq_cum),
-        "turnover": _ser_to_dict(hybrid_tno),
+        "equity_strategy_gross": _ser_to_dict(strat_cum_gross),
+        "equity_strategy_net": _ser_to_dict(strat_cum_net),
+        "equity_bench": _ser_to_dict(bench_series),
+        "turnover": _ser_to_dict(turnover_series),
         "rets_strategy": _ser_to_dict(strat_rets),
         "rets_bench": _ser_to_dict(bench_rets),
     }
+
+    payload["synthetic_flags"] = {
+        "strategy_gross": gross_raw.empty,
+        "strategy_net": net_raw.empty,
+        "benchmark": bench_raw.empty,
+        "turnover": tno_raw.empty,
+    }
+
+    return payload
 
 
 def deserialize_backtest_series(payload: Mapping[str, Any] | None) -> pd.Series:
@@ -274,28 +320,25 @@ def compute_hedge_metadata(
     """Compute hedge diagnostics with explicit overlap enforcement."""
 
     if portfolio_rets is None or bench_rets is None:
-        return {"correlation": None, "overlap": 0}
+        return {"correlation": None, "overlap": 0, "status": "missing"}
 
     a = pd.Series(portfolio_rets).dropna()
     b = pd.Series(bench_rets).dropna()
     if a.empty or b.empty:
-        return {"correlation": None, "overlap": 0}
+        return {"correlation": None, "overlap": 0, "status": "missing"}
 
-    aligned = a.to_frame("a").join(b.to_frame("b"), how="inner").dropna()
-    overlap = len(aligned)
-    if overlap < min_overlap:
-        if overlap > 0:
-            logging.warning(
-                "Hedge correlation skipped – only %d overlapping observations (min=%d)",
-                overlap,
-                min_overlap,
-            )
-        return {"correlation": None, "overlap": overlap}
+    idx = a.index.intersection(b.index)
+    overlap = len(idx)
+    if overlap < max(3, int(min_overlap)):
+        return {"correlation": None, "overlap": overlap, "status": "insufficient_data"}
 
-    corr = float(aligned["a"].corr(aligned["b"]))
-    if np.isnan(corr):
-        corr = None
-    return {"correlation": corr, "overlap": overlap}
+    aligned_a = a.loc[idx].sort_index()
+    aligned_b = b.loc[idx].sort_index()
+    corr = float(aligned_a.corr(aligned_b))
+    if pd.isna(corr):
+        return {"correlation": None, "overlap": overlap, "status": "insufficient_data"}
+
+    return {"correlation": corr, "overlap": overlap, "status": "ok"}
 
 # =========================
 # Optional numba helpers
@@ -514,6 +557,12 @@ AVG_TRADE_SIZE_DEFAULT  = 0.02  # 2% avg single-leg trade size
 HEDGE_MAX_DEFAULT       = 0.20
 HEDGE_TICKER_LABEL      = "QQQ (Hedge)"
 HEDGE_TICKER_ALIASES    = {HEDGE_TICKER_LABEL, "QQQ_HEDGE", "QQQ-HEDGE"}
+
+MIN_ELIGIBLE_FALLBACK   = 12
+LEADERSHIP_SLICE_DEFAULT = 0.30
+CORE_SPY_SLICE_DEFAULT   = 0.20
+FALLBACK_CORE_TICKER     = "SPY"
+FALLBACK_LEADERSHIP_ETFS = ["QQQ", "XLK", "XLC", "XLV", "XLY", "XLI"]
 
 # Defaults for regime-based exposure adjustments
 VIX_TS_THRESHOLD_DEFAULT = 1.0   # VIX3M / VIX ratio; <1 implies stress
@@ -1762,7 +1811,139 @@ def get_regime_adjusted_exposure(regime_metrics: Dict[str, float]) -> float:
     if qqq_above_ma < 1.0:  # Below 200DMA
         exposure *= 0.9
 
-    return np.clip(exposure, 0.3, 1.2)  # Keep between 30% and 120%
+    return float(np.clip(exposure, 0.3, 1.2))  # Keep between 30% and 120%
+
+
+def _determine_equity_target(
+    regime_label: str | None,
+    regime_metrics: Mapping[str, float] | None,
+    base_target: float,
+) -> float:
+    """Derive a defensive equity target based on regime context."""
+
+    metrics = dict(regime_metrics or {})
+    label = (regime_label or metrics.get("regime") or "").strip() or LATEST_REGIME_LABEL
+
+    target = float(
+        np.clip(get_regime_adjusted_exposure(metrics) if metrics else base_target, 0.0, 1.0)
+    )
+
+    normalized_label = label.lower()
+    if "extreme" in normalized_label and "risk-off" in normalized_label:
+        target = min(target, 0.25)
+    elif normalized_label == "risk-off":
+        target = min(target, 0.45)
+    elif normalized_label == "neutral":
+        target = min(target, 0.65)
+    elif normalized_label == "risk-on":
+        target = min(max(target, 0.75), 0.95)
+
+    if base_target > 0:
+        target = min(target, float(base_target))
+
+    return float(np.clip(target, 0.0, 1.0))
+
+
+def select_leadership_etfs(metrics: Mapping[str, float] | None) -> list[str]:
+    """Pick the ETF leadership basket used when stock breadth collapses."""
+
+    metrics = dict(metrics or {})
+    try:
+        qqq_above = float(metrics.get("qqq_above_200dma", 0.0) or 0.0)
+    except Exception:
+        qqq_above = 0.0
+    try:
+        slope = float(metrics.get("qqq_50dma_slope_10d", 0.0) or 0.0)
+    except Exception:
+        slope = 0.0
+
+    if qqq_above >= 1.0 and slope >= 0.0:
+        return ["QQQ"]
+
+    ordered = list(dict.fromkeys(FALLBACK_LEADERSHIP_ETFS))
+    if qqq_above < 0.5:
+        # When leadership is weak, prefer a more defensive blend
+        defensive = ["XLV", "XLU", "XLP"]
+        for ticker in defensive:
+            if ticker not in ordered:
+                ordered.append(ticker)
+
+    # Emphasise growth sectors when slope is still positive but QQQ is below 200DMA
+    if slope > 0.0 and "QQQ" not in ordered:
+        ordered.insert(0, "QQQ")
+
+    return ordered[:3] if len(ordered) >= 3 else ordered
+
+
+def compose_graceful_fallback(
+    stock_weights: pd.Series | None,
+    regime_metrics: Mapping[str, float] | None,
+    regime_label: str | None,
+    base_target: float,
+    min_names: int,
+    eligible_pool: int,
+    leadership_slice: float,
+    core_slice: float,
+) -> tuple[pd.Series, bool, float, float]:
+    """Blend leadership ETFs, core exposure, and stock sleeve under stress."""
+
+    min_names = int(max(0, min_names))
+    eligible_pool = int(max(0, eligible_pool))
+    equity_target = _determine_equity_target(regime_label, regime_metrics, base_target)
+
+    stocks = pd.Series(dtype=float) if stock_weights is None else pd.Series(stock_weights).astype(float)
+    stocks = stocks.replace([np.inf, -np.inf], np.nan).dropna()
+    stocks = stocks[stocks > 0]
+    stock_count = int(len(stocks))
+    current_equity = float(stocks.sum())
+
+    fallback_required = (
+        equity_target <= 0.0
+        or stock_count < min_names
+        or eligible_pool < min_names
+        or current_equity <= 0.0
+    )
+
+    leadership_slice = float(np.clip(leadership_slice, 0.0, 1.0))
+    core_slice = float(np.clip(core_slice, 0.0, 1.0))
+    slice_total = leadership_slice + core_slice
+    if slice_total > 0:
+        scale = min(1.0, 1.0 / slice_total) if slice_total > 1.0 else 1.0
+        leadership_slice *= scale
+        core_slice *= scale
+
+    if not fallback_required:
+        if current_equity > 0 and not np.isclose(current_equity, equity_target):
+            stocks = stocks * (equity_target / current_equity)
+        cash_weight = max(0.0, 1.0 - float(stocks.sum()))
+        return stocks.sort_values(ascending=False), False, equity_target, cash_weight
+
+    leadership_weight = equity_target * leadership_slice
+    core_weight = equity_target * core_slice
+
+    leadership_tickers = select_leadership_etfs(regime_metrics)
+    leadership_series = pd.Series(dtype=float)
+    if leadership_weight > 0 and leadership_tickers:
+        weights = pd.Series(1.0, index=leadership_tickers, dtype=float)
+        weights = weights / float(weights.sum())
+        leadership_series = weights * leadership_weight
+
+    core_series = pd.Series(dtype=float)
+    if core_weight > 0:
+        core_series = pd.Series({FALLBACK_CORE_TICKER: core_weight}, dtype=float)
+
+    residual = max(0.0, equity_target - float(leadership_series.sum()) - float(core_series.sum()))
+    stock_series = pd.Series(dtype=float)
+    if residual > 0 and not stocks.empty:
+        stock_series = (stocks / float(stocks.sum())) * residual
+
+    combined = pd.concat([leadership_series, core_series, stock_series])
+    combined = combined.groupby(level=0).sum()
+    combined = combined[combined > 0].sort_values(ascending=False)
+
+    cash_weight = max(0.0, 1.0 - float(combined.sum()))
+
+    return combined.sort_values(ascending=False), True, equity_target, cash_weight
 
 ######################################################################
 # Parameter mapping updater
@@ -4190,7 +4371,9 @@ def check_constraint_violations(
     return violations
 
 def _format_display(weights: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    display_df = pd.DataFrame({"Weight": weights}).sort_values("Weight", ascending=False)
+    clean = pd.Series(weights).astype(float)
+    clean = clean[np.abs(clean) > 1e-6]
+    display_df = pd.DataFrame({"Weight": clean}).sort_values("Weight", ascending=False)
     display_fmt = display_df.copy()
     display_fmt["Weight"] = display_fmt["Weight"].map("{:.2%}".format)
     return display_fmt, display_df
@@ -4961,6 +5144,66 @@ def generate_live_portfolio_isa_monthly(
             final_weights = diversified
             diversification_applied = True
 
+    min_names_floor = MIN_ELIGIBLE_FALLBACK
+    leadership_slice = LEADERSHIP_SLICE_DEFAULT
+    core_slice = CORE_SPY_SLICE_DEFAULT
+    if _HAS_ST:
+        try:
+            min_names_floor = int(st.session_state.get("min_eligible_floor", MIN_ELIGIBLE_FALLBACK))
+        except Exception:
+            min_names_floor = MIN_ELIGIBLE_FALLBACK
+        try:
+            leadership_slice = float(st.session_state.get("leadership_slice", LEADERSHIP_SLICE_DEFAULT))
+        except Exception:
+            leadership_slice = LEADERSHIP_SLICE_DEFAULT
+        try:
+            core_slice = float(st.session_state.get("core_spy_slice", CORE_SPY_SLICE_DEFAULT))
+        except Exception:
+            core_slice = CORE_SPY_SLICE_DEFAULT
+
+    eligible_pool = int(prune_meta.get("eligible_count", len(final_weights))) if isinstance(prune_meta, dict) else len(final_weights)
+    base_equity_target = float(final_weights.sum()) if isinstance(final_weights, pd.Series) else 0.0
+    if base_equity_target <= 0:
+        base_equity_target = target_equity
+    blended_weights, graceful_fallback, equity_target_used, cash_weight = compose_graceful_fallback(
+        final_weights,
+        regime_metrics,
+        current_regime_label,
+        base_equity_target,
+        min_names_floor,
+        eligible_pool,
+        leadership_slice,
+        core_slice,
+    )
+    final_weights = blended_weights.astype(float)
+
+    for ticker in final_weights.index:
+        if ticker == "CASH":
+            sectors_map.setdefault("CASH", "Cash")
+        elif ticker not in sectors_map:
+            sectors_map[ticker] = "ETF"
+
+    if graceful_fallback:
+        fallback_used = True
+        fallback_msg = (
+            "Graceful fallback blend engaged (leadership ETF/core/cash overlay)."
+        )
+        if decision:
+            decision = f"{decision}\n{fallback_msg}"
+        else:
+            decision = fallback_msg
+
+    if _HAS_ST:
+        try:
+            st.session_state["latest_equity_target"] = float(equity_target_used)
+            st.session_state["latest_cash_weight"] = float(cash_weight)
+        except Exception:
+            pass
+
+    if cash_weight > 0:
+        cash_note = f"Cash buffer set to {cash_weight:.1%}."
+        decision = f"{decision}\n{cash_note}" if decision else cash_note
+
     if _HAS_ST:
         try:
             st.session_state["diversification_fallback_applied"] = diversification_applied
@@ -5452,6 +5695,7 @@ def _auto_run_backtest_for_live_portfolio(
         )
         st.session_state["bt"] = bt_payload
         st.session_state["latest_backtest_payload"] = bt_payload
+        st.session_state["bt_payload"] = bt_payload
     except Exception:
         pass
 
@@ -5802,6 +6046,16 @@ def _ratio_to_score(r, good_low=True, lo=0.8, hi=1.2):
     return 100.0 - s if good_low else s
 
 
+def map_spread_to_score(oas: float) -> float:
+    """Translate HY credit spreads into a 0..100 risk score (higher = safer)."""
+
+    try:
+        spread = float(oas)
+    except Exception:
+        return 50.0
+    return _ratio_to_score(spread, good_low=True, lo=3.0, hi=8.0)
+
+
 def compute_regime_label(metrics: dict) -> tuple[str, float, dict]:
     """
     Returns (label, composite_score, components) based on:
@@ -5915,11 +6169,15 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
 
     vix_ts = _vix_term_structure(vix, vix3m)
     hy_oas_status = "ok"
+    hy_oas_last = np.nan
+    hy_oas_score = 50.0
     if hy_oas is None or hy_oas.dropna().empty:
-        hy_oas_last = np.nan
         hy_oas_status = "missing"
     else:
+        hy_oas = hy_oas.dropna()
         hy_oas_last = _safe_last(hy_oas)
+        if pd.notna(hy_oas_last):
+            hy_oas_score = map_spread_to_score(hy_oas_last)
 
     # Universe breadth above 200DMA (ignore tickers without sufficient history)
     above_flags: list[float] = []
@@ -5959,6 +6217,7 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
         "vix_term_structure": vix_ts,
         "hy_oas": hy_oas_last,
         "hy_oas_status": hy_oas_status,
+        "hy_oas_score": hy_oas_score,
     }
 
     used_metrics = {k: v for k, v in metrics.items() if pd.notna(v)}
@@ -6724,7 +6983,7 @@ def run_trust_checks(
     if turnover_series is None or len(getattr(turnover_series, "index", [])) == 0:
         if _HAS_ST:
             try:
-                bt_payload = st.session_state.get("bt", {})
+                bt_payload = st.session_state.get("bt_payload") or st.session_state.get("bt", {})
                 turnover_series = deserialize_backtest_series(bt_payload.get("turnover"))
             except Exception:
                 turnover_series = None
@@ -6739,7 +6998,7 @@ def run_trust_checks(
     bench_cum = pd.Series(dtype=float)
     if _HAS_ST:
         try:
-            bt_payload = st.session_state.get("bt", {})
+            bt_payload = st.session_state.get("bt_payload") or st.session_state.get("bt", {})
             base_cum = deserialize_backtest_series(bt_payload.get("equity_strategy"))
             bench_cum = deserialize_backtest_series(bt_payload.get("equity_bench"))
         except Exception:
@@ -6766,6 +7025,21 @@ def run_trust_checks(
         _to_monthly(base_cum),
         bench_monthly if not bench_monthly.empty else None,
     )
+
+    synthetic_flags: dict[str, Any] = {}
+    if _HAS_ST:
+        try:
+            synthetic_flags = dict(bt_payload.get("synthetic_flags", {}))
+        except Exception:
+            synthetic_flags = {}
+
+    if synthetic_flags.get("strategy_gross", False) and synthetic_flags.get("strategy_net", False):
+        health = dict(health or {})
+        health.setdefault("issues", [])
+        if "synthetic-data" not in health["issues"]:
+            health["issues"].append("synthetic-data")
+        health.setdefault("stats", {})["note"] = "n/a (synthetic)"
+        health["ok"] = False
 
     summary = trust_checks_summary(sig.get("ok", False), constr.get("ok", False), health.get("ok", False))
     summary["details"] = {"signal": sig, "construction": constr, "health": health}

@@ -39,7 +39,33 @@ def test_standardize_backtest_payload_creates_canonical_curves():
     assert np.allclose(rets_bench.values, bench.pct_change().dropna().values)
 
     turnover_payload = backend.deserialize_backtest_series(payload["turnover"])
-    assert np.allclose(turnover_payload.values, turnover.dropna().values)
+    expected_turnover = pd.Series([0.2, 0.15, 0.15, 0.25], index=idx)
+    pd.testing.assert_series_equal(turnover_payload, expected_turnover, check_names=False, check_freq=False)
+
+    assert payload["synthetic_flags"] == {
+        "strategy_gross": False,
+        "strategy_net": False,
+        "benchmark": False,
+        "turnover": False,
+    }
+
+
+def test_standardize_backtest_payload_builds_synthetic_when_missing():
+    payload = backend.standardize_backtest_payload(
+        strategy_cum_gross=None,
+        strategy_cum_net=None,
+        qqq_cum=None,
+        hybrid_tno=None,
+        show_net=True,
+    )
+
+    equity_strategy = backend.deserialize_backtest_series(payload["equity_strategy"])
+    assert (equity_strategy == 1.0).all()
+    turnover_payload = backend.deserialize_backtest_series(payload["turnover"])
+    assert (turnover_payload == 0.0).all()
+    assert payload["synthetic_flags"]["strategy_gross"] is True
+    assert payload["synthetic_flags"]["strategy_net"] is True
+    assert payload["synthetic_flags"]["benchmark"] is True
 
 
 def test_compute_hedge_metadata_enforces_overlap():
@@ -49,8 +75,10 @@ def test_compute_hedge_metadata_enforces_overlap():
 
     meta = backend.compute_hedge_metadata(portfolio, bench, min_overlap=12)
     assert meta["overlap"] == 12
+    assert meta["status"] == "ok"
     assert meta["correlation"] == pytest.approx(1.0)
 
     short_meta = backend.compute_hedge_metadata(portfolio.head(6), bench.head(6), min_overlap=12)
     assert short_meta["correlation"] is None
     assert short_meta["overlap"] == 6
+    assert short_meta["status"] == "insufficient_data"
