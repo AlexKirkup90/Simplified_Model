@@ -3880,21 +3880,6 @@ def generate_live_portfolio_isa_monthly(
     params["mom_cap"]        = float(mom_cap)
     params.setdefault("target_equity", 0.85)
 
-    def _fallback_momentum_weights(px_daily: pd.DataFrame, top_n: int, cap: float) -> pd.Series:
-        monthly_px = px_daily.resample("M").last()
-        z = blended_momentum_z(monthly_px)
-        z = z.dropna()
-        if z.empty:
-            return pd.Series(dtype=float)
-        top = z.nlargest(top_n)
-        w = top.clip(lower=-np.inf)
-        w = w - float(w.min()) if len(w) else w
-        if w.sum() <= 0:
-            w = pd.Series(1.0, index=top.index, dtype=float)
-        w = w / w.sum()
-        w = cap_weights(w, cap=float(cap))
-        return (w / w.sum()).astype(float) if w.sum() > 0 else pd.Series(dtype=float)
-
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
     base_tickers = _sc_sanitize_tickers(base_tickers)
@@ -4070,6 +4055,11 @@ def generate_live_portfolio_isa_monthly(
     decision = "Preview only – portfolio not saved" if not is_monthly else ""
 
     # Build candidate weights (enhanced) – overrides applied above
+    price_panel = {
+        "daily": close.copy(),
+        "monthly": close.resample("M").last(),
+    }
+
     new_w = _build_isa_weights_fixed(
         close, params, sectors_map, use_enhanced_features=use_enhanced_features
     )
@@ -4077,19 +4067,95 @@ def generate_live_portfolio_isa_monthly(
     if not isinstance(new_w, pd.Series):
         new_w = pd.Series(dtype=float)
 
+    fallback_used = False
+    composite_fallback_used = False
+    if _HAS_ST:
+        try:
+            st.session_state["fallback_used"] = False
+            st.session_state.pop("cap_debug_info", None)
+        except Exception:
+            pass
+
     if new_w.empty or float(new_w.sum() or 0.0) <= 0:
-        logging.info("Fallback momentum engaged: primary selection empty after gating.")
-        if _HAS_ST:
-            try:
-                cap_val = float(st.session_state.get("name_cap", params.get("mom_cap", 0.20)))
-            except Exception:
-                cap_val = float(params.get("mom_cap", 0.20))
-        else:
-            cap_val = float(params.get("mom_cap", 0.20))
-        top_n = int(params.get("mom_topn", preset.get("mom_topn", 15)))
-        fb = _fallback_momentum_weights(close, top_n=top_n, cap=cap_val)
-        if not fb.empty:
-            new_w = fb.copy()
+        logging.info("Composite fallback engaged: primary selection empty after gating.")
+        monthly_panel = price_panel.get("monthly")
+        if monthly_panel is None or monthly_panel.empty:
+            return None, None, "No monthly panel available after cleaning."
+
+        monthly_core = monthly_panel.drop(columns=["QQQ"], errors="ignore")
+        bm = blended_momentum_z(monthly_core).fillna(0)
+
+        close_daily = price_panel.get("daily")
+        if close_daily is None:
+            columns = list(monthly_core.columns)
+            fetch_start = (pd.Timestamp(monthly_core.index[-1]) - pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+            close_daily = fetch_market_data(
+                columns,
+                fetch_start,
+                pd.Timestamp.today().strftime("%Y-%m-%d"),
+            )
+
+        close_daily = close_daily.reindex(columns=bm.index, fill_value=np.nan)
+        tr = trend_z(close_daily).reindex(bm.index).fillna(0)
+        lv = lowvol_z(close_daily).reindex(bm.index).fillna(0)
+
+        comp = 0.6 * bm + 0.3 * tr - 0.1 * lv
+        comp = comp.replace([np.inf, -np.inf], np.nan).dropna()
+        if comp.empty:
+            return None, None, "Composite fallback produced no names."
+
+        top_pool = comp.nlargest(40)
+        sectors_fallback = get_enhanced_sector_map(
+            list(top_pool.index),
+            base_map=get_sector_map(list(top_pool.index)),
+        )
+        by_sector: dict[str, list[str]] = {}
+        for ticker in top_pool.index:
+            sector = sectors_fallback.get(ticker, "Other")
+            by_sector.setdefault(sector, []).append(ticker)
+
+        picks: list[str] = []
+        target_n = 20
+        while len(picks) < target_n and any(by_sector.values()):
+            for sector, names in list(by_sector.items()):
+                if not names:
+                    continue
+                best = max(names, key=lambda n: top_pool.get(n, -1e9))
+                picks.append(best)
+                names.remove(best)
+                if len(picks) >= target_n:
+                    break
+
+        picks = [p for p in picks if p in comp.index]
+        if not picks:
+            picks = list(top_pool.index[:10])
+
+        raw = pd.Series(1.0 / len(picks), index=picks, dtype=float)
+
+        session_name_cap = float(st.session_state.get("name_cap", params.get("mom_cap", 0.20))) if _HAS_ST else float(params.get("mom_cap", 0.20))
+        session_sector_cap = float(st.session_state.get("sector_cap", params.get("sector_cap", 0.30))) if _HAS_ST else float(params.get("sector_cap", 0.30))
+
+        enhanced_map = get_enhanced_sector_map(list(raw.index), base_map=sectors_map)
+        group_caps_fb = build_group_caps(enhanced_map)
+        capped = enforce_caps_iteratively(
+            raw,
+            enhanced_map,
+            name_cap=min(0.10, session_name_cap),
+            sector_cap=session_sector_cap,
+            group_caps=group_caps_fb,
+        )
+        if capped.sum() > 0:
+            capped = capped / capped.sum()
+        new_w = capped.sort_values(ascending=False)
+        fallback_used = True
+        composite_fallback_used = True
+        decision = "Fallback composite allocation used (sector-spread, capped @10% name / sector cap applied)."
+
+    if fallback_used and _HAS_ST:
+        try:
+            st.session_state["fallback_used"] = True
+        except Exception:
+            pass
 
     if new_w.empty or float(new_w.sum() or 0.0) <= 0:
         logging.warning("All selection paths empty — using ETF stub.")
@@ -4099,6 +4165,14 @@ def generate_live_portfolio_isa_monthly(
         else:
             new_w = pd.Series({"CASH": 1.0}, dtype=float)
             sectors_map.setdefault("CASH", "Cash")
+        fallback_used = True
+        if not decision:
+            decision = "ETF fallback allocation used due to empty selection."
+        if _HAS_ST:
+            try:
+                st.session_state["fallback_used"] = True
+            except Exception:
+                pass
 
     target_equity = float(params.get("target_equity", 0.85))
 
@@ -4123,20 +4197,25 @@ def generate_live_portfolio_isa_monthly(
             logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
     # Validate and re-enforce caps if scaling introduced violations
+    cap_debug: dict[str, Any] = {}
     if len(new_w) > 0:
         enhanced_sectors = get_enhanced_sector_map(list(new_w.index), base_map=sectors_map)
         group_caps = build_group_caps(enhanced_sectors)
+        pre_cap = new_w.astype(float).copy()
+        effective_name_cap = params["mom_cap"]
+        if composite_fallback_used:
+            effective_name_cap = min(effective_name_cap, 0.10)
         new_w = enforce_caps_iteratively(
-            new_w.astype(float),
+            pre_cap,
             enhanced_sectors,
-            name_cap=params["mom_cap"],
+            name_cap=effective_name_cap,
             sector_cap=params.get("sector_cap", 0.30),
             group_caps=group_caps,
         )
         violations = check_constraint_violations(
             new_w,
             sectors_map,
-            params["mom_cap"],
+            effective_name_cap,
             params.get("sector_cap", 0.30),
             group_caps=group_caps,
         )
@@ -4144,6 +4223,26 @@ def generate_live_portfolio_isa_monthly(
             raise ValueError(
                 f"Constraint violations after re-enforcing caps: {violations}"
             )
+        sector_labels_before = pd.Series(
+            [enhanced_sectors.get(t, "Other") for t in pre_cap.index],
+            index=pre_cap.index,
+        )
+        sector_labels_after = pd.Series(
+            [enhanced_sectors.get(t, "Other") for t in new_w.index],
+            index=new_w.index,
+        )
+        cap_debug = {
+            "top_weights": new_w.sort_values(ascending=False).head(10).to_dict(),
+            "sector_before": pre_cap.groupby(sector_labels_before).sum().to_dict(),
+            "sector_after": new_w.groupby(sector_labels_after).sum().to_dict(),
+            "pre_cap_sum": float(pre_cap.sum()),
+            "post_cap_sum": float(new_w.sum()),
+        }
+        if _HAS_ST:
+            try:
+                st.session_state["cap_debug_info"] = cap_debug
+            except Exception:
+                pass
 
     final_weights = new_w.astype(float) if isinstance(new_w, pd.Series) else pd.Series(dtype=float)
 
@@ -4552,10 +4651,20 @@ def run_backtest_isa_dynamic(
         apply_vol_target=apply_vol_target,
         use_incremental=use_incremental,
     )
-    hybrid_gross = res["hybrid_rets"]
+    hybrid_gross = res.get("hybrid_rets")
+    if hybrid_gross is None and "hybrid_equity" in res:
+        equity = pd.Series(res["hybrid_equity"]).sort_index()
+        hybrid_gross = equity.pct_change().fillna(0.0)
+    elif hybrid_gross is not None:
+        hybrid_gross = pd.Series(hybrid_gross).sort_index()
+    else:
+        hybrid_gross = pd.Series(dtype=float)
+
+    mom_turn = pd.Series(res.get("mom_turnover", pd.Series(dtype=float))).sort_index()
+    mr_turn = pd.Series(res.get("mr_turnover", pd.Series(dtype=float))).sort_index()
     hybrid_tno = (
-        cfg.mom_weight * res["mom_turnover"].reindex(hybrid_gross.index).fillna(0)
-        + cfg.mr_weight * res["mr_turnover"].reindex(hybrid_gross.index).fillna(0)
+        cfg.mom_weight * mom_turn.reindex(hybrid_gross.index).fillna(0)
+        + cfg.mr_weight * mr_turn.reindex(hybrid_gross.index).fillna(0)
     )
 
     qqq_monthly = qqq.resample("M").last().pct_change()
@@ -4601,8 +4710,9 @@ def run_backtest_isa_dynamic(
 
     # Cum curves
     strat_cum_gross = (1 + hybrid_gross.fillna(0)).cumprod()
-    strat_cum_net   = (1 + hybrid_net.fillna(0)).cumprod() if show_net else None
-    qqq_cum = (1 + qqq_monthly).cumprod().reindex(strat_cum_gross.index, method="ffill")
+    strat_cum_net = (1 + hybrid_net.fillna(0)).cumprod()
+    qqq_cum_base = (1 + qqq_monthly.fillna(0)).cumprod()
+    qqq_cum = qqq_cum_base.reindex(strat_cum_gross.index, method="ffill") if not strat_cum_gross.empty else qqq_cum_base
 
     return (
         strat_cum_gross,
@@ -5152,7 +5262,8 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
         base_tickers, _, _ = get_universe(univ)
         end = asof_ts.strftime("%Y-%m-%d")
         start = (asof_ts - relativedelta(months=12)).strftime("%Y-%m-%d")
-        hist = fetch_market_data(base_tickers, start, end)
+        fetch_start = _resolve_fetch_start(start, end)
+        hist = fetch_market_data(base_tickers, fetch_start, end)
         metrics.update(compute_regime_metrics(hist))
     except Exception:
         metrics = {}
@@ -5160,6 +5271,10 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     # Add regime label (uses existing helper which internally recomputes metrics)
     regime_label, _ = get_market_regime()
     metrics["regime"] = regime_label
+
+    metrics["qqq_vol_10d"] = float(metrics.get("qqq_vol_10d") or 0.0)
+    metrics["qqq_50dma_slope_10d"] = float(metrics.get("qqq_50dma_slope_10d") or 0.0)
+    metrics["breadth_pos_6m"] = float(metrics.get("breadth_pos_6m") or 0.0)
 
     eligible_count_h150 = _estimate_hybrid150_eligible_count(asof_ts)
     metrics["eligible_count_hybrid150"] = int(eligible_count_h150)
@@ -5547,11 +5662,17 @@ def summarize_portfolio_construction(
         "total_equity_exposure": total_exp,
         "max_name_weight": max_w,
         "avg_turnover_last_12m": tpy,
+        "exposure_target_range": (0.95, 1.05),
     }
+    if name_cap is not None and name_cap <= 0.15 and max_w <= (name_cap + 1e-9):
+        out["stats"]["name_cap_bonus"] = True
 
     # Heuristics
-    if total_exp <= 0.50:
+    if total_exp < 0.95:
         out["issues"].append("low-exposure")
+        out["ok"] = False
+    elif total_exp > 1.05:
+        out["issues"].append("over-exposed")
         out["ok"] = False
     if max_w > max(0.35, name_cap + 0.10):  # hard stop if crazy
         out["issues"].append(f"max-name-weight {max_w:.2%} too high")
@@ -5584,7 +5705,24 @@ def summarize_health(
         issues.append("large-drawdown")
 
     ok = len(issues) == 0
-    return {"ok": ok, "issues": issues, "stats": stats}
+    override = False
+    recent_sharpe = stats.get("recent_3m_sharpe")
+    current_dd = stats.get("current_drawdown", 0.0)
+    if (
+        not ok
+        and recent_sharpe is not None
+        and pd.notna(recent_sharpe)
+        and float(recent_sharpe) >= 0.6
+        and current_dd is not None
+        and float(current_dd) >= -0.12
+    ):
+        ok = True
+        override = True
+
+    result = {"ok": ok, "issues": issues, "stats": stats}
+    if override:
+        result["override"] = "Recent Sharpe >= 0.6 with drawdown better than -12%"
+    return result
 
 def run_trust_checks(
     weights_df: pd.DataFrame | None,
