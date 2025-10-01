@@ -1,8 +1,12 @@
-import pandas as pd
-import streamlit as st
-import sys, pathlib, types
+import pathlib
+import sys
+import types
 from datetime import date
+
+import numpy as np
+import pandas as pd
 import pytest
+import streamlit as st
 
 # Provide empty secrets to avoid backend errors
 st.secrets = types.SimpleNamespace(get=lambda *args, **kwargs: None)
@@ -48,6 +52,22 @@ def _mock_env(
     monkeypatch.setattr(backend, "compute_regime_metrics", lambda hist: {})
     monkeypatch.setattr(backend, "get_regime_adjusted_exposure", lambda metrics: exposure)
     monkeypatch.setattr(backend, "is_rebalance_today", lambda today, idx: True)
+    monkeypatch.setattr(backend, "MIN_ELIGIBLE_FALLBACK", 1)
+
+    def _no_fallback(stock_weights, *args, **kwargs):
+        series = (
+            pd.Series(stock_weights).astype(float)
+            if stock_weights is not None
+            else pd.Series(dtype=float)
+        )
+        series = series[series > 0]
+        base_target = float(args[2]) if len(args) >= 3 else float(series.sum())
+        target = float(series.sum()) if not series.empty else base_target
+        cash = max(0.0, 1.0 - target)
+        meta = {"components": list(series.index), "equity_target": target}
+        return series, False, target, cash, meta
+
+    monkeypatch.setattr(backend, "compose_graceful_fallback", _no_fallback)
 
 
 def test_scaling_enforces_caps(monkeypatch):

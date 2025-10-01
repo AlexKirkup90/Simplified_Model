@@ -1,10 +1,11 @@
+import pathlib
+import sys
+import types
+
 import numpy as np
 import pandas as pd
 import pytest
 import streamlit as st
-import types
-import sys
-import pathlib
 
 st.secrets = types.SimpleNamespace(get=lambda *args, **kwargs: None)
 
@@ -16,7 +17,7 @@ def test_compose_graceful_fallback_blends_components():
     stocks = pd.Series(dtype=float)
     metrics = {"qqq_above_200dma": 0.0, "qqq_50dma_slope_10d": -0.01}
 
-    blended, used, target, cash_weight = backend.compose_graceful_fallback(
+    blended, used, target, cash_weight, meta = backend.compose_graceful_fallback(
         stocks,
         metrics,
         "Extreme Risk-Off",
@@ -32,13 +33,16 @@ def test_compose_graceful_fallback_blends_components():
     assert cash_weight > 0
     assert any(ticker in blended.index for ticker in backend.FALLBACK_LEADERSHIP_ETFS + [backend.FALLBACK_CORE_TICKER])
     assert target <= 0.45  # risk-off cap applied
+    assert len(blended[blended > 0]) >= 15
+    assert meta["components"]
+    assert meta["equity_target"] == pytest.approx(target)
 
 
 def test_compose_graceful_fallback_scales_existing_weights_without_trigger():
     stocks = pd.Series({"AAPL": 0.5, "MSFT": 0.35}, dtype=float)
     metrics = {"qqq_above_200dma": 1.0, "qqq_50dma_slope_10d": 0.02}
 
-    blended, used, target, cash_weight = backend.compose_graceful_fallback(
+    blended, used, target, cash_weight, meta = backend.compose_graceful_fallback(
         stocks,
         metrics,
         "Risk-On",
@@ -52,6 +56,7 @@ def test_compose_graceful_fallback_scales_existing_weights_without_trigger():
     assert used is False
     assert cash_weight > 0
     assert pytest.approx(blended.sum(), rel=1e-6) == pytest.approx(target, rel=1e-6)
+    assert meta["components"] == list(blended.sort_values(ascending=False).index)
 
 
 def test_hy_oas_missing_sets_neutral_score(monkeypatch):
