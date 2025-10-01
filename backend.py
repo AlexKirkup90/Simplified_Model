@@ -1425,11 +1425,11 @@ def apply_signal_decay(
 # =========================
 def get_regime_adjusted_exposure(regime_metrics: Dict[str, float]) -> float:
     """Scale overall portfolio exposure based on market regime"""
-    breadth = regime_metrics.get('breadth_pos_6m', 0.5)
-    vol_regime = regime_metrics.get('qqq_vol_10d', 0.02)
-    qqq_above_ma = regime_metrics.get('qqq_above_200dma', 1.0)
-    vix_ts = regime_metrics.get('vix_term_structure', 1.0)
-    hy_oas = regime_metrics.get('hy_oas', 4.0)
+    breadth = _metric_or_default(regime_metrics, 'breadth_pos_6m', 0.5)
+    vol_regime = _metric_or_default(regime_metrics, 'qqq_vol_10d', 0.02)
+    qqq_above_ma = _metric_or_default(regime_metrics, 'qqq_above_200dma', 1.0)
+    vix_ts = _metric_or_default(regime_metrics, 'vix_term_structure', 1.0)
+    hy_oas = _metric_or_default(regime_metrics, 'hy_oas', 4.0)
     
     # Base exposure
     exposure = 1.0
@@ -1752,10 +1752,14 @@ def build_hedge_weight(portfolio_returns: pd.Series,
     if pd.isna(corr) or corr < 0:
         return 0.0
 
+    qqq_above = _metric_or_default(regime_metrics, "qqq_above_200dma", 1.0)
+    breadth = _metric_or_default(regime_metrics, "breadth_pos_6m", 1.0)
+    slope = _metric_or_default(regime_metrics, "qqq_50dma_slope_10d", 0.0)
+
     bearish = (
-        regime_metrics.get("qqq_above_200dma", 1.0) < 1.0 or
-        regime_metrics.get("breadth_pos_6m", 1.0) < 0.40 or
-        regime_metrics.get("qqq_50dma_slope_10d", 0.0) < 0.0
+        qqq_above < 1.0 or
+        breadth < 0.40 or
+        slope < 0.0
     )
 
     if not bearish or corr < corr_threshold:
@@ -4717,6 +4721,58 @@ def get_benchmark_series(ticker: str, start: str, end: str) -> pd.Series:
             if attempt == 1:
                 raise e
 
+def _safe_last(series: pd.Series) -> float:
+    if series is None:
+        return np.nan
+    ser = pd.Series(series).dropna()
+    if ser.empty:
+        return np.nan
+    last = ser.iloc[-1]
+    return float(last) if pd.notna(last) else np.nan
+
+
+def _safe_last_vol(series: pd.Series, window: int = 10) -> float:
+    if series is None:
+        return np.nan
+    ser = pd.Series(series).dropna()
+    if ser.empty or ser.shape[0] <= window:
+        return np.nan
+    vol = ser.pct_change().rolling(window).std().iloc[-1]
+    return float(vol) if pd.notna(vol) and vol > 0 else np.nan
+
+
+def _vix_term_structure(vix1m: pd.Series, vix3m: pd.Series) -> float:
+    v1 = _safe_last(vix1m)
+    v3 = _safe_last(vix3m)
+    if not (pd.notna(v1) and pd.notna(v3) and v1 > 0 and v3 > 0):
+        return np.nan
+    ratio = v3 / v1
+    return ratio if 0.5 <= ratio <= 2.0 else np.nan
+
+
+def _above_200dma(px: pd.Series) -> float:
+    if px is None:
+        return np.nan
+    ser = pd.Series(px).dropna()
+    if ser.shape[0] < REGIME_MA:
+        return np.nan
+    ma = ser.rolling(REGIME_MA).mean().iloc[-1]
+    last = ser.iloc[-1]
+    if not (pd.notna(ma) and pd.notna(last)):
+        return np.nan
+    return float(last > ma)
+
+
+def _metric_or_default(metrics: Dict[str, float], key: str, default: float) -> float:
+    val = metrics.get(key, np.nan)
+    if pd.notna(val):
+        try:
+            return float(val)
+        except Exception:
+            return default
+    return default
+
+
 def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
     """Enhanced regime metrics calculation"""
     if universe_prices_daily.empty:
@@ -4733,42 +4789,49 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
             return pd.Series(dtype=float)
 
     qqq = _safe_fetch("QQQ").dropna()
+    if qqq.empty:
+        logging.info("Regime metrics missing QQQ series; attempting SPY fallback")
+        qqq = _safe_fetch("SPY").dropna()
+    if qqq.empty:
+        logging.warning("Regime metrics could not source QQQ or SPY; hedge inputs will be NaN")
+
     vix = _safe_fetch("^VIX")
     vix3m = _safe_fetch("^VIX3M")
     hy_oas = _safe_fetch("BAMLH0A0HYM2")
 
-    if len(vix) and len(vix3m):
-        latest_vix = vix.iloc[-1]
-        latest_vix3m = vix3m.iloc[-1]
-        vix_ts = float(latest_vix3m / latest_vix) if latest_vix not in (0, np.nan) else np.nan
-    else:
-        vix_ts = np.nan
+    vix_ts = _vix_term_structure(vix, vix3m)
+    hy_oas_last = _safe_last(hy_oas)
 
-    hy_oas_last = float(hy_oas.iloc[-1]) if len(hy_oas) else np.nan
+    # Universe breadth above 200DMA (ignore tickers without sufficient history)
+    above_flags: list[float] = []
+    for col in universe_prices_daily.columns:
+        flag = _above_200dma(universe_prices_daily[col])
+        if pd.notna(flag):
+            above_flags.append(flag)
+    pct_above_ma = float(np.mean(above_flags)) if above_flags else np.nan
 
-    roll_ma = universe_prices_daily.rolling(REGIME_MA).mean()
-    if len(roll_ma) and not roll_ma.iloc[-1].isna().all():
-        pct_above_ma = float((universe_prices_daily.iloc[-1] > roll_ma.iloc[-1]).mean())
-    else:
-        pct_above_ma = np.nan
-
-    qqq_above_ma = np.nan
-    qqq_vol_10d = np.nan
+    qqq_above_ma = _above_200dma(qqq)
+    qqq_vol_10d = _safe_last_vol(qqq, window=10)
     qqq_slope_50 = np.nan
     if not qqq.empty:
-        qqq_ma = qqq.rolling(REGIME_MA).mean()
-        if len(qqq_ma.dropna()) > 0:
-            qqq_above_ma = float(qqq.iloc[-1] > qqq_ma.iloc[-1])
-        qqq_vol_10d = float(qqq.pct_change().rolling(10).std().iloc[-1]) if len(qqq) >= 11 else np.nan
-        if len(qqq) > 60:
-            ma50 = qqq.rolling(50).mean()
-            if pd.notna(ma50.iloc[-1]) and pd.notna(ma50.iloc[-10]):
+        ser = qqq.dropna()
+        if ser.shape[0] > 60:
+            ma50 = ser.rolling(50).mean()
+            tail = ma50.iloc[-10:]
+            if tail.dropna().shape[0] == 10 and pd.notna(ma50.iloc[-1]) and pd.notna(ma50.iloc[-10]):
                 qqq_slope_50 = float(ma50.iloc[-1] / ma50.iloc[-10] - 1)
 
     monthly = universe_prices_daily.resample("M").last()
-    pos_6m = float((monthly.pct_change(6).iloc[-1] > 0).mean()) if len(monthly) >= 7 else np.nan
+    pos_6m = np.nan
+    if len(monthly) >= 7:
+        valid_cols = monthly.notna().sum() >= 7
+        six_m = monthly.pct_change(6).iloc[-1]
+        six_m = six_m[valid_cols.reindex(six_m.index).fillna(False)]
+        six_m = six_m.dropna()
+        if not six_m.empty:
+            pos_6m = float((six_m > 0).mean())
 
-    return {
+    metrics = {
         "universe_above_200dma": pct_above_ma,
         "qqq_above_200dma": qqq_above_ma,
         "qqq_vol_10d": qqq_vol_10d,
@@ -4777,6 +4840,19 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
         "vix_term_structure": vix_ts,
         "hy_oas": hy_oas_last,
     }
+
+    used_metrics = {k: v for k, v in metrics.items() if pd.notna(v)}
+    logging.info(
+        "REGIME metrics computed | vol=%s | breadth=%s | qqq>200=%s | vix_ts=%s | hy_oas=%s (used=%d)",
+        metrics.get("qqq_vol_10d"),
+        metrics.get("breadth_pos_6m"),
+        metrics.get("qqq_above_200dma"),
+        metrics.get("vix_term_structure"),
+        metrics.get("hy_oas"),
+        len(used_metrics),
+    )
+
+    return metrics
 
 def get_market_regime() -> Tuple[str, Dict[str, float]]:
     """
@@ -4789,28 +4865,51 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
         start = (date.today() - relativedelta(months=12)).strftime("%Y-%m-%d")
         px = fetch_market_data(base_tickers, start, end)
         metrics = compute_regime_metrics(px)
-        
+
+        scoring_inputs = {
+            "vol": metrics.get("qqq_vol_10d", np.nan),
+            "breadth": metrics.get("breadth_pos_6m", np.nan),
+            "trend": metrics.get("qqq_above_200dma", np.nan),
+            "vix_ts": metrics.get("vix_term_structure", np.nan),
+        }
+        valid = {k: v for k, v in scoring_inputs.items() if pd.notna(v)}
+        logging.info(
+            "REGIME inputs | vol=%s | breadth=%s | qqq>200=%s | vix_ts=%s (used=%d)",
+            scoring_inputs["vol"],
+            scoring_inputs["breadth"],
+            scoring_inputs["trend"],
+            scoring_inputs["vix_ts"],
+            len(valid),
+        )
+
         # Enhanced labeling with more nuanced categories
-        breadth = metrics.get("breadth_pos_6m", np.nan)
-        qqq_abv = metrics.get("qqq_above_200dma", np.nan)
-        vol10   = metrics.get("qqq_vol_10d", np.nan)
-        
-        # More sophisticated regime classification
-        if qqq_abv >= 1.0 and breadth > 0.65 and vol10 < 0.025:
-            label = "Strong Risk-On"
-        elif qqq_abv >= 1.0 and breadth > 0.50:
-            label = "Risk-On"
-        elif qqq_abv >= 1.0 and breadth > 0.35:
-            label = "Cautious Risk-On"
-        elif qqq_abv < 1.0 and breadth > 0.45:
-            label = "Mixed"
-        elif qqq_abv < 1.0 and breadth > 0.35:
-            label = "Risk-Off"
-        elif vol10 > 0.045:
-            label = "High Volatility Risk-Off"
+        breadth = scoring_inputs["breadth"]
+        qqq_abv = scoring_inputs["trend"]
+        vol10 = scoring_inputs["vol"]
+
+        if len(valid) < 3:
+            label = "Neutral"
         else:
-            label = "Extreme Risk-Off"
-            
+            qqq_above_flag = pd.notna(qqq_abv) and qqq_abv >= 1.0
+            breadth_gt = lambda threshold: pd.notna(breadth) and breadth > threshold
+            vol_gt = lambda threshold: pd.notna(vol10) and vol10 > threshold
+            vol_lt = lambda threshold: pd.notna(vol10) and vol10 < threshold
+
+            if qqq_above_flag and breadth_gt(0.65) and vol_lt(0.025):
+                label = "Strong Risk-On"
+            elif qqq_above_flag and breadth_gt(0.50):
+                label = "Risk-On"
+            elif qqq_above_flag and breadth_gt(0.35):
+                label = "Cautious Risk-On"
+            elif (pd.notna(qqq_abv) and qqq_abv < 1.0) and breadth_gt(0.45):
+                label = "Mixed"
+            elif (pd.notna(qqq_abv) and qqq_abv < 1.0) and breadth_gt(0.35):
+                label = "Risk-Off"
+            elif vol_gt(0.045):
+                label = "High Volatility Risk-Off"
+            else:
+                label = "Extreme Risk-Off"
+
         return label, metrics
     except Exception:
         return "Neutral", {}
