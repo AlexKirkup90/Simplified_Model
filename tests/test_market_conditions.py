@@ -41,9 +41,10 @@ def test_assess_market_conditions_risk_on(monkeypatch):
     metrics = {
         "breadth_pos_6m": 0.7,
         "qqq_vol_10d": 0.02,
-        "vix_term_structure": 1.1,
+        "vix_term_structure": 0.95,
         "hy_oas": 4.0,
         "qqq_above_200dma": 1.0,
+        "universe_above_200dma": 0.75,
     }
     _base_patch(monkeypatch, metrics, "Risk-On", eligible_count=120)
     result = backend.assess_market_conditions(date(2024, 1, 5))
@@ -59,9 +60,10 @@ def test_assess_market_conditions_risk_off(monkeypatch):
     metrics = {
         "breadth_pos_6m": 0.3,
         "qqq_vol_10d": 0.05,
-        "vix_term_structure": 0.8,
+        "vix_term_structure": 1.4,
         "hy_oas": 7.0,
         "qqq_above_200dma": 0.0,
+        "universe_above_200dma": 0.2,
     }
     _base_patch(monkeypatch, metrics, "Risk-Off", eligible_count=40)
     result = backend.assess_market_conditions(date(2024, 1, 5))
@@ -77,9 +79,10 @@ def test_assess_market_conditions_logs(monkeypatch):
     metrics = {
         "breadth_pos_6m": 0.7,
         "qqq_vol_10d": 0.02,
-        "vix_term_structure": 1.1,
+        "vix_term_structure": 0.95,
         "hy_oas": 4.0,
         "qqq_above_200dma": 1.0,
+        "universe_above_200dma": 0.75,
     }
     _base_patch(monkeypatch, metrics, "Risk-On")
 

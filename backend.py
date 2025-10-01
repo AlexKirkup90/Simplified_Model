@@ -4626,10 +4626,11 @@ def generate_live_portfolio_isa_monthly(
         LATEST_REGIME_LABEL = current_regime_label
         if _HAS_ST:
             try:
-                st.session_state["latest_regime_label"] = current_regime_label
                 latest_metrics_payload = dict(regime_metrics)
-                latest_metrics_payload["regime"] = current_regime_label
-                score, comps = _compute_regime_score(latest_metrics_payload)
+                label, score, comps = compute_regime_label(latest_metrics_payload)
+                current_regime_label = label
+                st.session_state["latest_regime_label"] = label
+                latest_metrics_payload["regime"] = label
                 latest_metrics_payload["regime_score"] = score
                 latest_metrics_payload["regime_components"] = comps
                 st.session_state["latest_metrics"] = latest_metrics_payload
@@ -5766,82 +5767,124 @@ def _metric_or_default(metrics: Dict[str, float], key: str, default: float) -> f
     return default
 
 
+def _clamp(x, lo=0.0, hi=100.0):
+    try:
+        return float(min(max(x, lo), hi))
+    except Exception:
+        return 50.0  # neutral
+
+
+def _pct_to_score(p, good_high=True):
+    """Map p in [0,1] → 0..100; invert if good_high=False."""
+
+    try:
+        p = float(p)
+    except Exception:
+        return 50.0
+    p = min(max(p, 0.0), 1.0)
+    s = 100.0 * p
+    return s if good_high else 100.0 - s
+
+
+def _ratio_to_score(r, good_low=True, lo=0.8, hi=1.2):
+    """
+    Map ratio r to 0..100 over [lo,hi] with clamping.
+    If good_low=True, lower is better (invert scale).
+    """
+
+    try:
+        r = float(r)
+    except Exception:
+        return 50.0
+    r_n = (r - lo) / (hi - lo)
+    r_n = min(max(r_n, 0.0), 1.0)
+    s = 100.0 * r_n
+    return 100.0 - s if good_low else s
+
+
+def compute_regime_label(metrics: dict) -> tuple[str, float, dict]:
+    """
+    Returns (label, composite_score, components) based on:
+      - universe_above_200dma (0..1)
+      - breadth_pos_6m (0..1)
+      - qqq_above_200dma (0/1)
+      - qqq_50dma_slope_10d (approx monthly slope)
+      - vix_term_structure (VIX3M/VIX1M; higher = worse)
+      - qqq_vol_10d (optional; NaN -> neutral)
+    All components are scored so higher = better risk environment.
+    """
+
+    metrics = metrics or {}
+
+    # Breadth & trend (higher better)
+    breadth = _pct_to_score(metrics.get("breadth_pos_6m", 0.0), good_high=True)
+    trend = _pct_to_score(metrics.get("universe_above_200dma", 0.0), good_high=True)
+
+    # VIX TS: higher → worse; invert (good_low=True)
+    vix_ts = _ratio_to_score(metrics.get("vix_term_structure", 1.0), good_low=True, lo=0.8, hi=1.2)
+
+    # Slope: map -2%..+2% to ~0..100
+    slope_raw = metrics.get("qqq_50dma_slope_10d", 0.0)
+    try:
+        slope = _clamp(50.0 + 50.0 * (float(slope_raw) / 0.02))
+    except Exception:
+        slope = 50.0
+
+    # Volatility: lower better; treat NaN as neutral
+    vol_10d = metrics.get("qqq_vol_10d", None)
+    if vol_10d is None or (
+        isinstance(vol_10d, float) and (np.isnan(vol_10d) or np.isinf(vol_10d))
+    ):
+        vol = 50.0
+    else:
+        vol = _ratio_to_score(float(vol_10d), good_low=True, lo=0.005, hi=0.06)
+
+    components = {
+        "breadth": breadth,
+        "trend": trend,
+        "vix_ts": vix_ts,
+        "slope": slope,
+        "volatility": vol,
+    }
+
+    # Weighted composite (tunable)
+    score = (
+        0.30 * breadth
+        + 0.25 * trend
+        + 0.20 * vix_ts
+        + 0.15 * slope
+        + 0.10 * vol
+    )
+    score = _clamp(score)
+
+    # Hard overrides (guardrails)
+    qqq_above = int(metrics.get("qqq_above_200dma", 0) or 0)
+    breadth_p = float(metrics.get("breadth_pos_6m", 0.0) or 0.0)
+
+    if qqq_above == 0 and breadth_p < 0.05:
+        label = "Risk-Off"
+        score = min(score, 33.0)
+    else:
+        if score >= 67.0:
+            label = "Risk-On"
+        elif score >= 45.0:
+            label = "Neutral"
+        else:
+            label = "Risk-Off"
+
+    # Final sanity: no Risk-On when QQQ < 200DMA and breadth tiny
+    if label == "Risk-On" and (qqq_above == 0 and breadth_p < 0.10):
+        label = "Neutral"
+        score = min(score, 55.0)
+
+    return label, score, components
+
+
 def _classify_market_regime(metrics: Dict[str, float]) -> str:
     """Translate raw regime metrics into a discrete regime label."""
 
-    if not metrics:
-        return "Neutral"
-
-    breadth = float(metrics.get("breadth_pos_6m", np.nan))
-    vix_ts = float(metrics.get("vix_term_structure", np.nan))
-    vol10 = float(metrics.get("qqq_vol_10d", np.nan))
-    trend_val = metrics.get("qqq_above_200dma", np.nan)
-
-    inputs = [trend_val, breadth, vix_ts, vol10]
-    valid_count = sum(pd.notna(x) for x in inputs)
-    if valid_count < 3:
-        return "Neutral"
-
-    qqq_above_200 = pd.notna(trend_val) and float(trend_val) >= 1.0
-
-    flags = [
-        ("trend", pd.notna(trend_val) and not qqq_above_200),
-        ("breadth", pd.notna(breadth) and breadth < 0.35),
-        ("vix_ts", pd.notna(vix_ts) and vix_ts < 0.9),
-        ("vol", pd.notna(vol10) and vol10 > 0.035),
-    ]
-
-    n_red = sum(1 for _, flag in flags if flag)
-
-    strong_risk_on = (
-        pd.notna(breadth)
-        and breadth > 0.65
-        and pd.notna(vol10)
-        and vol10 < 0.025
-    )
-
-    if n_red >= 3:
-        return "Extreme Risk-Off"
-    if n_red == 2:
-        return "Risk-Off"
-    if strong_risk_on:
-        return "Strong Risk-On"
-    return "Risk-On"
-
-
-def _compute_regime_score(metrics: Dict[str, float]) -> tuple[float, Dict[str, float]]:
-    components: Dict[str, float] = {}
-
-    breadth = metrics.get("breadth_pos_6m")
-    if pd.notna(breadth):
-        components["breadth"] = float(np.clip(breadth, 0.0, 1.0) * 100.0)
-
-    vol10 = metrics.get("qqq_vol_10d")
-    if pd.notna(vol10):
-        components["volatility"] = float(np.clip(1.0 - (vol10 / 0.05), 0.0, 1.0) * 100.0)
-
-    vix_ts = metrics.get("vix_term_structure")
-    if pd.notna(vix_ts):
-        components["vix_ts"] = float(np.clip((vix_ts - 0.75) / (1.25 - 0.75), 0.0, 1.0) * 100.0)
-
-    trend = metrics.get("qqq_above_200dma")
-    if pd.notna(trend):
-        components["trend"] = 100.0 if float(trend) >= 1.0 else 25.0
-
-    slope = metrics.get("qqq_50dma_slope_10d")
-    if pd.notna(slope):
-        components["slope"] = float(np.clip((slope + 0.05) / 0.10, 0.0, 1.0) * 100.0)
-
-    if metrics.get("hy_oas_status") != "missing":
-        hy_oas = metrics.get("hy_oas")
-        if pd.notna(hy_oas):
-            components["hy_oas"] = float(np.clip((6.0 - hy_oas) / 4.0, 0.0, 1.0) * 100.0)
-
-    if not components:
-        return 50.0, {}
-
-    score = float(np.mean(list(components.values())))
-    return score, components
+    label, _, _ = compute_regime_label(metrics or {})
+    return label
 
 
 def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
@@ -5959,7 +6002,10 @@ def get_market_regime() -> Tuple[str, Dict[str, float]]:
             len(valid),
         )
 
-        label = _classify_market_regime(metrics)
+        label, score, comps = compute_regime_label(metrics)
+        metrics["regime"] = label
+        metrics["regime_score"] = score
+        metrics["regime_components"] = comps
 
         global LATEST_REGIME_LABEL
         LATEST_REGIME_LABEL = label
@@ -6097,16 +6143,27 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     except Exception:
         metrics = {}
 
-    # Add regime label (uses existing helper which internally recomputes metrics)
-    regime_label, _ = get_market_regime()
+    regime_label, regime_score, regime_components = compute_regime_label(metrics)
+    global LATEST_REGIME_LABEL
+    LATEST_REGIME_LABEL = regime_label
     metrics["regime"] = regime_label
-    regime_score, regime_components = _compute_regime_score(metrics)
     metrics["regime_score"] = regime_score
     metrics["regime_components"] = regime_components
 
-    metrics["qqq_vol_10d"] = float(metrics.get("qqq_vol_10d") or 0.0)
-    metrics["qqq_50dma_slope_10d"] = float(metrics.get("qqq_50dma_slope_10d") or 0.0)
-    metrics["breadth_pos_6m"] = float(metrics.get("breadth_pos_6m") or 0.0)
+    # Keep raw metrics numeric but do not treat missing as bullish
+    for key in ("qqq_vol_10d", "qqq_50dma_slope_10d", "breadth_pos_6m"):
+        val = metrics.get(key)
+        if val is None:
+            metrics[key] = np.nan
+        else:
+            try:
+                val_f = float(val)
+            except Exception:
+                val_f = np.nan
+            if isinstance(val_f, float) and (np.isnan(val_f) or np.isinf(val_f)):
+                metrics[key] = np.nan
+            else:
+                metrics[key] = val_f
 
     eligible_count_h150 = _estimate_hybrid150_eligible_count(asof_ts)
     metrics["eligible_count_hybrid150"] = int(eligible_count_h150)
@@ -6130,10 +6187,20 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     st.session_state["universe"] = chosen_universe
 
     # Derive settings based on key thresholds
-    breadth = metrics.get("breadth_pos_6m", 0.5)
-    vol10 = metrics.get("qqq_vol_10d", 0.02)
-    vix_ts = metrics.get("vix_term_structure", 1.0)
-    hy_oas = metrics.get("hy_oas", 4.0)
+    def _neutral_metric(name: str, default: float) -> float:
+        val = metrics.get(name, default)
+        try:
+            val_f = float(val)
+        except Exception:
+            return default
+        if np.isnan(val_f) or np.isinf(val_f):
+            return default
+        return val_f
+
+    breadth = _neutral_metric("breadth_pos_6m", 0.5)
+    vol10 = _neutral_metric("qqq_vol_10d", 0.02)
+    vix_ts = _neutral_metric("vix_term_structure", 1.0)
+    hy_oas = _neutral_metric("hy_oas", 4.0)
     hy_oas_status = metrics.get("hy_oas_status", "ok")
 
     vix_thresh = st.session_state.get("vix_ts_threshold", VIX_TS_THRESHOLD_DEFAULT)
@@ -6146,14 +6213,14 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     risk_off = (
         breadth < 0.35
         or vol10 > 0.045
-        or vix_ts < vix_thresh
+        or vix_ts > vix_thresh
         or (hy_oas_status != "missing" and hy_oas > oas_thresh)
     )
 
     risk_on = (
         breadth > 0.65
         and vol10 < 0.025
-        and vix_ts >= vix_thresh
+        and vix_ts <= vix_thresh
         and (hy_oas_status == "missing" or hy_oas < max(0.0, oas_thresh - 1))
     )
 
