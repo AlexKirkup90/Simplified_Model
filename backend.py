@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os, io, warnings, json, hashlib
-from typing import Optional, Tuple, Dict, List, Any, Callable, Iterable
+from typing import Optional, Tuple, Dict, List, Any, Callable, Iterable, Mapping
 from dataclasses import replace, asdict
 
 import numpy as np
@@ -151,6 +151,88 @@ def _run_hybrid_backtest_with_cache(
     if use_incremental and cache_key:
         strategy_core.save_backtest_cache(cache_key, result)
     return result
+
+
+def _as_native_scalar(value: Any) -> Any:
+    """Convert numpy/pandas scalars to plain Python types for JSON safety."""
+
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, pd.Period):
+        return value.to_timestamp().isoformat()
+    if isinstance(value, (datetime, date)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, pd.Timedelta):
+        return float(value.total_seconds())
+    if isinstance(value, np.generic):
+        try:
+            return value.item()
+        except Exception:
+            return value
+    return value
+
+
+def _serialize_series(series: pd.Series) -> Dict[str, Any]:
+    ser = pd.Series(series)
+    if ser.empty:
+        return {"type": "series", "name": ser.name, "index": [], "values": []}
+
+    ser = ser.replace([np.inf, -np.inf], np.nan)
+    values = [None if pd.isna(v) else _as_native_scalar(v) for v in ser.tolist()]
+    index = [_as_native_scalar(idx) for idx in ser.index]
+    return {
+        "type": "series",
+        "name": ser.name,
+        "index": index,
+        "values": values,
+    }
+
+
+def _serialize_frame(frame: pd.DataFrame) -> Dict[str, Any]:
+    df = pd.DataFrame(frame)
+    if df.empty:
+        return {"type": "dataframe", "columns": [], "index": [], "data": []}
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+    obj = df.astype(object)
+    obj = obj.where(pd.notna(obj), None)
+    data = [[_as_native_scalar(v) for v in row] for row in obj.to_numpy()]  # type: ignore[arg-type]
+    columns = [_as_native_scalar(col) for col in obj.columns]
+    index = [_as_native_scalar(idx) for idx in obj.index]
+    return {
+        "type": "dataframe",
+        "columns": columns,
+        "index": index,
+        "data": data,
+    }
+
+
+def standardize_backtest_payload(payload: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """Return a JSON-friendly representation of backtest artefacts.
+
+    The helper gracefully handles pandas objects without evaluating them in a
+    boolean context, preventing ambiguous truth-value errors when Series are
+    empty. Scalars are converted to native Python types so that downstream
+    caching layers (e.g., Streamlit session state) can safely serialise the
+    payload.
+    """
+
+    if payload is None:
+        return {}
+
+    out: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, pd.Series):
+            out[key] = _serialize_series(value)
+            continue
+        if isinstance(value, pd.DataFrame):
+            out[key] = _serialize_frame(value)
+            continue
+        if isinstance(value, (list, tuple, np.ndarray)):
+            out[key] = [_as_native_scalar(v) for v in list(value)]
+            continue
+        out[key] = _as_native_scalar(value)
+    return out
 
 # =========================
 # Optional numba helpers
@@ -449,7 +531,8 @@ def _emit_info(msg: str, info: Optional[Callable[[str], None]] = None) -> None:
 def _record_hedge_state(scope: str,
                         weight: float,
                         correlation: float | None,
-                        regime_metrics: Dict[str, float]) -> None:
+                        regime_metrics: Dict[str, float],
+                        correlation_fallback: bool = False) -> None:
     """Persist the latest hedge details for UI/reporting purposes."""
     if not _HAS_ST:
         return
@@ -461,7 +544,13 @@ def _record_hedge_state(scope: str,
         "qqq_above_200dma": regime_metrics.get("qqq_above_200dma"),
         "breadth_pos_6m": regime_metrics.get("breadth_pos_6m"),
         "timestamp": datetime.utcnow().isoformat(),
-        "reason": describe_hedge_state(weight, correlation, regime_metrics),
+        "correlation_fallback": bool(correlation_fallback),
+        "reason": describe_hedge_state(
+            weight,
+            correlation,
+            regime_metrics,
+            correlation_fallback=correlation_fallback,
+        ),
     }
     st.session_state[f"latest_{scope}_hedge"] = summary
 
@@ -1326,6 +1415,7 @@ def apply_diversification_safety_net(
     comp_scores: pd.Series | None,
     daily_close: pd.DataFrame | None,
     min_names: int = 8,
+    fallback_min_names: int = 15,
     etf_candidates: tuple[str, ...] = ("QQQ", "SPY", "VTI"),
 ) -> tuple[pd.Series, bool, Dict[str, str]]:
     """Broaden the allocation when too few names survive gating.
@@ -1340,10 +1430,12 @@ def apply_diversification_safety_net(
     notes: Dict[str, str] = {}
     series = weights.copy().astype(float)
     current = int(series[series > 0].shape[0])
+    target_floor = max(int(min_names), int(fallback_min_names)) if fallback_min_names else int(min_names)
+    target_floor = max(target_floor, 0)
     total = float(series.sum()) or 1.0
 
-    if current < min_names and comp_scores is not None and not comp_scores.empty:
-        need = max(0, min_names - current)
+    if current < target_floor and comp_scores is not None and not comp_scores.empty:
+        need = max(0, target_floor - current)
         pool = pd.Series(comp_scores).drop(index=series.index, errors="ignore").dropna()
         pool = pool.replace([np.inf, -np.inf], np.nan).dropna()
         if not pool.empty:
@@ -1355,10 +1447,11 @@ def apply_diversification_safety_net(
                 series = series.add(expanded * total * blend, fill_value=0.0)
                 applied = True
                 notes["secondary_pool"] = (
-                    f"Added {len(extras)} secondary picks to avoid concentration (blend {blend:.0%})."
+                    f"Added {len(extras)} secondary picks to target {target_floor} names (blend {blend:.0%})."
                 )
+        current = int(series[series > 0].shape[0])
 
-    if series[series > 0].shape[0] < min_names:
+    if series[series > 0].shape[0] < target_floor:
         stub = None
         cols = list(getattr(daily_close, "columns", []))
         for candidate in etf_candidates:
@@ -1366,13 +1459,14 @@ def apply_diversification_safety_net(
                 stub = candidate
                 break
         if stub is not None:
-            blend = min(0.30, 0.08 * max(0, min_names - series[series > 0].shape[0]))
+            shortfall = max(0, target_floor - series[series > 0].shape[0])
+            blend = min(0.30, 0.08 * shortfall)
             if blend > 0:
                 series = series * (1 - blend)
                 series.loc[stub] = series.get(stub, 0.0) + total * blend
                 applied = True
                 notes["etf_overlay"] = (
-                    f"Blended {stub} overlay ({blend:.0%}) to maintain diversification."
+                    f"Blended {stub} overlay ({blend:.0%}) to maintain diversification (target {target_floor})."
                 )
 
     if applied:
@@ -1805,7 +1899,9 @@ def apply_dynamic_drawdown_scaling(monthly_returns: pd.Series,
 def calculate_portfolio_correlation_to_market(
     portfolio_returns: pd.Series,
     market_returns: pd.Series = None,
-) -> float:
+    *,
+    return_metadata: bool = False,
+) -> float | tuple[float, Dict[str, Any]]:
     """Calculate correlation between portfolio and benchmark.
 
     """
@@ -1841,8 +1937,12 @@ def calculate_portfolio_correlation_to_market(
 
     # Portfolio series
     port = pd.Series(portfolio_returns).astype(float).dropna()
+    metadata: Dict[str, Any] = {"fallback": False, "points": 0}
     if port.empty:
-        return np.nan
+        metadata["fallback"] = True
+        if return_metadata:
+            return 0.0, metadata
+        return 0.0
 
     # Market series (fetch QQQ if not provided)
     if market_returns is None:
@@ -1852,7 +1952,11 @@ def calculate_portfolio_correlation_to_market(
             qqq_px = get_benchmark_series("QQQ", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
             mkt = qqq_px.pct_change().dropna()
         except Exception:
-            return np.nan
+            metadata["fallback"] = True
+            logging.warning("Hedge correlation fallback: unable to source benchmark series")
+            if return_metadata:
+                return 0.0, metadata
+            return 0.0
     else:
         mkt = pd.Series(market_returns).astype(float).dropna()
 
@@ -1861,15 +1965,42 @@ def calculate_portfolio_correlation_to_market(
     mkt_m  = _to_monthly_returns(mkt)
 
     if port_m.empty or mkt_m.empty:
-        return np.nan
+        metadata["fallback"] = True
+        if return_metadata:
+            return 0.0, metadata
+        return 0.0
 
-    # Align and require enough overlap
-    common = port_m.index.intersection(mkt_m.index)
-    if len(common) < 3:
-        return np.nan
+    # Align to the portfolio index and fill benchmark gaps conservatively
+    market_aligned = mkt_m.reindex(port_m.index).ffill()
+    aligned = pd.DataFrame({"portfolio": port_m, "market": market_aligned}).dropna()
+    metadata["points"] = int(len(aligned))
 
-    corr = port_m.reindex(common).corr(mkt_m.reindex(common))
-    return float(corr) if pd.notna(corr) else np.nan
+    if len(aligned) < 3:
+        metadata["fallback"] = True
+        logging.warning(
+            "Hedge correlation fallback: insufficient overlap (n=%d)",
+            metadata["points"],
+        )
+        if return_metadata:
+            return 0.0, metadata
+        return 0.0
+
+    corr = aligned["portfolio"].corr(aligned["market"])
+    if pd.isna(corr):
+        metadata["fallback"] = True
+        logging.warning(
+            "Hedge correlation fallback: correlation returned NaN (n=%d)",
+            metadata["points"],
+        )
+        if return_metadata:
+            return 0.0, metadata
+        return 0.0
+
+    corr_value = float(corr)
+    if return_metadata:
+        metadata["fallback"] = False
+        return corr_value, metadata
+    return corr_value
 
 # =========================
 # NEW: QQQ Hedge Builder
@@ -1877,7 +2008,8 @@ def calculate_portfolio_correlation_to_market(
 def build_hedge_weight(portfolio_returns: pd.Series,
                        regime_metrics: Dict[str, float],
                        hedge_size: float,
-                       corr_threshold: float = 0.8) -> float:
+                       corr_threshold: float = 0.8,
+                       precomputed_correlation: float | None = None) -> float:
     """Determine QQQ hedge weight based on correlation and regime.
 
     The hedge activates only when the portfolio exhibits high correlation
@@ -1887,8 +2019,14 @@ def build_hedge_weight(portfolio_returns: pd.Series,
     if hedge_size <= 0 or portfolio_returns is None or portfolio_returns.empty:
         return 0.0
 
-    corr = calculate_portfolio_correlation_to_market(portfolio_returns)
-    if pd.isna(corr) or corr < 0:
+    if precomputed_correlation is None:
+        corr = calculate_portfolio_correlation_to_market(portfolio_returns)
+    else:
+        corr = float(precomputed_correlation)
+    if pd.isna(corr):
+        logging.warning("Hedge correlation unavailable – defaulting to 0.0 for sizing")
+        corr = 0.0
+    if corr < 0:
         return 0.0
 
     qqq_above = _metric_or_default(regime_metrics, "qqq_above_200dma", 1.0)
@@ -1913,6 +2051,7 @@ def describe_hedge_state(
     correlation: float | None,
     regime_metrics: Dict[str, float],
     corr_threshold: float = 0.8,
+    correlation_fallback: bool = False,
 ) -> str:
     """Provide a human-readable explanation for the hedge decision."""
 
@@ -1931,7 +2070,9 @@ def describe_hedge_state(
 
     if weight <= 0:
         reasons: list[str] = []
-        if correlation is None or pd.isna(correlation):
+        if correlation_fallback:
+            reasons.append("correlation unavailable (fallback applied)")
+        elif correlation is None or pd.isna(correlation):
             reasons.append("insufficient data for correlation")
         elif float(correlation) < corr_threshold:
             reasons.append(f"correlation {float(correlation):.2f} < {corr_threshold:.2f}")
@@ -1942,9 +2083,10 @@ def describe_hedge_state(
 
     triggers = bearish_flags or ["bearish regime signals"]
     trigger_text = "; ".join(triggers)
-    return (
-        f"Hedge active ({weight:.1%}): corr {corr_txt} ≥ {corr_threshold:.2f}; {trigger_text}."
-    )
+    note = f"Hedge active ({weight:.1%}): corr {corr_txt} ≥ {corr_threshold:.2f}; {trigger_text}."
+    if correlation_fallback:
+        note = f"{note} Correlation fallback used."
+    return note
 
 # =========================
 # Helpers (Enhanced)
@@ -3891,6 +4033,7 @@ def _build_isa_weights_fixed(
         comp_vec_full,
         daily_close,
         min_names=min_names,
+        fallback_min_names=max(15, min_names),
     )
     if broadened:
         combined_raw = combined_raw.sort_values(ascending=False)
@@ -4657,6 +4800,7 @@ def generate_live_portfolio_isa_monthly(
 
     hedge_weight = 0.0
     corr = np.nan
+    corr_meta: Dict[str, Any] = {"fallback": False}
     portfolio_recent = pd.Series(dtype=float)
     try:
         cfg_live = HybridConfig(
@@ -4683,9 +4827,18 @@ def generate_live_portfolio_isa_monthly(
             st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
             if _HAS_ST else HEDGE_MAX_DEFAULT
         )
-        hedge_weight = build_hedge_weight(portfolio_recent, regime_metrics, hedge_size)
-        corr = calculate_portfolio_correlation_to_market(portfolio_recent)
+        corr, corr_meta = calculate_portfolio_correlation_to_market(
+            portfolio_recent,
+            return_metadata=True,
+        )
+        hedge_weight = build_hedge_weight(
+            portfolio_recent,
+            regime_metrics,
+            hedge_size,
+            precomputed_correlation=corr,
+        )
     except Exception:
+        corr_meta = {"fallback": True}
         logging.warning("H02 hedge overlay failed in allocation", exc_info=True)
 
     # Trigger vs previous portfolio (health of current)
@@ -4768,7 +4921,13 @@ def generate_live_portfolio_isa_monthly(
     _emit_info(
         f"Live allocation QQQ hedge {state} (weight={hedge_weight:.1%}, corr={corr_txt})"
     )
-    _record_hedge_state("live", hedge_weight, corr, regime_metrics)
+    _record_hedge_state(
+        "live",
+        hedge_weight,
+        corr,
+        regime_metrics,
+        correlation_fallback=bool(corr_meta.get("fallback")),
+    )
 
     if is_monthly and isinstance(final_weights, pd.Series) and not final_weights.empty:
         try:
@@ -4782,7 +4941,12 @@ def generate_live_portfolio_isa_monthly(
         except Exception:
             logging.warning("Auto backtest trigger after monthly lock failed", exc_info=True)
 
-    hedge_note = describe_hedge_state(hedge_weight, corr, regime_metrics)
+    hedge_note = describe_hedge_state(
+        hedge_weight,
+        corr,
+        regime_metrics,
+        correlation_fallback=bool(corr_meta.get("fallback")),
+    )
     decision = (decision or "").strip()
     decision = f"{decision}\n{hedge_note}" if decision else hedge_note
 
@@ -5091,6 +5255,7 @@ def run_backtest_isa_dynamic(
 
     hedge_weight = 0.0
     corr = np.nan
+    corr_meta: Dict[str, Any] = {"fallback": False}
     regime_metrics: Dict[str, float] = {}
     portfolio_recent = hybrid_gross.tail(6)
 
@@ -5103,14 +5268,23 @@ def run_backtest_isa_dynamic(
             st.session_state.get("max_hedge", HEDGE_MAX_DEFAULT)
             if _HAS_ST else HEDGE_MAX_DEFAULT
         )
-        hedge_weight = build_hedge_weight(portfolio_recent, regime_metrics, hedge_size)
-        corr = calculate_portfolio_correlation_to_market(portfolio_recent)
+        corr, corr_meta = calculate_portfolio_correlation_to_market(
+            portfolio_recent,
+            return_metadata=True,
+        )
+        hedge_weight = build_hedge_weight(
+            portfolio_recent,
+            regime_metrics,
+            hedge_size,
+            precomputed_correlation=corr,
+        )
 
         if hedge_weight > 0 and not qqq_monthly.empty:
             qqq_aligned = qqq_monthly.reindex(hybrid_gross.index).fillna(0.0)
             hedge_returns = -hedge_weight * qqq_aligned
             hybrid_gross = hybrid_gross.add(hedge_returns, fill_value=0.0)
     except Exception:
+        corr_meta = {"fallback": True}
         logging.warning("H01 hedge overlay failed in backtest", exc_info=True)
 
     state = "active" if hedge_weight > 0 else "inactive"
@@ -5118,7 +5292,13 @@ def run_backtest_isa_dynamic(
     _emit_info(
         f"Backtest QQQ hedge {state} (weight={hedge_weight:.1%}, corr={corr_txt})"
     )
-    _record_hedge_state("backtest", hedge_weight, corr, regime_metrics)
+    _record_hedge_state(
+        "backtest",
+        hedge_weight,
+        corr,
+        regime_metrics,
+        correlation_fallback=bool(corr_meta.get("fallback")),
+    )
 
     hybrid_net = apply_costs(hybrid_gross, hybrid_tno, roundtrip_bps) if show_net else hybrid_gross
 
@@ -5199,6 +5379,14 @@ def _auto_run_backtest_for_live_portfolio(
         st.session_state["qqq_cum"] = qqq_cum
         st.session_state["hybrid_tno"] = hybrid_tno
         st.session_state["latest_backtest_timestamp"] = datetime.utcnow().isoformat()
+        st.session_state["latest_backtest_payload"] = standardize_backtest_payload(
+            {
+                "strategy_cum_gross": strat_cum_gross,
+                "strategy_cum_net": strat_cum_net,
+                "benchmark_cum": qqq_cum,
+                "turnover": hybrid_tno,
+            }
+        )
     except Exception:
         pass
 
