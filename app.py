@@ -149,6 +149,15 @@ AVG_TRADE_SIZE = AVG_TRADE_SIZE_DEFAULT
 tol = 0.01
 show_net = st.session_state["show_net"]
 
+# Canonical backtest helpers
+def _bt_payload() -> dict:
+    bt = st.session_state.get("bt")
+    return bt if isinstance(bt, dict) else {}
+
+
+def _bt_to_series(key: str) -> pd.Series:
+    return backend.deserialize_backtest_series(_bt_payload().get(key))
+
 # Prev portfolio (for plan & monthly lock)
 prev_portfolio = backend.load_previous_portfolio()
 
@@ -253,6 +262,7 @@ if go:
     active_universe = st.session_state.get("universe_choice", st.session_state.get("universe", "Hybrid Top150"))
     st.session_state["universe"] = active_universe
     with st.spinner("Building enhanced monthly-locked portfolio and running backtest…"):
+        bt_payload = {}
         try:
             # ---- Live portfolio (monthly lock + stability + trigger + sector caps + enhancements)
             live_disp, live_raw, decision = backend.generate_live_portfolio_isa_monthly(
@@ -353,12 +363,24 @@ if go:
                     strategy_cum_gross = (1 + rets.fillna(0)).cumprod()
             except Exception as exc:
                 st.warning(f"Standardizing backtest outputs failed: {exc}")
+            bt_payload = backend.standardize_backtest_payload(
+                strategy_cum_gross=strategy_cum_gross,
+                strategy_cum_net=strategy_cum_net,
+                qqq_cum=qqq_cum,
+                hybrid_tno=hybrid_tno,
+                show_net=show_net,
+            )
+            st.session_state["bt"] = bt_payload
+            st.session_state["latest_backtest_payload"] = bt_payload
+
             if strategy_cum_gross is not None:
                 st.session_state["strategy_cum_gross"] = strategy_cum_gross
             if strategy_cum_net is not None:
                 st.session_state["strategy_cum_net"] = strategy_cum_net
             if qqq_cum is not None:
                 st.session_state["qqq_cum"] = qqq_cum
+            if hybrid_tno is not None:
+                st.session_state["hybrid_tno"] = hybrid_tno
             if auto_cfg is not None:
                 st.session_state["auto_best_config"] = asdict(auto_cfg)
             if auto_diag is not None and not auto_diag.empty:
@@ -375,9 +397,9 @@ if go:
 
         # Automatically run Monte Carlo projections using historical returns
         try:
-            base_cum = strategy_cum_net if (strategy_cum_net is not None and show_net) else strategy_cum_gross
-            if base_cum is not None:
-                mc_returns = base_cum.pct_change().dropna()
+            bt_base = backend.deserialize_backtest_series(bt_payload.get("equity_strategy"))
+            if not bt_base.empty:
+                mc_returns = bt_base.pct_change().dropna()
                 st.session_state.mc_results = backend.run_monte_carlo_projections(
                     mc_returns,
                     confidence_levels=[5, 25, 50, 75, 95],
@@ -388,6 +410,18 @@ if go:
         except Exception as e:
             st.warning(f"Monte Carlo simulation failed: {e}")
             st.session_state.mc_results = {"error": str(e)}
+
+        # Update hedge metadata using canonical returns
+        try:
+            strat_rets = backend.deserialize_backtest_series(bt_payload.get("rets_strategy"))
+            bench_rets = backend.deserialize_backtest_series(bt_payload.get("rets_bench"))
+            hedge_meta = backend.compute_hedge_metadata(strat_rets, bench_rets, min_overlap=12)
+            st.session_state["latest_backtest_hedge"] = {
+                **st.session_state.get("latest_backtest_hedge", {}),
+                **hedge_meta,
+            }
+        except Exception:
+            pass
 
     success = live_raw is not None and not live_raw.empty
     if success and _is_rebalance_day():
@@ -451,12 +485,22 @@ with tab1:
                     st.write("None")
             with c2:
                 st.markdown("### 🟢 New Buys")
-                if signals["buy"]:
-                    for t in signals["buy"]:
-                        tgt = float(live_for_plan.loc[t, "Weight"]) if t in live_for_plan.index else 0.0
+                buys_pos: list[tuple[str, float]] = []
+                buys_zero: list[tuple[str, float]] = []
+                for t in signals["buy"]:
+                    tgt = float(live_for_plan.loc[t, "Weight"]) if t in live_for_plan.index else 0.0
+                    (buys_pos if tgt >= tol else buys_zero).append((t, tgt))
+
+                if buys_pos:
+                    for t, tgt in buys_pos:
                         st.write(f"- **{t}** — target {tgt:.2%}")
                 else:
                     st.write("None")
+
+                if buys_zero:
+                    st.markdown("**Standby (0% weight, diversification fallback):**")
+                    for t, _ in buys_zero:
+                        st.write(f"- {t}")
             with c3:
                 st.markdown(f"### 🔄 Rebalance (≥ {tol:.1%})")
                 if signals["rebalance"]:
@@ -472,7 +516,8 @@ with tab1:
             picks_rows.append({"Action": "Sell", "Ticker": t, "OldWeight": old_w, "NewWeight": 0.0})
         for t in signals["buy"]:
             new_w = float(live_for_plan.loc[t, "Weight"]) if t in live_for_plan.index else 0.0
-            picks_rows.append({"Action": "Buy", "Ticker": t, "OldWeight": 0.0, "NewWeight": new_w})
+            if new_w >= tol:
+                picks_rows.append({"Action": "Buy", "Ticker": t, "OldWeight": 0.0, "NewWeight": new_w})
         for t, old_w, new_w in signals["rebalance"]:
             picks_rows.append({"Action": "Rebalance", "Ticker": t, "OldWeight": old_w, "NewWeight": new_w})
         picks = pd.DataFrame(picks_rows)
@@ -521,6 +566,7 @@ with tab2:
         if hedge_details:
             hedge_weight = float(hedge_details.get("weight") or 0.0)
             corr = hedge_details.get("correlation")
+            overlap = hedge_details.get("overlap")
             breadth = hedge_details.get("breadth_pos_6m")
             qqq_above = hedge_details.get("qqq_above_200dma")
             hedge_reason = hedge_details.get("reason")
@@ -528,6 +574,10 @@ with tab2:
             help_bits = []
             if corr is not None:
                 help_bits.append(f"Correlation vs QQQ: {corr:.2f}")
+            elif overlap is not None:
+                help_bits.append(f"Correlation: n/a (overlap={int(overlap)})")
+            else:
+                help_bits.append("Correlation unavailable (insufficient overlap)")
             if qqq_above is not None:
                 help_bits.append("QQQ above 200DMA" if qqq_above >= 1 else "QQQ below 200DMA")
             if breadth is not None and not np.isnan(breadth):
@@ -690,19 +740,32 @@ with tab2:
 # ---------------------------
 with tab3:
     st.subheader("📈 Backtest (since 2017-07-01)")
-    if strategy_cum_gross is None or qqq_cum is None:
-        st.info("Click Generate to see backtest results.")
+    equity_strategy = _bt_to_series("equity_strategy")
+    equity_strategy_gross = _bt_to_series("equity_strategy_gross")
+    equity_strategy_net = _bt_to_series("equity_strategy_net")
+    equity_bench = _bt_to_series("equity_bench")
+    hybrid_tno_series = _bt_to_series("turnover")
+    rs = _bt_to_series("rets_strategy")
+    rb = _bt_to_series("rets_bench")
+
+    if equity_strategy.empty or equity_bench.empty:
+        st.info("Backtest artefacts unavailable.")
     else:
         hedge_details = st.session_state.get("latest_backtest_hedge", {})
         if hedge_details:
             hedge_weight = float(hedge_details.get("weight") or 0.0)
             corr = hedge_details.get("correlation")
+            overlap = hedge_details.get("overlap")
             breadth = hedge_details.get("breadth_pos_6m")
             qqq_above = hedge_details.get("qqq_above_200dma")
 
             help_bits = []
             if corr is not None:
                 help_bits.append(f"Correlation vs QQQ: {corr:.2f}")
+            elif overlap is not None:
+                help_bits.append(f"Correlation: n/a (overlap={int(overlap)})")
+            else:
+                help_bits.append("Correlation unavailable (insufficient overlap)")
             if qqq_above is not None:
                 help_bits.append("QQQ above 200DMA" if qqq_above >= 1 else "QQQ below 200DMA")
             if breadth is not None and not np.isnan(breadth):
@@ -715,88 +778,108 @@ with tab3:
                 delta="Active" if hedge_weight > 0 else "Inactive",
                 help=help_text,
             )
+            corr_text = (
+                f"{corr:.2f}" if corr is not None else (f"n/a (overlap={int(overlap)})" if overlap is not None else "n/a")
+            )
+            st.caption(f"Hedge correlation vs QQQ: {corr_text}")
 
         st.markdown("#### Key Performance (monthly series inferred)")
 
-        # --- KPI table ---
+        gross_curve = equity_strategy_gross if not equity_strategy_gross.empty else equity_strategy
+        net_curve = equity_strategy_net if not equity_strategy_net.empty else pd.Series(dtype=float)
+
         rows = []
-        rows.append(
-            backend.kpi_row(
-                "Strategy (Gross)",
-                strategy_cum_gross.pct_change(),
-                turnover_series=hybrid_tno,
-                avg_trade_size=AVG_TRADE_SIZE
+        if not gross_curve.empty:
+            rows.append(
+                backend.kpi_row(
+                    "Strategy (Gross)",
+                    gross_curve.pct_change(),
+                    turnover_series=hybrid_tno_series,
+                    avg_trade_size=AVG_TRADE_SIZE,
+                )
             )
-        )
-        if strategy_cum_net is not None and show_net:
+        if show_net and not equity_strategy_net.empty:
             rows.append(
                 backend.kpi_row(
                     "Strategy (Net of costs)",
-                    strategy_cum_net.pct_change(),
-                    turnover_series=hybrid_tno,
-                    avg_trade_size=AVG_TRADE_SIZE
+                    equity_strategy_net.pct_change(),
+                    turnover_series=hybrid_tno_series,
+                    avg_trade_size=AVG_TRADE_SIZE,
                 )
             )
         rows.append(
             backend.kpi_row(
                 "QQQ Benchmark",
-                qqq_cum.pct_change()
+                equity_bench.pct_change(),
             )
         )
 
-        kdf = pd.DataFrame(
-            rows,
-            columns=["Model", "Freq", "CAGR", "Sharpe", "Sortino", "Calmar", "MaxDD", "Trades/yr", "Turnover/yr (0.5×L1)", "Equity x"]
-        )
-        st.dataframe(kdf, use_container_width=True)
+        if rows:
+            kdf = pd.DataFrame(
+                rows,
+                columns=[
+                    "Model",
+                    "Freq",
+                    "CAGR",
+                    "Sharpe",
+                    "Sortino",
+                    "Calmar",
+                    "MaxDD",
+                    "Trades/yr",
+                    "Turnover/yr (0.5×L1)",
+                    "Equity x",
+                ],
+            )
+            st.dataframe(kdf, use_container_width=True)
 
-        # --- Enhanced Equity curves ---
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        # Equity curves
-        axes[0,0].plot(strategy_cum_gross.index, strategy_cum_gross.values, label="Strategy (Gross)", linewidth=2)
-        if strategy_cum_net is not None and show_net:
-            axes[0,0].plot(strategy_cum_net.index, strategy_cum_net.values, label="Strategy (Net)", linestyle=":", linewidth=2)
-        axes[0,0].plot(qqq_cum.index, qqq_cum.values, label="QQQ", linestyle="--", alpha=0.8)
-        axes[0,0].set_yscale("log")
-        axes[0,0].set_ylabel("Cumulative Growth (log)")
-        axes[0,0].set_title("Equity Curves")
-        axes[0,0].grid(True, ls="--", alpha=0.6)
-        axes[0,0].legend()
-        
-        # Drawdowns
-        base_series = strategy_cum_net if (strategy_cum_net is not None and show_net) else strategy_cum_gross
-        dd_strategy = backend.drawdown(base_series)
-        dd_qqq = backend.drawdown(qqq_cum)
-        
-        axes[0,1].fill_between(dd_strategy.index, dd_strategy.values, 0, alpha=0.3, color='red', label='Strategy')
-        axes[0,1].fill_between(dd_qqq.index, dd_qqq.values, 0, alpha=0.3, color='green', label='QQQ')
-        axes[0,1].set_ylabel("Drawdown")
-        axes[0,1].set_title("Drawdown Comparison")
-        axes[0,1].legend()
-        axes[0,1].grid(True, alpha=0.3)
-        
-        # Rolling Sharpe (12-month)
-        if len(base_series.pct_change().dropna()) >= 12:
-            rolling_returns = base_series.pct_change().dropna()
-            rolling_sharpe = rolling_returns.rolling(12).apply(
+
+        axes[0, 0].plot(gross_curve.index, gross_curve.values, label="Strategy (Gross)", linewidth=2)
+        if show_net and not equity_strategy_net.empty:
+            axes[0, 0].plot(
+                equity_strategy_net.index,
+                equity_strategy_net.values,
+                label="Strategy (Net)",
+                linestyle=":",
+                linewidth=2,
+            )
+        axes[0, 0].plot(equity_bench.index, equity_bench.values, label="QQQ", linestyle="--", alpha=0.8)
+        axes[0, 0].set_yscale("log")
+        axes[0, 0].set_ylabel("Cumulative Growth (log)")
+        axes[0, 0].set_title("Equity Curves")
+        axes[0, 0].grid(True, ls="--", alpha=0.6)
+        axes[0, 0].legend()
+
+        base_curve = equity_strategy
+        dd_strategy = backend.drawdown(base_curve)
+        dd_qqq = backend.drawdown(equity_bench)
+
+        axes[0, 1].fill_between(dd_strategy.index, dd_strategy.values, 0, alpha=0.3, color="red", label="Strategy")
+        axes[0, 1].fill_between(dd_qqq.index, dd_qqq.values, 0, alpha=0.3, color="green", label="QQQ")
+        axes[0, 1].set_ylabel("Drawdown")
+        axes[0, 1].set_title("Drawdown Comparison")
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+
+        base_returns = base_curve.pct_change().dropna()
+        if len(base_returns) >= 12:
+            rolling_sharpe = base_returns.rolling(12).apply(
                 lambda x: (x.mean() * 12) / (x.std() * np.sqrt(12) + 1e-9)
             ).dropna()
-            
-            axes[1,0].plot(rolling_sharpe.index, rolling_sharpe.values, linewidth=2, color='purple')
-            axes[1,0].axhline(y=1.0, color='orange', linestyle='--', alpha=0.7, label='Sharpe = 1.0')
-            axes[1,0].set_ylabel("Rolling 12M Sharpe")
-            axes[1,0].set_title("Strategy Consistency")
-            axes[1,0].legend()
-            axes[1,0].grid(True, alpha=0.3)
-        
-        # Turnover analysis
-        if hybrid_tno is not None and not hybrid_tno.empty:
-            axes[1,1].plot(hybrid_tno.index, hybrid_tno.values, color='brown', alpha=0.7)
-            axes[1,1].set_ylabel("Monthly Turnover (0.5×L1)")
-            axes[1,1].set_title("Trading Activity")
-            axes[1,1].grid(True, alpha=0.3)
-        
+            if not rolling_sharpe.empty:
+                axes[1, 0].plot(rolling_sharpe.index, rolling_sharpe.values, linewidth=2, color="purple")
+                axes[1, 0].axhline(y=1.0, color="orange", linestyle="--", alpha=0.7, label="Sharpe = 1.0")
+                axes[1, 0].set_ylabel("Rolling 12M Sharpe")
+                axes[1, 0].set_title("Strategy Consistency")
+                axes[1, 0].legend()
+                axes[1, 0].grid(True, alpha=0.3)
+
+        if not hybrid_tno_series.empty:
+            axes[1, 1].plot(hybrid_tno_series.index, hybrid_tno_series.values, color="brown", alpha=0.7)
+            axes[1, 1].set_ylabel("Monthly Turnover (0.5×L1)")
+            axes[1, 1].set_title("Trading Activity")
+            axes[1, 1].grid(True, alpha=0.3)
+
         plt.tight_layout()
         st.pyplot(fig)
 
@@ -804,18 +887,13 @@ with tab3:
             f"Trades/yr estimated from turnover (0.5×L1) assuming ~{AVG_TRADE_SIZE*100:.1f}% average single-leg trade."
         )
 
-        # ========= Monthly Net Returns =========
         st.subheader("📅 Monthly Net Returns (%)")
 
-        # Choose net if available (and user ticked 'show net'); else use gross
-        base_cum = strategy_cum_net if (strategy_cum_net is not None and show_net) else strategy_cum_gross
-
-        monthly_net = base_cum.pct_change().dropna() * 100  # %
+        monthly_net = base_returns * 100
         monthly_net = monthly_net[monthly_net.index >= pd.Timestamp("2017-07-01")]
 
         monthly_net_df = pd.DataFrame(monthly_net, columns=["Net Return (%)"])
 
-        # Robust index formatting: handle Datetime/Period or pre-formatted strings
         idx = monthly_net_df.index
         if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
             monthly_net_df.index = idx.strftime("%Y-%m")
@@ -834,15 +912,14 @@ with tab3:
             data=csv_bytes,
             file_name="monthly_net_returns.csv",
             mime="text/csv",
-            use_container_width=True
+            use_container_width=True,
         )
 
-        # Quick stats
-        m = (monthly_net / 100.0).astype(float)  # decimal
+        m = (monthly_net / 100.0).astype(float)
         if len(m) > 0:
             ann_cagr = (1 + m).prod() ** (12 / len(m)) - 1
-            ann_vol  = m.std() * (12 ** 0.5)
-            sharpe   = (m.mean() * 12) / (m.std() * (12 ** 0.5) + 1e-9)
+            ann_vol = m.std() * (12 ** 0.5)
+            sharpe = (m.mean() * 12) / (m.std() * (12 ** 0.5) + 1e-9)
             hit_rate = (m > 0).mean()
 
             st.markdown(
@@ -850,25 +927,26 @@ with tab3:
                 f"CAGR: **{ann_cagr:.2%}** • Vol: **{ann_vol:.2%}** • Sharpe: **{sharpe:.2f}** • Hit-rate: **{hit_rate:.1%}**"
             )
 
-        # ========= 12-Month Monte Carlo Projection =========
         st.subheader("🔮 12-Month Monte Carlo Projection")
         mc_results = st.session_state.get("mc_results")
         if not mc_results or "error" in mc_results:
             st.info("Monte Carlo projections unavailable.")
         else:
             percentiles = mc_results["percentiles"]
-            pct_table = pd.DataFrame({
-                "Percentile": [f"{int(k[1:])}th" for k in sorted(percentiles.keys(), key=lambda x: int(x[1:]))],
-                "Return": [f"{percentiles[k]:.1%}" for k in sorted(percentiles.keys(), key=lambda x: int(x[1:]))]
-            })
+            pct_table = pd.DataFrame(
+                {
+                    "Percentile": [f"{int(k[1:])}th" for k in sorted(percentiles.keys(), key=lambda x: int(x[1:]))],
+                    "Return": [f"{percentiles[k]:.1%}" for k in sorted(percentiles.keys(), key=lambda x: int(x[1:]))],
+                }
+            )
             st.table(pct_table)
 
             fig2, ax2 = plt.subplots(figsize=(10, 6))
             scenarios = mc_results["scenarios"]
-            ax2.hist(scenarios * 100.0, bins=50, alpha=0.7, density=True, color='skyblue', edgecolor='black')
+            ax2.hist(scenarios * 100.0, bins=50, alpha=0.7, density=True, color="skyblue", edgecolor="black")
             for level, pct_val in sorted(percentiles.items(), key=lambda x: int(x[0][1:])):
                 ax2.axvline(pct_val * 100, linestyle="--", linewidth=1, label=f"{level[1:]}th: {pct_val:.1%}")
-            ax2.axvline(0, color='red', linestyle='-', alpha=0.5, label='Break-even')
+            ax2.axvline(0, color="red", linestyle="-", alpha=0.5, label="Break-even")
             ax2.set_xlabel("12-month return (%)")
             ax2.set_ylabel("Probability Density")
             ax2.set_title("Monte Carlo Return Distribution")
@@ -1042,17 +1120,16 @@ with tab5:
 # ---------------------------
 with tab6:
     st.subheader("🏥 Strategy Health Monitor")
-    
-    if strategy_cum_net is None and strategy_cum_gross is None:
+
+    equity_strategy = _bt_to_series("equity_strategy")
+    equity_bench = _bt_to_series("equity_bench")
+
+    if equity_strategy.empty:
         st.info("Generate backtest first to see strategy health metrics.")
     else:
-        # Use net if available, otherwise gross
-        perf_series = strategy_cum_net if strategy_cum_net is not None else strategy_cum_gross
-        returns_series = perf_series.pct_change().dropna()
-        
-        # Get QQQ for comparison
-        qqq_returns = qqq_cum.pct_change().dropna() if qqq_cum is not None else None
-        
+        returns_series = equity_strategy.pct_change().dropna()
+        qqq_returns = equity_bench.pct_change().dropna() if not equity_bench.empty else None
+
         # Calculate health metrics (prefer auto-run snapshot if available)
         stored_health = st.session_state.get("latest_health_metrics")
         if isinstance(stored_health, dict) and stored_health:
@@ -1093,7 +1170,8 @@ with tab6:
         # Health diagnostics
         st.markdown("#### 🔍 Health Diagnostics")
         
-        issues = backend.diagnose_strategy_issues(returns_series, hybrid_tno)
+        turnover_series = _bt_to_series("turnover")
+        issues = backend.diagnose_strategy_issues(returns_series, turnover_series)
         
         if issues and issues[0] != "No significant issues detected":
             st.markdown("**⚠️ Detected Issues:**")
@@ -1184,13 +1262,7 @@ with tab7:
     except Exception:
         pass
 
-    turnover_series = None
-    try:
-        turnover_series = hybrid_tno
-        # Also stash for later refresh
-        st.session_state["hybrid_tno"] = hybrid_tno
-    except Exception:
-        turnover_series = st.session_state.get("hybrid_tno")
+    turnover_series = _bt_to_series("turnover")
 
     metrics = metrics or {}
 
