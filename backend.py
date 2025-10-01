@@ -55,6 +55,36 @@ except Exception:  # pragma: no cover - fallback if module layout changes
     def _sc_sanitize_tickers(tickers: Iterable[str]) -> list[str]:
         return sorted({(str(x).strip().upper()) for x in (tickers or []) if str(x).strip()})
 
+YF_ALIASES = {
+    "BRK.B": "BRK-B",
+    "BRK/A": "BRK-A",
+    "BF.B": "BF-B",
+    "BF/A": "BF-A",
+}
+
+
+def _alias_tickers(tickers: Iterable[str]) -> list[str]:
+    return [YF_ALIASES.get(str(t).strip().upper(), str(t).strip().upper()) for t in (tickers or [])]
+
+
+def _drop_recent_nan_columns(df: pd.DataFrame, window: int = 30) -> tuple[pd.DataFrame, list[str]]:
+    if df is None or df.empty:
+        return df, []
+    window = max(int(window), 1)
+    tail = df.tail(window)
+    if tail.empty:
+        return df, []
+    to_drop = [col for col in tail.columns if tail[col].isna().all()]
+    if to_drop:
+        logging.info(
+            "Dropping %d tickers with %d-day all-NaN tails: %s",
+            len(to_drop),
+            window,
+            ", ".join(to_drop[:10]),
+        )
+        df = df.drop(columns=to_drop, errors="ignore")
+    return df, to_drop
+
 warnings.filterwarnings("ignore")
 
 # Track the most recently classified market regime for downstream gating logic.
@@ -1244,6 +1274,52 @@ def enforce_caps_iteratively(
     w[w < 0] = 0.0
     return w
 
+
+def enforce_diversification(
+    w: pd.Series,
+    sector_map: dict[str, str] | None = None,
+    max_name_cap: float = 0.15,
+    target_top_n: int = 30,
+) -> pd.Series:
+    if w is None or w.empty:
+        return w
+
+    clipped = w.clip(upper=max_name_cap)
+    total = clipped.sum()
+    if total <= 0:
+        return clipped
+
+    scale = min(1.0, total)
+    if total > 0:
+        clipped = clipped * (scale / total)
+
+    hhi = float((clipped ** 2).sum()) if not clipped.empty else 0.0
+    if hhi <= 0.12 or len(clipped) >= target_top_n:
+        return clipped
+
+    expanded = clipped.sort_values(ascending=False)
+    if sector_map:
+        by_sector: dict[str, list[str]] = {}
+        for ticker in expanded.index:
+            sec = sector_map.get(ticker, "OTHER")
+            by_sector.setdefault(sec, []).append(ticker)
+        ordered: list[str] = []
+        while any(by_sector.values()):
+            for sec in list(by_sector.keys()):
+                bucket = by_sector.get(sec, [])
+                if not bucket:
+                    continue
+                ordered.append(bucket.pop(0))
+        expanded = expanded.reindex(ordered).dropna()
+
+    expanded = expanded.clip(upper=max_name_cap)
+    total = expanded.sum()
+    if total <= 0:
+        return expanded
+    scale = min(1.0, total)
+    return expanded * (scale / total)
+
+
 # --- Enhanced sector bucketing -----------------------------------------------
 
 def get_enhanced_sector_map(tickers: list[str], base_map: dict[str, str] | None = None) -> dict[str, str]:
@@ -2011,6 +2087,7 @@ _SECTOR_OVERRIDE_PATH = Path(__file__).with_name("sector_overrides.csv")
 
 # Directory for parquet-based caching of downloaded price data
 PARQUET_CACHE_DIR = Path(".parquet_cache")
+SNAPSHOT_DIR = Path(".bt_cache") / "snapshots"
 
 def _load_sector_overrides() -> Dict[str, str]:
     if _SECTOR_OVERRIDE_PATH.exists():
@@ -2273,6 +2350,50 @@ def _prepare_universe_for_backtest(
             vol   = vol[keep_cols + ["QQQ"]]
             sectors_map = {t: sectors_map.get(t, "Unknown") for t in keep_cols}
 
+    guardrails_info: dict[str, object] = {}
+    elig_prices, guardrails_info = _eligibility_guardrails(
+        close.drop(columns=["QQQ"], errors="ignore"),
+        min_count=25,
+        relax_once=True,
+        fallback_universe="SP500_ALL" if label == "Hybrid Top150" else None,
+    )
+    if guardrails_info.get("fallback_used"):
+        fallback_choice = str(guardrails_info["fallback_used"])
+        target_universe = "S&P500 (All)" if "SP500" in fallback_choice.upper() else fallback_choice
+        base_tickers, base_sectors, label = get_universe(target_universe)
+        tickers_fb = _sc_sanitize_tickers(base_tickers)
+        if "QQQ" not in tickers_fb:
+            tickers_fb.append("QQQ")
+        close_raw_fb, vol_raw_fb = fetch_price_volume(tickers_fb, start_date, end_date)
+        if close_raw_fb.empty:
+            return pd.DataFrame(), pd.DataFrame(), {}, label
+        close = close_raw_fb
+        vol = vol_raw_fb
+        sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns if t != "QQQ"}
+        elig_prices, guardrails_secondary = _eligibility_guardrails(
+            close.drop(columns=["QQQ"], errors="ignore"),
+            min_count=25,
+            relax_once=True,
+            fallback_universe=None,
+        )
+        for key, val in guardrails_secondary.items():
+            guardrails_info.setdefault(key, val)
+
+    if not elig_prices.empty:
+        cols = list(elig_prices.columns)
+        if "QQQ" in close.columns:
+            cols.append("QQQ")
+        close = close.loc[:, [c for c in cols if c in close.columns]]
+        if isinstance(vol, pd.DataFrame) and not vol.empty:
+            vol = vol.loc[:, [c for c in cols if c in vol.columns]]
+        sectors_map = {t: sectors_map.get(t, "Unknown") for t in elig_prices.columns}
+
+    if _HAS_ST:
+        try:
+            st.session_state["eligibility_guardrails_info"] = guardrails_info
+        except Exception:
+            pass
+
     # Ensure timezone-naive datetimes
     for _df in (close, vol):
         idx = pd.to_datetime(_df.index)
@@ -2280,6 +2401,40 @@ def _prepare_universe_for_backtest(
             _df.index = idx.tz_localize(None)
 
     return close, vol, sectors_map, label
+
+
+def _eligibility_guardrails(
+    prices: pd.DataFrame,
+    min_age_days: int = 270,
+    min_count: int = 25,
+    fallback_universe: str | None = None,
+    relax_once: bool = True,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    info: dict[str, object] = {}
+    df = _ensure_unique_sorted_index(prices)
+    if df.empty:
+        info["after_age_filter"] = 0
+        return df, info
+
+    tail_coverage = df.notna().rolling(min_age_days, min_periods=1).sum().iloc[-1]
+    age_ok = tail_coverage >= min_age_days
+    kept = df.loc[:, age_ok.index[age_ok]]
+    info["after_age_filter"] = int(kept.shape[1])
+
+    if kept.shape[1] < min_count and relax_once:
+        relaxed_days = max(int(min_age_days * 0.7), 90)
+        kept2 = df.ffill(limit=30)
+        tail_relaxed = kept2.notna().rolling(relaxed_days, min_periods=1).sum().iloc[-1]
+        age_ok2 = tail_relaxed >= relaxed_days
+        kept = kept2.loc[:, age_ok2.index[age_ok2]]
+        info["relaxed_once"] = True
+        info["after_relax"] = int(kept.shape[1])
+
+    if kept.shape[1] < min_count and fallback_universe:
+        info["fallback_used"] = fallback_universe
+
+    return kept, info
+
 
 # =========================
 # Data fetching (cache) - Enhanced with validation
@@ -2312,6 +2467,7 @@ def _resolve_fetch_start(start_date: str, end_date: Optional[str]) -> str:
 @st.cache_data(ttl=43200)
 def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
     """Download adj-close prices for tickers, validate/clean, and cache to disk & Streamlit."""
+    tickers = _alias_tickers(tickers)
     safe = _sc_sanitize_tickers(tickers)
     if "QQQ" not in safe:
         safe.append("QQQ")
@@ -2362,7 +2518,7 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
         if not frames:
             return pd.DataFrame()
-            
+
         data = pd.concat(frames, axis=1)
         data = _ensure_unique_sorted_index(data)
         result = data.dropna(axis=1, how="all")
@@ -2380,6 +2536,10 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
             if len(cols) == 0:
                 cols = cleaned_result.columns
             cleaned_result = cleaned_result.loc[:, cols]
+
+            cleaned_result, dropped_recent = _drop_recent_nan_columns(cleaned_result, window=30)
+            if dropped_recent:
+                logging.info("Guardrail: dropped tickers with missing trailing prices: %s", ", ".join(dropped_recent[:10]))
 
             universe_size = cleaned_result.shape[1]
             min_days = 90 if universe_size <= 200 else 150
@@ -2401,6 +2561,10 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
 
             _write_cached_dataframe(cleaned_result, cache_path)
             return _maybe_add_qqq(cleaned_result)
+
+        result, dropped_recent = _drop_recent_nan_columns(result, window=30)
+        if dropped_recent:
+            logging.info("Guardrail: dropped tickers with missing trailing prices: %s", ", ".join(dropped_recent[:10]))
 
         _write_cached_dataframe(result, cache_path)
         return _maybe_add_qqq(result)
@@ -2471,6 +2635,12 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     if len(v_cols) == 0:
                         v_cols = vol.columns
                     close = close.loc[:, c_cols]
+                    close, dropped_recent = _drop_recent_nan_columns(close, window=30)
+                    if dropped_recent:
+                        logging.info(
+                            "Guardrail: dropped tickers with missing trailing prices: %s",
+                            ", ".join(dropped_recent[:10]),
+                        )
                     close = close.sort_index().ffill(limit=5)
                     universe_size = close.shape[1]
                     min_days = 90 if universe_size <= 200 else 150
@@ -2503,6 +2673,12 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                     if len(v_cols) == 0:
                         v_cols = vol.columns
                     close = close.loc[:, c_cols]
+                    close, dropped_recent = _drop_recent_nan_columns(close, window=30)
+                    if dropped_recent:
+                        logging.info(
+                            "Guardrail: dropped tickers with missing trailing prices: %s",
+                            ", ".join(dropped_recent[:10]),
+                        )
                     close = close.sort_index().ffill(limit=5)
                     universe_size = close.shape[1]
                     min_days = 90 if universe_size <= 200 else 150
@@ -2593,6 +2769,12 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
         universe_size = cleaned_close.shape[1]
         min_days = 90 if universe_size <= 200 else 150
         cleaned_close = _keep_if_sufficient_history(cleaned_close, min_days=min_days)
+        cleaned_close, dropped_recent = _drop_recent_nan_columns(cleaned_close, window=30)
+        if dropped_recent:
+            logging.info(
+                "Guardrail: dropped tickers with missing trailing prices: %s",
+                ", ".join(dropped_recent[:10]),
+            )
 
         dropped = set(close.columns) - set(cleaned_close.columns)
         if dropped:
@@ -2618,6 +2800,12 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 cleaned_close.shape[1],
             )
             cleaned_close = _keep_if_sufficient_history(cleaned_close, min_days=60)
+            cleaned_close, dropped_recent_relaxed = _drop_recent_nan_columns(cleaned_close, window=30)
+            if dropped_recent_relaxed:
+                logging.info(
+                    "Guardrail: dropped tickers with missing trailing prices: %s",
+                    ", ".join(dropped_recent_relaxed[:10]),
+                )
             vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
 
         cleaned_close, vol_aligned = _maybe_add_qqq(cleaned_close, vol_aligned)
@@ -4346,6 +4534,25 @@ def generate_live_portfolio_isa_monthly(
             else:
                 decision = f"Health {health:.2f} < trigger {params['trigger']:.2f} — rebalancing to new targets."
 
+    diversification_applied = False
+    if not final_weights.empty and float(final_weights.sum() or 0.0) > 0:
+        enhanced_map_final = get_enhanced_sector_map(list(final_weights.index), base_map=sectors_map)
+        diversified = enforce_diversification(
+            final_weights,
+            enhanced_map_final,
+            max_name_cap=float(params.get("mom_cap", 0.25)),
+            target_top_n=int(params.get("mom_topn", 30)),
+        )
+        if not diversified.equals(final_weights):
+            final_weights = diversified
+            diversification_applied = True
+
+    if _HAS_ST:
+        try:
+            st.session_state["diversification_fallback_applied"] = diversification_applied
+        except Exception:
+            pass
+
     def _inject_hedge(weights: pd.Series) -> pd.Series:
         w = weights.copy() if weights is not None else pd.Series(dtype=float)
         if not isinstance(w, pd.Series):
@@ -4845,6 +5052,8 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
             st.warning(msg)
         else:
             logging.warning(msg)
+        if _HAS_ST:
+            st.session_state["explain_changes_missing"] = missing
         return pd.DataFrame()
 
     snap = _signal_snapshot_for_explain(prices, params)
@@ -4884,6 +5093,8 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
         })
 
     out = pd.DataFrame(rows)
+    if _HAS_ST:
+        st.session_state["explain_changes_missing"] = missing
     if out.empty:
         return out
 
@@ -5021,6 +5232,41 @@ def _classify_market_regime(metrics: Dict[str, float]) -> str:
     return "Risk-On"
 
 
+def _compute_regime_score(metrics: Dict[str, float]) -> tuple[float, Dict[str, float]]:
+    components: Dict[str, float] = {}
+
+    breadth = metrics.get("breadth_pos_6m")
+    if pd.notna(breadth):
+        components["breadth"] = float(np.clip(breadth, 0.0, 1.0) * 100.0)
+
+    vol10 = metrics.get("qqq_vol_10d")
+    if pd.notna(vol10):
+        components["volatility"] = float(np.clip(1.0 - (vol10 / 0.05), 0.0, 1.0) * 100.0)
+
+    vix_ts = metrics.get("vix_term_structure")
+    if pd.notna(vix_ts):
+        components["vix_ts"] = float(np.clip((vix_ts - 0.75) / (1.25 - 0.75), 0.0, 1.0) * 100.0)
+
+    trend = metrics.get("qqq_above_200dma")
+    if pd.notna(trend):
+        components["trend"] = 100.0 if float(trend) >= 1.0 else 25.0
+
+    slope = metrics.get("qqq_50dma_slope_10d")
+    if pd.notna(slope):
+        components["slope"] = float(np.clip((slope + 0.05) / 0.10, 0.0, 1.0) * 100.0)
+
+    if metrics.get("hy_oas_status") != "missing":
+        hy_oas = metrics.get("hy_oas")
+        if pd.notna(hy_oas):
+            components["hy_oas"] = float(np.clip((6.0 - hy_oas) / 4.0, 0.0, 1.0) * 100.0)
+
+    if not components:
+        return 50.0, {}
+
+    score = float(np.mean(list(components.values())))
+    return score, components
+
+
 def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, float]:
     """Enhanced regime metrics calculation"""
     if universe_prices_daily.empty:
@@ -5048,7 +5294,12 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
     hy_oas = _safe_fetch("BAMLH0A0HYM2")
 
     vix_ts = _vix_term_structure(vix, vix3m)
-    hy_oas_last = _safe_last(hy_oas)
+    hy_oas_status = "ok"
+    if hy_oas is None or hy_oas.dropna().empty:
+        hy_oas_last = np.nan
+        hy_oas_status = "missing"
+    else:
+        hy_oas_last = _safe_last(hy_oas)
 
     # Universe breadth above 200DMA (ignore tickers without sufficient history)
     above_flags: list[float] = []
@@ -5087,6 +5338,7 @@ def compute_regime_metrics(universe_prices_daily: pd.DataFrame) -> Dict[str, flo
         "qqq_50dma_slope_10d": qqq_slope_50,
         "vix_term_structure": vix_ts,
         "hy_oas": hy_oas_last,
+        "hy_oas_status": hy_oas_status,
     }
 
     used_metrics = {k: v for k, v in metrics.items() if pd.notna(v)}
@@ -5271,6 +5523,9 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     # Add regime label (uses existing helper which internally recomputes metrics)
     regime_label, _ = get_market_regime()
     metrics["regime"] = regime_label
+    regime_score, regime_components = _compute_regime_score(metrics)
+    metrics["regime_score"] = regime_score
+    metrics["regime_components"] = regime_components
 
     metrics["qqq_vol_10d"] = float(metrics.get("qqq_vol_10d") or 0.0)
     metrics["qqq_50dma_slope_10d"] = float(metrics.get("qqq_50dma_slope_10d") or 0.0)
@@ -5302,6 +5557,7 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     vol10 = metrics.get("qqq_vol_10d", 0.02)
     vix_ts = metrics.get("vix_term_structure", 1.0)
     hy_oas = metrics.get("hy_oas", 4.0)
+    hy_oas_status = metrics.get("hy_oas_status", "ok")
 
     vix_thresh = st.session_state.get("vix_ts_threshold", VIX_TS_THRESHOLD_DEFAULT)
     oas_thresh = st.session_state.get("hy_oas_threshold", HY_OAS_THRESHOLD_DEFAULT)
@@ -5314,14 +5570,14 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
         breadth < 0.35
         or vol10 > 0.045
         or vix_ts < vix_thresh
-        or hy_oas > oas_thresh
+        or (hy_oas_status != "missing" and hy_oas > oas_thresh)
     )
 
     risk_on = (
         breadth > 0.65
         and vol10 < 0.025
         and vix_ts >= vix_thresh
-        and hy_oas < max(0.0, oas_thresh - 1)
+        and (hy_oas_status == "missing" or hy_oas < max(0.0, oas_thresh - 1))
     )
 
     if risk_off:
@@ -5353,7 +5609,20 @@ def assess_market_conditions(as_of: date | None = None) -> Dict[str, Any]:
     except Exception as e:
         logging.warning("P03 failed to save assessment log", exc_info=True)
 
-    return {"metrics": metrics, "settings": settings, "universe": chosen_universe}
+    universe_map = {
+        "Hybrid Top150": "Hybrid150",
+        "S&P500 (All)": "SP500_ALL",
+        "NASDAQ100+": "NASDAQ100",
+    }
+    recommended_code = universe_map.get(chosen_universe, chosen_universe)
+
+    return {
+        "metrics": metrics,
+        "settings": settings,
+        "universe": chosen_universe,
+        "recommended_universe": recommended_code,
+        "regime_score": regime_score,
+    }
 
 # =========================
 # Assessment Logging
@@ -5724,6 +5993,20 @@ def summarize_health(
         result["override"] = "Recent Sharpe >= 0.6 with drawdown better than -12%"
     return result
 
+
+def trust_checks_summary(signals_ok: bool, construction_ok: bool, health_ok: bool) -> dict[str, object]:
+    score = int(bool(signals_ok)) + int(bool(construction_ok)) + int(bool(health_ok))
+    return {
+        "score": score,
+        "of": 3,
+        "checks": {
+            "signals": bool(signals_ok),
+            "construction": bool(construction_ok),
+            "health": bool(health_ok),
+        },
+    }
+
+
 def run_trust_checks(
     weights_df: pd.DataFrame | None,
     metrics: Dict[str, float] | None,
@@ -5769,8 +6052,9 @@ def run_trust_checks(
         _to_monthly(qqq_cum) if qqq_cum is not None else None
     )
 
-    score = sum(int(x["ok"]) for x in (sig, constr, health))
-    return {"score": score, "signal": sig, "construction": constr, "health": health}
+    summary = trust_checks_summary(sig.get("ok", False), constr.get("ok", False), health.get("ok", False))
+    summary["details"] = {"signal": sig, "construction": constr, "health": health}
+    return summary
 
 # =========================
 # Live performance tracking (Enhanced)
@@ -5813,6 +6097,57 @@ def calc_one_day_live_return(weights: pd.Series, daily_prices: pd.DataFrame) -> 
         return 0.0
     rets = aligned.pct_change().iloc[-1]
     return float((rets * weights.reindex(aligned.columns).fillna(0.0)).sum())
+
+
+def save_snapshot(snapshot: dict[str, object]) -> Path:
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+    weights_obj = snapshot.get("weights")
+    if isinstance(weights_obj, pd.Series):
+        weights_series = weights_obj.astype(float)
+    elif isinstance(weights_obj, dict):
+        weights_series = pd.Series(weights_obj, dtype=float)
+    else:
+        weights_series = pd.Series(dtype=float)
+
+    meta = {
+        "as_of": snapshot.get("as_of"),
+        "universe": snapshot.get("universe"),
+        "regime": snapshot.get("regime"),
+        "regime_score": float(snapshot.get("regime_score")) if snapshot.get("regime_score") is not None else np.nan,
+        "hedge_weight": float(snapshot.get("hedge_weight", 0.0) or 0.0),
+    }
+    params_json = json.dumps(snapshot.get("params", {}), default=float)
+
+    rows: list[dict[str, object]] = []
+    if weights_series.empty:
+        rows.append({**meta, "ticker": None, "weight": np.nan, "params": params_json})
+    else:
+        for ticker, weight in weights_series.items():
+            rows.append({**meta, "ticker": ticker, "weight": float(weight), "params": params_json})
+
+    df = pd.DataFrame(rows)
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
+    as_of = str(meta.get("as_of") or pd.Timestamp.today().strftime("%Y-%m"))
+    fname = f"snapshot_{as_of}_{stamp}.parquet"
+    path = SNAPSHOT_DIR / fname
+    df.to_parquet(path, index=False)
+    return path
+
+
+def undo_last_snapshot() -> bool:
+    if not SNAPSHOT_DIR.exists():
+        return False
+    files = sorted(SNAPSHOT_DIR.glob("*.parquet"))
+    if not files:
+        return False
+    try:
+        files[-1].unlink()
+        return True
+    except Exception:
+        logging.exception("Failed to remove last snapshot")
+        return False
+
 
 def record_live_snapshot(weights_df: pd.DataFrame, note: str = "") -> Dict[str, object]:
     try:

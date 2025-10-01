@@ -16,6 +16,43 @@ import backend  # all logic lives here
 AVG_TRADE_SIZE_DEFAULT = backend.AVG_TRADE_SIZE_DEFAULT
 HISTORY_YEARS_DEFAULT = 9
 
+# --- Regime binding / cool-down state ---
+UNIVERSE_COOLDOWN_MONTHS = 2
+
+UNIVERSE_LABEL_TO_CODE = {
+    "Hybrid Top150": "Hybrid150",
+    "NASDAQ100+": "NASDAQ100",
+    "S&P500 (All)": "SP500_ALL",
+}
+UNIVERSE_CODE_TO_LABEL = {v: k for k, v in UNIVERSE_LABEL_TO_CODE.items()}
+
+
+def _now_month():
+    return pd.Timestamp.today().to_period("M")
+
+
+def _allow_universe_switch(new_universe: str, regime_score: float) -> bool:
+    lock_until = st.session_state.get("universe_lock_until")
+    if lock_until and _now_month() < lock_until:
+        return regime_score <= 20 or regime_score >= 80
+    return True
+
+
+def _bind_universe_choice(recommended: str, regime_score: float):
+    current = st.session_state.get("universe_choice")
+    if current is None:
+        st.session_state["universe_choice"] = recommended
+        st.session_state["universe_lock_until"] = _now_month() + UNIVERSE_COOLDOWN_MONTHS
+        return
+    if current != recommended and _allow_universe_switch(recommended, regime_score):
+        st.session_state["universe_choice"] = recommended
+        st.session_state["universe_lock_until"] = _now_month() + UNIVERSE_COOLDOWN_MONTHS
+
+
+def _is_rebalance_day(today=None):
+    today = today or pd.Timestamp.today()
+    return today.day <= 2
+
 # ---------------------------
 # Page config
 # ---------------------------
@@ -30,14 +67,21 @@ st.caption("Enhanced composite momentum + mean reversion, with stickiness, secto
 st.sidebar.header("⚙️ Execution Settings")
 
 # Universe choice
+st.session_state.setdefault("universe_choice", "Hybrid Top150")
+st.session_state.setdefault("universe_lock_until", None)
+
 universe_choice = st.sidebar.selectbox(
     "Universe",
     options=["Hybrid Top150", "NASDAQ100+", "S&P500 (All)"],
     index=["Hybrid Top150", "NASDAQ100+", "S&P500 (All)"].index(
-        st.session_state.get("universe", "Hybrid Top150")
+        st.session_state.get("universe_choice", "Hybrid Top150")
     )
 )
-st.session_state["universe"] = universe_choice
+if universe_choice != st.session_state.get("universe_choice"):
+    st.session_state["universe_choice"] = universe_choice
+    st.session_state["universe_lock_until"] = _now_month() + UNIVERSE_COOLDOWN_MONTHS
+
+st.session_state["universe"] = st.session_state.get("universe_choice", universe_choice)
 
 # ISA preset defaults
 preset = backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
@@ -115,16 +159,24 @@ assess = st.button("Assess Market Conditions", key="assess_market")
 if assess:
     with st.spinner("Assessing market conditions…"):
         assessment = backend.assess_market_conditions()
+        st.session_state["latest_assessment"] = assessment
     st.write("### Market Metrics")
     st.json(assessment["metrics"])
     st.write("### Recommended Universe")
-    st.write(assessment.get("universe", st.session_state.get("universe")))
+    recommended_code = assessment.get("recommended_universe")
+    recommended_label = UNIVERSE_CODE_TO_LABEL.get(
+        recommended_code,
+        assessment.get("universe", st.session_state.get("universe_choice", "Hybrid Top150"))
+    )
+    regime_score = float(assessment.get("regime_score", 50))
+    _bind_universe_choice(recommended_label, regime_score)
+    st.session_state["universe"] = st.session_state.get("universe_choice", recommended_label)
+    st.write(recommended_label)
     st.write("### Recommended Settings")
     st.json(assessment["settings"])
     for k, v in assessment["settings"].items():
         st.session_state[k] = v
-    # ensure selected universe persists
-    st.session_state["universe"] = assessment.get("universe", st.session_state.get("universe"))
+    st.metric("Regime score", f"{regime_score:.0f}", help="0 (extreme risk-off) → 100 (strong risk-on)")
 
     # -------------------------
     # Assessment log & accuracy
@@ -198,6 +250,8 @@ mc_results = st.session_state.get("mc_results")
 # Generate
 # ===========================
 if go:
+    active_universe = st.session_state.get("universe_choice", st.session_state.get("universe", "Hybrid Top150"))
+    st.session_state["universe"] = active_universe
     with st.spinner("Building enhanced monthly-locked portfolio and running backtest…"):
         try:
             # ---- Live portfolio (monthly lock + stability + trigger + sector caps + enhancements)
@@ -251,7 +305,7 @@ if go:
                 min_dollar_volume=st.session_state.get("min_dollar_volume", 0),
                 show_net=st.session_state.get("show_net", True),
                 start_date=backtest_start_str,
-                universe_choice=st.session_state.get("universe", "Hybrid Top150"),
+                universe_choice=active_universe,
                 top_n=None if auto_optimize else preset["mom_topn"],
                 name_cap=None if auto_optimize else float(
                     st.session_state.get("name_cap", preset.get("mom_cap", 0.25))
@@ -315,7 +369,9 @@ if go:
 
         # save to session for Save button / persistence
         if live_raw is not None and not live_raw.empty:
-            st.session_state.latest_portfolio = live_raw.copy()
+            st.session_state.latest_portfolio = live_raw.drop(index=["QQQ"], errors="ignore").copy()
+        else:
+            st.session_state.pop("latest_portfolio", None)
 
         # Automatically run Monte Carlo projections using historical returns
         try:
@@ -333,6 +389,44 @@ if go:
             st.warning(f"Monte Carlo simulation failed: {e}")
             st.session_state.mc_results = {"error": str(e)}
 
+    success = live_raw is not None and not live_raw.empty
+    if success and _is_rebalance_day():
+        weights_series = (
+            live_raw["Weight"].astype(float).drop(index=["QQQ"], errors="ignore")
+            if "Weight" in live_raw.columns
+            else pd.Series(dtype=float)
+        )
+        last_assessment = st.session_state.get("latest_assessment", {})
+        metrics = last_assessment.get("metrics", {})
+        regime = metrics.get("regime")
+        regime_score = float(last_assessment.get("regime_score", metrics.get("regime_score", 50)))
+        params_cfg = st.session_state.get("auto_best_config")
+        resolved_params = params_cfg.copy() if isinstance(params_cfg, dict) else {
+            "name_cap": float(st.session_state.get("name_cap", preset.get("mom_cap", 0.25))),
+            "sector_cap": float(st.session_state.get("sector_cap", preset.get("sector_cap", 0.30))),
+            "stickiness_days": int(st.session_state.get("stickiness_days", preset.get("stability_days", 7))),
+            "mr_topn": preset.get("mr_topn"),
+            "mom_topn": preset.get("mom_topn"),
+            "mom_weight": preset.get("mom_w"),
+            "mr_weight": preset.get("mr_w"),
+        }
+        hedge_details = st.session_state.get("latest_live_hedge", {})
+        hedge_weight = float(hedge_details.get("weight") or 0.0)
+        snapshot_payload = {
+            "as_of": pd.Timestamp.today().strftime("%Y-%m"),
+            "universe": active_universe,
+            "regime": regime,
+            "regime_score": regime_score,
+            "params": resolved_params,
+            "weights": weights_series,
+            "hedge_weight": hedge_weight,
+        }
+        try:
+            backend.save_snapshot(snapshot_payload)
+            st.success("Auto-saved monthly snapshot.")
+        except Exception as exc:
+            st.warning(f"Snapshot save failed: {exc}")
+
 # ---------------------------
 # Tab 1: Rebalancing Plan
 # ---------------------------
@@ -341,7 +435,9 @@ with tab1:
     if live_raw is None or live_raw.empty:
         st.info("Click Generate to produce a live portfolio.")
     else:
-        signals = backend.diff_portfolios(prev_portfolio, live_raw, tol)
+        prev_for_plan = prev_portfolio.drop(index=["QQQ"], errors="ignore") if prev_portfolio is not None else prev_portfolio
+        live_for_plan = live_raw.drop(index=["QQQ"], errors="ignore")
+        signals = backend.diff_portfolios(prev_for_plan, live_for_plan, tol)
         if not any([signals["sell"], signals["buy"], signals["rebalance"]]):
             st.success("✅ No major rebalancing needed!")
         else:
@@ -357,7 +453,7 @@ with tab1:
                 st.markdown("### 🟢 New Buys")
                 if signals["buy"]:
                     for t in signals["buy"]:
-                        tgt = float(live_raw.loc[t, "Weight"]) if t in live_raw.index else 0.0
+                        tgt = float(live_for_plan.loc[t, "Weight"]) if t in live_for_plan.index else 0.0
                         st.write(f"- **{t}** — target {tgt:.2%}")
                 else:
                     st.write("None")
@@ -372,10 +468,10 @@ with tab1:
         # Build rebalancing plan for download
         picks_rows = []
         for t in signals["sell"]:
-            old_w = float(prev_portfolio.loc[t, "Weight"]) if prev_portfolio is not None and t in prev_portfolio.index else 0.0
+            old_w = float(prev_for_plan.loc[t, "Weight"]) if prev_for_plan is not None and t in prev_for_plan.index else 0.0
             picks_rows.append({"Action": "Sell", "Ticker": t, "OldWeight": old_w, "NewWeight": 0.0})
         for t in signals["buy"]:
-            new_w = float(live_raw.loc[t, "Weight"]) if t in live_raw.index else 0.0
+            new_w = float(live_for_plan.loc[t, "Weight"]) if t in live_for_plan.index else 0.0
             picks_rows.append({"Action": "Buy", "Ticker": t, "OldWeight": 0.0, "NewWeight": new_w})
         for t, old_w, new_w in signals["rebalance"]:
             picks_rows.append({"Action": "Rebalance", "Ticker": t, "OldWeight": old_w, "NewWeight": new_w})
@@ -404,6 +500,22 @@ with tab2:
         st.info(decision)
         if st.session_state.get("fallback_used"):
             st.warning("🛟 Fallback composite allocation applied (sector-spread safety net).")
+
+        guardrails_info = st.session_state.get("eligibility_guardrails_info", {})
+        if guardrails_info.get("fallback_used"):
+            fallback_label = UNIVERSE_CODE_TO_LABEL.get(str(guardrails_info.get("fallback_used")), str(guardrails_info.get("fallback_used")))
+            st.warning(f"Eligibility fallback engaged — switched universe to {fallback_label} for sufficient breadth.")
+        elif guardrails_info.get("relaxed_once"):
+            after_relax = guardrails_info.get("after_relax")
+            after_primary = guardrails_info.get("after_age_filter")
+            pieces = []
+            if after_primary is not None:
+                pieces.append(f"primary count {after_primary}")
+            if after_relax is not None:
+                pieces.append(f"after relax {after_relax}")
+            detail = ", ".join(pieces)
+            note = f" ({detail})" if detail else ""
+            st.caption(f"Eligibility guardrails relaxed once{note}.")
 
         hedge_details = st.session_state.get("latest_live_hedge", {})
         if hedge_details:
@@ -438,7 +550,12 @@ with tab2:
         if not is_rebalance_day:
             st.info("Preview only – portfolio not saved")
 
-        st.dataframe(live_disp, use_container_width=True)
+        hedge_ticker = "QQQ"
+        display_table = live_disp.drop(index=[hedge_ticker], errors="ignore")
+        st.dataframe(display_table, use_container_width=True)
+
+        if st.session_state.get("diversification_fallback_applied"):
+            st.info("Diversification fallback applied (max name cap 15%, HHI reduced).")
 
         dbg = st.session_state.get("eligibility_debug", [])
         if dbg:
@@ -448,11 +565,11 @@ with tab2:
         # Extract current weights safely
         try:
             if "Weight" in live_raw.columns:
-                weights = live_raw["Weight"].astype(float)
+                weights = live_raw["Weight"].astype(float).drop(index=[hedge_ticker], errors="ignore")
             else:
                 # fallback if the column is named differently or the table is the source
                 col_name = [c for c in live_disp.columns if c.lower() in ("weight", "weights")]
-                weights = live_disp[col_name[0]].astype(float) if col_name else None
+                weights = live_disp[col_name[0]].astype(float).drop(index=[hedge_ticker], errors="ignore") if col_name else None
         except Exception:
             weights = None
 
@@ -525,7 +642,13 @@ with tab2:
 
         # Gated save action – only visible on rebalance days
         if is_rebalance_day and st.button("💾 Save Portfolio"):
-            backend.save_portfolio_if_rebalance(live_raw, price_index)
+            live_to_save = live_raw.drop(index=[hedge_ticker], errors="ignore") if live_raw is not None else live_raw
+            backend.save_portfolio_if_rebalance(live_to_save, price_index)
+        if is_rebalance_day and st.button("↩️ Undo last snapshot"):
+            if backend.undo_last_snapshot():
+                st.success("Removed last saved snapshot.")
+            else:
+                st.info("No snapshot available to undo.")
 
     # -------------------------
     # Sector totals (current holdings)
@@ -752,7 +875,7 @@ with tab4:
     st.subheader("🧭 Enhanced Market Regime Analysis")
     try:
         label, metrics = backend.get_market_regime()
-        
+
         # Main regime display
         c1, c2, c3 = st.columns(3)
         c1.metric("Current Regime", label)
@@ -765,11 +888,15 @@ with tab4:
         c6.metric("6M Breadth", f"{metrics.get('breadth_pos_6m', np.nan)*100:.1f}%",
                  help="Percentage of stocks with positive 6-month returns")
 
-        c7, c8 = st.columns(2)
+        c7, c8, c9 = st.columns(3)
         c7.metric("VIX 3M/1M", f"{metrics.get('vix_term_structure', np.nan):.2f}",
                  help="Ratio of 3M to 1M VIX; <1 can signal stress")
         c8.metric("HY OAS (%)", f"{metrics.get('hy_oas', np.nan):.2f}%",
                  help="High-yield option-adjusted spread")
+        c9.metric("Regime score", f"{metrics.get('regime_score', 50):.0f}")
+
+        if str(metrics.get("hy_oas_status", "")).lower() == "missing":
+            st.warning("HY OAS unavailable — not used this run.")
 
         # Enhanced regime guidance
         breadth = float(metrics.get("breadth_pos_6m", np.nan))
@@ -832,6 +959,8 @@ with tab5:
                 end   = date.today().strftime("%Y-%m-%d")
                 start = (date.today() - relativedelta(months=14)).strftime("%Y-%m-%d")
                 px_union = backend.fetch_market_data(union_tickers, start, end)
+                if hasattr(backend, "_ensure_unique_sorted_index"):
+                    px_union = backend._ensure_unique_sorted_index(px_union)
             else:
                 px_union = pd.DataFrame()
 
@@ -843,6 +972,12 @@ with tab5:
                 backend.STRATEGY_PRESETS["ISA Dynamic (0.75)"]
             )
 
+            missing = st.session_state.get("explain_changes_missing", [])
+
+            if missing:
+                skipped = ", ".join(missing[:8]) + (" …" if len(missing) > 8 else "")
+                st.caption(f"Skipped symbols (no data): {skipped}")
+
             if expl is None or expl.empty:
                 st.info("No changes to explain.")
             else:
@@ -853,18 +988,18 @@ with tab5:
                         show[col] = show[col].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
                     if "Return" in col:
                         show[col] = show[col].map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
-                
+
                 st.dataframe(show, use_container_width=True)
-                
+
                 # Enhanced insights
                 if len(expl) > 0:
                     buys = expl[expl['Action'] == 'Buy']
                     sells = expl[expl['Action'] == 'Sell']
-                    
+
                     if len(buys) > 0:
                         avg_mom_rank_buys = buys['Mom Rank'].mean()
                         st.info(f"📈 **New Positions:** Average momentum rank {avg_mom_rank_buys:.1f} - targeting higher momentum stocks")
-                    
+
                     if len(sells) > 0:
                         st.info(f"📉 **Exits:** Removed {len(sells)} positions - likely due to momentum deterioration or stickiness requirements")
 
@@ -1052,18 +1187,24 @@ with tab7:
         sector_cap=sector_cap,
     )
 
+    details = report.get("details", {}) if isinstance(report, dict) else {}
+    signal = details.get("signal", {})
+    construction = details.get("construction", {})
+    health = details.get("health", {})
+
     # ======= Summary tiles =======
     c1, c2, c3 = st.columns(3)
-    c1.metric("Signal Alignment", "Pass" if report["signal"]["ok"] else "Check")
-    c2.metric("Construction", "Pass" if report["construction"]["ok"] else "Check")
-    c3.metric("Health", "Pass" if report["health"]["ok"] else "Check")
+    c1.metric("Signal Alignment", "Pass" if signal.get("ok") else "Check")
+    c2.metric("Construction", "Pass" if construction.get("ok") else "Check")
+    c3.metric("Health", "Pass" if health.get("ok") else "Check")
 
-    st.markdown(f"**Composite Score:** `{report['score']}/3` (3 = strong trust)")
+    total = report.get("of", 3)
+    st.markdown(f"**Composite Score:** `{report.get('score', 0)}/{total}` (3 = strong trust)")
 
     # ======= Detail: Signal =======
     with st.expander("🔎 Signal Alignment – details"):
-        st.write(f"Regime label: **{report['signal']['reason']}**")
-        checks = report["signal"]["checks"]
+        st.write(f"Regime label: **{signal.get('reason', 'n/a')}**")
+        checks = signal.get("checks")
         if checks:
             st.table(
                 pd.DataFrame([checks]).T.rename(columns={0: "OK?"})
@@ -1073,8 +1214,8 @@ with tab7:
 
     # ======= Detail: Construction =======
     with st.expander("🏗️ Portfolio Construction – details"):
-        st.json(report["construction"]["stats"])
-        issues = report["construction"]["issues"]
+        st.json(construction.get("stats", {}))
+        issues = construction.get("issues", [])
         if issues:
             st.warning("Issues:")
             for it in issues:
@@ -1084,8 +1225,8 @@ with tab7:
 
     # ======= Detail: Health =======
     with st.expander("🏥 Health – details"):
-        st.json(report["health"]["stats"])
-        issues = report["health"]["issues"]
+        st.json(health.get("stats", {}))
+        issues = health.get("issues", [])
         if issues:
             st.warning("Issues:")
             for it in issues:
