@@ -405,6 +405,11 @@ with tab2:
 
         st.dataframe(live_disp, use_container_width=True)
 
+        dbg = st.session_state.get("eligibility_debug", [])
+        if dbg:
+            st.caption("Eligibility pipeline (count after each gate):")
+            st.table(pd.DataFrame(dbg, columns=["Stage", "Count"]))
+
         # Extract current weights safely
         try:
             if "Weight" in live_raw.columns:

@@ -1,9 +1,11 @@
 # backend.py — Enhanced Hybrid Top150 / Composite Rank / Sector Caps / Stickiness / ISA lock
 from __future__ import annotations
 
+import logging
 import os, io, warnings, json, hashlib
 from typing import Optional, Tuple, Dict, List, Any, Callable, Iterable
 from dataclasses import replace, asdict
+
 import numpy as np
 import pandas as pd
 
@@ -3484,20 +3486,19 @@ def _build_isa_weights_fixed(
     comp_vec_full = comp_vec.copy()
 
     momz = blended_momentum_z(monthly)
-    filtered = comp_vec_full.copy()
+    mom_pool = comp_vec_full.copy()
     if isinstance(momz, pd.Series) and not momz.empty:
-        aligned_momz = momz.reindex(filtered.index)
+        aligned_momz = momz.reindex(mom_pool.index)
         valid_momz = aligned_momz.dropna()
         cutoff = 0.0
         if not valid_momz.empty:
             median_val = float(valid_momz.median())
             cutoff = max(median_val, 0.0) if np.isfinite(median_val) else 0.0
-        filtered = filtered[aligned_momz > cutoff].dropna()
-    if filtered.empty:
-        filtered = comp_vec_full.dropna()
-    top_m = filtered.nlargest(preset["mom_topn"]) if not filtered.empty else pd.Series(dtype=float)
+        mom_pool = mom_pool[aligned_momz > cutoff].dropna()
+    if mom_pool.empty:
+        mom_pool = comp_vec_full.dropna()
+    _debug_stage("positive-mom pool", mom_pool.index)
 
-    # Stickiness filter (keep names that have persisted in the top set)
     try:
         stable_iter = momentum_stable_names(
             daily_close,
@@ -3515,16 +3516,19 @@ def _build_isa_weights_fixed(
         else:
             raise
     stable_names = set(stable_iter)
-    if stable_names and not top_m.empty:
-        filtered = top_m.reindex([t for t in top_m.index if t in stable_names]).dropna()
-        if not filtered.empty:
-            top_m = filtered
+    if stable_names and not mom_pool.empty:
+        sticky_pool = mom_pool.reindex([t for t in mom_pool.index if t in stable_names]).dropna()
+        if not sticky_pool.empty:
+            mom_pool = sticky_pool
+    _debug_stage("stickiness/monthly lock", mom_pool.index)
 
-    if top_m.empty:
-        top_m = comp_vec_full.nlargest(preset["mom_topn"]) if not comp_vec_full.empty else pd.Series(dtype=float)
+    if mom_pool.empty:
+        mom_pool = comp_vec_full.dropna()
 
-    # Raw momentum weights (scaled by sleeve weight)
-    mom_raw = (top_m / top_m.sum()) * preset["mom_w"] if not top_m.empty and top_m.sum() > 0 else pd.Series(dtype=float)
+    mom_cap = float(preset.get("mom_cap", 0.25))
+    mom_weight = float(preset.get("mom_w", 0.0))
+    w_mom_core = _safe_momentum_weights(mom_pool, top_n=int(preset["mom_topn"]), name_cap=mom_cap)
+    mom_raw = w_mom_core * mom_weight if not w_mom_core.empty else pd.Series(dtype=float)
 
     # --- Mean Reversion Component (NO CAPS YET) ---
     st_ret  = daily_close.pct_change(preset["mr_lb"]).iloc[-1]
@@ -3534,9 +3538,9 @@ def _build_isa_weights_fixed(
     else:
         long_ma = daily_close.rolling(preset["mr_ma"]).mean().iloc[-1]
     quality = (daily_close.iloc[-1] > long_ma)
-    pool    = [t for t, ok in quality.items() if ok]
-    dips    = st_ret.reindex(pool).dropna().nsmallest(preset["mr_topn"])
-    mr_raw  = (pd.Series(1 / len(dips), index=dips.index) * preset["mr_w"]) if len(dips) > 0 else pd.Series(dtype=float)
+    _debug_stage("quality/MA gate", [t for t, ok in quality.items() if ok])
+    w_mr_core = _safe_mr_weights(st_ret, quality.astype(bool), top_n=int(preset["mr_topn"]))
+    mr_raw = w_mr_core * float(preset.get("mr_w", 0.0)) if not w_mr_core.empty else pd.Series(dtype=float)
 
     # --- Combine Components BEFORE Applying Caps ---
     combined_raw = mom_raw.add(mr_raw, fill_value=0.0)
@@ -3566,12 +3570,21 @@ def _build_isa_weights_fixed(
     final_weights = enforce_caps_iteratively(
         combined_raw.astype(float),
         enhanced_sectors,
-        name_cap=preset["mom_cap"],
+        name_cap=mom_cap,
         sector_cap=preset.get("sector_cap", 0.30),
         group_caps=group_caps,             # <- IMPORTANT: turns on the sub-caps
     )
 
-    return final_weights / final_weights.sum() if final_weights.sum() > 0 else final_weights
+    target_equity = float(preset.get("target_equity", 1.0))
+    final_weights = _rescale_and_floor(
+        final_weights.astype(float),
+        sectors_map,
+        name_cap=mom_cap,
+        sector_cap=preset.get("sector_cap", 0.30),
+        target_equity=target_equity,
+    )
+
+    return final_weights
 
 def check_constraint_violations(
     weights: pd.Series,
@@ -3656,6 +3669,20 @@ def _store_live_prune_meta(meta: Dict[str, Any]) -> None:
         return
 
 
+def _debug_stage(label: str, obj) -> None:
+    """Record eligibility counts for diagnostics without raising on failure."""
+
+    try:
+        n = len(obj)  # type: ignore[arg-type]
+    except Exception:
+        n = None
+    logging.info("ELIGIBILITY • %-22s -> %s", label, n)
+    try:
+        st.session_state.setdefault("eligibility_debug", []).append((label, n))
+    except Exception:
+        pass
+
+
 def _prune_price_history_with_meta(
     prices: Optional[pd.DataFrame],
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -3684,6 +3711,91 @@ def _prune_price_history_with_meta(
     }
     return pruned, meta
 
+
+def _safe_momentum_weights(scores: pd.Series, top_n: int, name_cap: float) -> pd.Series:
+    """Return non-empty weights even if all scores are non-positive."""
+
+    if scores is None or scores.empty:
+        return pd.Series(dtype=float)
+
+    ranked = scores.dropna().sort_values(ascending=False)
+    top = ranked.head(max(1, int(top_n)))
+
+    raw = top[top > 0]
+    if raw.empty or raw.sum() <= 0:
+        raw = top.clip(lower=0)
+
+    if raw.sum() <= 0:
+        raw = pd.Series(1.0 / len(top), index=top.index)
+    else:
+        raw = raw / raw.sum()
+
+    w = cap_weights(raw, cap=float(name_cap))
+    if w.sum() <= 0:
+        w = pd.Series(1.0 / len(raw), index=raw.index)
+
+    return (w / w.sum()).astype(float)
+
+
+def _safe_mr_weights(
+    short_window_returns: pd.Series,
+    quality_mask: pd.Series | None,
+    top_n: int,
+) -> pd.Series:
+    pool = (
+        quality_mask[quality_mask].index
+        if isinstance(quality_mask, pd.Series)
+        else short_window_returns.index
+    )
+    candidates = short_window_returns.reindex(pool).dropna()
+    if candidates.empty:
+        candidates = short_window_returns.dropna()
+    picks = candidates.nsmallest(max(1, int(top_n)))
+    if picks.empty:
+        return pd.Series(dtype=float)
+    return pd.Series(1.0 / len(picks), index=picks.index)
+
+
+def _rescale_and_floor(
+    weights: pd.Series,
+    sector_map: dict[str, str],
+    name_cap: float,
+    sector_cap: float,
+    target_equity: float = 0.85,
+    *,
+    respect_capacity: bool = False,
+) -> pd.Series:
+    if weights is None or weights.empty:
+        return pd.Series(dtype=float)
+
+    capped = cap_weights(weights.clip(lower=0).fillna(0.0), cap=float(name_cap))
+
+    try:
+        sectors = pd.Series({t: sector_map.get(t, "Other") for t in capped.index})
+        by_sector = capped.groupby(sectors).sum()
+        scale = {t: 1.0 for t in capped.index}
+        for s, tot in by_sector.items():
+            if tot > float(sector_cap):
+                shrink = float(sector_cap) / max(1e-12, float(tot))
+                for t in sectors.index[sectors == s]:
+                    scale[t] = shrink
+        capped = capped * pd.Series(scale)
+    except Exception:
+        pass
+
+    capped = capped.clip(lower=0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    total = float(capped.sum())
+    if total <= 0:
+        capped = pd.Series(1.0 / len(weights), index=weights.index)
+        total = float(capped.sum())
+
+    normalized = capped / total if total > 0 else capped
+    target = float(target_equity)
+    if respect_capacity and total > 0 and target > total:
+        target = total
+
+    return (normalized * target).astype(float)
+
 def generate_live_portfolio_isa_monthly(
     preset: Dict,
     prev_portfolio: Optional[pd.DataFrame],
@@ -3699,6 +3811,10 @@ def generate_live_portfolio_isa_monthly(
     within this routine.
     """
     _store_live_prune_meta({"eligible_tickers": [], "dropped_tickers": []})
+    try:
+        st.session_state["eligibility_debug"] = []
+    except Exception:
+        pass
 
     universe_choice = st.session_state.get("universe", "Hybrid Top150")
     base_params = STRATEGY_PRESETS["ISA Dynamic (0.75)"]
@@ -3715,7 +3831,8 @@ def generate_live_portfolio_isa_monthly(
     params["stickiness_days"] = int(stickiness_days)
     params["sector_cap"]     = float(sector_cap)
     params["mom_cap"]        = float(mom_cap)
-    
+    params.setdefault("target_equity", 0.85)
+
     # Universe base tickers + sectors
     base_tickers, base_sectors, label = get_universe(universe_choice)
     base_tickers = _sc_sanitize_tickers(base_tickers)
@@ -3730,8 +3847,8 @@ def generate_live_portfolio_isa_monthly(
     # Fetch prices
     start = (today - relativedelta(months=max(preset["mom_lb"], 12) + 8)).strftime("%Y-%m-%d")
     end   = today.strftime("%Y-%m-%d")
-    close, vol = fetch_price_volume(base_tickers, start, end)
-    if close.empty:
+    close_raw, vol_raw = fetch_price_volume(base_tickers, start, end)
+    if close_raw.empty:
         _store_live_prune_meta({
             "eligible_tickers": [],
             "dropped_tickers": [t for t in base_tickers if t != "QQQ"],
@@ -3741,53 +3858,124 @@ def generate_live_portfolio_isa_monthly(
     # Special: Hybrid Top150 → reduce by 60d median dollar volume
     sectors_map = base_sectors.copy()
     if label == "Hybrid Top150":
-        med = median_dollar_volume(close, vol, window=60).sort_values(ascending=False)
+        med = median_dollar_volume(close_raw, vol_raw, window=60).sort_values(ascending=False)
         top_list = med.head(150).index.tolist()
-        close = close[top_list]
-        vol   = vol[top_list]
-        sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns}
+        close_raw = close_raw[top_list]
+        vol_raw   = vol_raw[top_list]
+        sectors_map = {t: base_sectors.get(t, "Unknown") for t in close_raw.columns}
 
-    # Liquidity floor (optional)
-    if min_dollar_volume > 0:
-        keep = filter_by_liquidity(close, vol, min_dollar_volume)
-        if not keep:
-            _store_live_prune_meta({
-                "eligible_tickers": [],
-                "dropped_tickers": [t for t in close.columns if t != "QQQ"],
-            })
-            return None, None, "No tickers pass liquidity filter."
-        close = close[keep]
-        sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
+    close_base = close_raw.copy()
+    vol_base = vol_raw.copy()
+    sectors_base = sectors_map.copy()
 
-    # Fundamental quality filter
-    min_prof = st.session_state.get("min_profitability", 0.0)
-    max_lev = st.session_state.get("max_leverage", 2.0)
-    fundamentals = fetch_fundamental_metrics(close.columns.tolist())
-    keep = fundamental_quality_filter(fundamentals, min_profitability=min_prof, max_leverage=max_lev)
-    if not keep:
-        _store_live_prune_meta({
-            "eligible_tickers": [],
-            "dropped_tickers": [t for t in close.columns if t != "QQQ"],
-        })
-        return None, None, "No tickers pass quality filter."
-    close = close[keep]
-    close = _soft_prune_history(close, min_days=180, max_missing_frac=0.60)
-    if close.empty:
-        raise ValueError("No tickers have sufficient price history after applying filters.")
-    sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
+    min_prof = float(st.session_state.get("min_profitability", 0.0))
+    max_lev = float(st.session_state.get("max_leverage", 2.0))
 
-    close, prune_meta = _prune_price_history_with_meta(close)
-    sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
+    def _apply_primary_filters(
+        min_dollar_volume_val: float,
+        min_profitability_val: float,
+    ) -> tuple[pd.DataFrame, dict[str, str], dict[str, Any]]:
+        local_close = close_base.copy()
+        local_vol = vol_base.copy()
+        local_sectors = {t: sectors_base.get(t, "Unknown") for t in local_close.columns}
+
+        equities_initial = [t for t in local_close.columns if t != "QQQ"]
+        _debug_stage("universe (input)", equities_initial)
+
+        liq_pool = equities_initial
+        if min_dollar_volume_val > 0:
+            keep = filter_by_liquidity(
+                local_close.drop(columns=["QQQ"], errors="ignore"),
+                local_vol.drop(columns=["QQQ"], errors="ignore"),
+                float(min_dollar_volume_val),
+            )
+            keep = [t for t in keep if t in local_close.columns]
+            liq_pool = [t for t in keep if t != "QQQ"]
+            _debug_stage("liquidity gate", liq_pool)
+            if keep:
+                keep_ordered = list(dict.fromkeys(keep))
+                if "QQQ" in local_close.columns and "QQQ" not in keep_ordered:
+                    keep_ordered.append("QQQ")
+                local_close = local_close.loc[:, [c for c in keep_ordered if c in local_close.columns]]
+                local_vol = local_vol.reindex(columns=local_close.columns)
+                local_sectors = {t: sectors_base.get(t, "Unknown") for t in local_close.columns}
+            else:
+                local_close = local_close.iloc[:, :0]
+        else:
+            _debug_stage("liquidity gate", liq_pool)
+
+        if local_close.empty:
+            meta = {"eligible_tickers": [], "eligible_count": 0, "dropped_tickers": equities_initial}
+            return local_close, local_sectors, meta
+
+        fundamentals = fetch_fundamental_metrics([t for t in local_close.columns if t != "QQQ"])
+        keep_quality = fundamental_quality_filter(
+            fundamentals,
+            min_profitability=float(min_profitability_val),
+            max_leverage=max_lev,
+        )
+        quality_pool = [t for t in keep_quality if t in local_close.columns and t != "QQQ"]
+        _debug_stage("quality/MA gate", quality_pool if keep_quality else [t for t in local_close.columns if t != "QQQ"])
+        if keep_quality:
+            keep_ordered = list(dict.fromkeys(keep_quality))
+            if "QQQ" in local_close.columns and "QQQ" not in keep_ordered:
+                keep_ordered.append("QQQ")
+            local_close = local_close.loc[:, [c for c in keep_ordered if c in local_close.columns]]
+            local_vol = local_vol.reindex(columns=local_close.columns)
+            local_sectors = {t: sectors_base.get(t, "Unknown") for t in local_close.columns}
+        elif min_profitability_val > 0:
+            local_close = local_close.iloc[:, :0]
+
+        if local_close.empty:
+            meta = {"eligible_tickers": [], "eligible_count": 0, "dropped_tickers": equities_initial}
+            return local_close, local_sectors, meta
+
+        local_close = _soft_prune_history(local_close, min_days=180, max_missing_frac=0.60)
+        if local_close.empty:
+            meta = {"eligible_tickers": [], "eligible_count": 0, "dropped_tickers": equities_initial}
+            _debug_stage("data survivors", [])
+            return local_close, local_sectors, meta
+
+        pruned_close, prune_meta = _prune_price_history_with_meta(local_close)
+        if pruned_close.empty:
+            _debug_stage("data survivors", [])
+            return pruned_close, local_sectors, prune_meta
+
+        local_sectors = {t: sectors_base.get(t, "Unknown") for t in pruned_close.columns}
+        survivors = [t for t in pruned_close.columns if t != "QQQ"]
+        _debug_stage("data survivors", survivors)
+        return pruned_close, local_sectors, prune_meta
+
+    filtered_close, filtered_sectors, prune_meta = _apply_primary_filters(min_dollar_volume, min_prof)
+    survivors = [t for t in filtered_close.columns if t != "QQQ"]
+    survivor_cnt = len(survivors)
+    if survivor_cnt < 120 and (min_dollar_volume > 0 or min_prof > 0):
+        logging.info(
+            "Relaxing gates: %d survivors < 120 — removing liquidity/quality floors.",
+            survivor_cnt,
+        )
+        try:
+            st.session_state["eligibility_debug"] = []
+        except Exception:
+            pass
+        min_dollar_volume = 0
+        min_prof = 0.0
+        filtered_close, filtered_sectors, prune_meta = _apply_primary_filters(min_dollar_volume, min_prof)
+        survivors = [t for t in filtered_close.columns if t != "QQQ"]
+
+    close = filtered_close
+    sectors_map = filtered_sectors
     _store_live_prune_meta(prune_meta)
-    survivors = close.columns
+
+    survivors_index = close.columns
     want = pd.Index(sorted(set(base_tickers)))
-    have = survivors.intersection(want)
+    have = survivors_index.intersection(want)
     if have.empty:
         logging.warning(
             "Universe filter removed everything; using survivors only (%d names).",
-            len(survivors),
+            len(survivors_index),
         )
-        have = survivors
+        have = survivors_index
     close = close.loc[:, have]
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
     if close.empty:
@@ -3813,12 +4001,25 @@ def generate_live_portfolio_isa_monthly(
         close, params, sectors_map, use_enhanced_features=use_enhanced_features
     )
 
-    # Apply regime-based exposure scaling to final weights
-    if use_enhanced_features and len(close) > 0 and len(new_w) > 0:
+    target_equity = float(params.get("target_equity", 0.85))
+
+    # Apply regime-based exposure scaling to final weights (respecting floor)
+    if (
+        use_enhanced_features
+        and len(close) > 0
+        and isinstance(new_w, pd.Series)
+        and not new_w.empty
+    ):
         try:
             regime_exposure = get_regime_adjusted_exposure(regime_metrics)
-            new_w = new_w * float(regime_exposure)
-            new_w = new_w / new_w.sum() if new_w.sum() > 0 else new_w
+            regime_target = max(float(regime_exposure), target_equity)
+            new_w = _rescale_and_floor(
+                new_w,
+                sectors_map,
+                params["mom_cap"],
+                params.get("sector_cap", 0.30),
+                target_equity=regime_target,
+            )
         except Exception:
             logging.warning("R02 regime exposure scaling failed in allocation", exc_info=True)
 
@@ -3826,6 +4027,13 @@ def generate_live_portfolio_isa_monthly(
     if len(new_w) > 0:
         enhanced_sectors = get_enhanced_sector_map(list(new_w.index), base_map=sectors_map)
         group_caps = build_group_caps(enhanced_sectors)
+        new_w = enforce_caps_iteratively(
+            new_w.astype(float),
+            enhanced_sectors,
+            name_cap=params["mom_cap"],
+            sector_cap=params.get("sector_cap", 0.30),
+            group_caps=group_caps,
+        )
         violations = check_constraint_violations(
             new_w,
             sectors_map,
@@ -3834,24 +4042,35 @@ def generate_live_portfolio_isa_monthly(
             group_caps=group_caps,
         )
         if violations:
-            new_w = enforce_caps_iteratively(
-                new_w.astype(float),
-                enhanced_sectors,
-                name_cap=params["mom_cap"],
-                sector_cap=params.get("sector_cap", 0.30),
-                group_caps=group_caps,
+            raise ValueError(
+                f"Constraint violations after re-enforcing caps: {violations}"
             )
-            violations = check_constraint_violations(
-                new_w,
-                sectors_map,
-                params["mom_cap"],
-                params.get("sector_cap", 0.30),
-                group_caps=group_caps,
-            )
-            if violations:
-                raise ValueError(
-                    f"Constraint violations after re-enforcing caps: {violations}"
-                )
+
+    final_weights = new_w.astype(float) if isinstance(new_w, pd.Series) else pd.Series(dtype=float)
+
+    # Stickiness / lock fallback: ensure we carry forward previous allocation when needed
+    if (final_weights.empty or final_weights.sum() <= 0) and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
+        prev_w = prev_portfolio["Weight"].astype(float).drop(index=HEDGE_TICKER_LABEL, errors="ignore")
+        final_weights = _rescale_and_floor(
+            prev_w,
+            sectors_map,
+            params["mom_cap"],
+            params.get("sector_cap", 0.30),
+            target_equity=float(prev_w.sum() or target_equity),
+            respect_capacity=True,
+        )
+        decision = decision or "Fallback to previous allocation due to empty candidate set."
+
+    if not is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
+        prev_w = prev_portfolio["Weight"].astype(float).drop(index=HEDGE_TICKER_LABEL, errors="ignore")
+        final_weights = _rescale_and_floor(
+            prev_w,
+            sectors_map,
+            params["mom_cap"],
+            params.get("sector_cap", 0.30),
+            target_equity=float(prev_w.sum() or target_equity),
+            respect_capacity=True,
+        )
 
     hedge_weight = 0.0
     corr = np.nan
@@ -3886,8 +4105,6 @@ def generate_live_portfolio_isa_monthly(
     except Exception:
         logging.warning("H02 hedge overlay failed in allocation", exc_info=True)
 
-    final_weights = new_w.astype(float) if len(new_w) > 0 else new_w
-
     # Trigger vs previous portfolio (health of current)
     if is_monthly and prev_portfolio is not None and not prev_portfolio.empty and "Weight" in prev_portfolio.columns:
         monthly = close.resample("M").last()
@@ -3909,7 +4126,14 @@ def generate_live_portfolio_isa_monthly(
                     sector_cap,
                     group_caps=group_caps,
                 )
-                prev_w = prev_w / prev_w.sum()
+                prev_w = _rescale_and_floor(
+                    prev_w,
+                    sectors_map,
+                    mom_cap,
+                    sector_cap,
+                    target_equity=target_equity,
+                    respect_capacity=True,
+                )
                 violations = check_constraint_violations(
                     prev_w, sectors_map, mom_cap, sector_cap, group_caps=group_caps
                 )
@@ -4392,14 +4616,20 @@ def explain_portfolio_changes(prev_df: Optional[pd.DataFrame],
             f"Above {params['mr_ma']}DMA","Why"
         ])
 
-    prices_subset, missing = _safe_subset(daily_prices, all_tickers)
+    safe_cols = [c for c in all_tickers if c in daily_prices.columns]
+    missing = [c for c in all_tickers if c not in daily_prices.columns]
     if missing:
         preview = missing[:10]
         if len(missing) > 10:
             preview = preview + ["…"]
         logging.warning("Explainability: missing price columns for %s", preview)
 
-    prices = prices_subset.dropna(axis=1, how="all")
+    if safe_cols:
+        prices = daily_prices.loc[:, safe_cols].copy()
+    else:
+        prices = daily_prices.iloc[:, :0].copy()
+
+    prices = prices.dropna(axis=1, how="all")
     if prices.empty:
         msg = "Explainability unavailable: no overlapping price history for selected tickers."
         if _HAS_ST:
