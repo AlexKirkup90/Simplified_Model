@@ -805,15 +805,7 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
         }
 
     # ---- Normalize index (unique, sorted, datetime) ----
-    try:
-        if "_ensure_unique_sorted_index" in globals() and callable(globals()["_ensure_unique_sorted_index"]):
-            daily = _ensure_unique_sorted_index(daily)
-        else:
-            daily = daily.copy()
-            daily.index = pd.to_datetime(daily.index, errors="coerce")
-            daily = daily[~daily.index.duplicated(keep="last")].sort_index()
-    except Exception:
-        daily = daily.sort_index()
+    daily = _ensure_unique_sorted_index(daily)
 
     # ---- Prefer Polars path if engine switch exists and returns True ----
     use_polars = False
@@ -1793,10 +1785,23 @@ def _ensure_unique_sorted_index(df: pd.DataFrame) -> pd.DataFrame:
     try:
         out.index = pd.to_datetime(out.index, errors="coerce")
     except Exception:
-        pass
+        return out.sort_index()
 
     out = out[~out.index.duplicated(keep="last")]
     return out.sort_index()
+
+
+def _keep_if_sufficient_history(df: pd.DataFrame, min_days: int = 120) -> pd.DataFrame:
+    """Soft gate that keeps columns with at least ``min_days`` observations."""
+    if df is None or not hasattr(df, "empty") or df.empty:
+        return df
+
+    non_na = df.notna().sum(axis=0)
+    keep_cols = non_na[non_na >= int(min_days)].index
+    if len(keep_cols) == 0:
+        # Fall back to top-N by coverage to avoid returning an empty frame
+        keep_cols = non_na.sort_values(ascending=False).head(min(20, len(non_na))).index
+    return df.loc[:, keep_cols]
 
 
 def _normalize_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -2235,9 +2240,15 @@ def _prepare_universe_for_backtest(
         return pd.DataFrame(), pd.DataFrame(), {}, label
 
     # Enhanced data validation is now built into fetch_price_volume
-    close = close.loc[:, [c for c in close.columns if c in tickers]]
+    cols = close.columns.intersection(tickers)
+    if len(cols) == 0:
+        cols = close.columns
+    close = close.loc[:, cols]
     if isinstance(vol, pd.DataFrame) and not vol.empty:
-        vol = vol.loc[:, [c for c in vol.columns if c in tickers]]
+        v_cols = vol.columns.intersection(tickers)
+        if len(v_cols) == 0:
+            v_cols = vol.columns
+        vol = vol.loc[:, v_cols]
     sectors_map = {t: base_sectors.get(t, "Unknown") for t in close.columns if t != "QQQ"}
 
     if label == "Hybrid Top150":
@@ -2312,7 +2323,14 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
     cached = _read_cached_dataframe(cache_path)
     if cached is not None:
         cached = _ensure_unique_sorted_index(cached)
-        cached = cached.loc[:, cached.columns.intersection(safe)]
+        cols = cached.columns.intersection(safe)
+        if len(cols) == 0:
+            cols = cached.columns
+        cached = cached.loc[:, cols]
+        cached = cached.sort_index().ffill(limit=5)
+        universe_size = cached.shape[1]
+        min_days = 90 if universe_size <= 200 else 150
+        cached = _keep_if_sufficient_history(cached, min_days=min_days)
         return _maybe_add_qqq(cached)
 
     try:
@@ -2339,14 +2357,34 @@ def fetch_market_data(tickers: List[str], start_date: str, end_date: str) -> pd.
         data = pd.concat(frames, axis=1)
         data = _ensure_unique_sorted_index(data)
         result = data.dropna(axis=1, how="all")
-        result = result.loc[:, result.columns.intersection(safe)]
+        cols = result.columns.intersection(safe)
+        if len(cols) == 0:
+            cols = result.columns
+        result = result.loc[:, cols]
 
         if not result.empty:
             cleaned_result, cleaning_alerts, _, _ = validate_and_clean_market_data(
                 result, info=logging.info
             )
             cleaned_result = _ensure_unique_sorted_index(cleaned_result)
-            cleaned_result = cleaned_result.loc[:, cleaned_result.columns.intersection(safe)]
+            cols = cleaned_result.columns.intersection(safe)
+            if len(cols) == 0:
+                cols = cleaned_result.columns
+            cleaned_result = cleaned_result.loc[:, cols]
+
+            universe_size = cleaned_result.shape[1]
+            min_days = 90 if universe_size <= 200 else 150
+            cleaned_result = _keep_if_sufficient_history(cleaned_result, min_days=min_days)
+            cleaned_result = cleaned_result.sort_index().ffill(limit=5)
+
+            dropped = set(result.columns) - set(cleaned_result.columns)
+            if dropped:
+                logging.info(
+                    "Pruned %d tickers for insufficient history (min_days=%d). Examples: %s",
+                    len(dropped),
+                    min_days,
+                    ", ".join(list(dropped)[:10]),
+                )
 
             if cleaning_alerts:
                 for alert in cleaning_alerts[:2]:
@@ -2417,11 +2455,25 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                 if {"Close", "Volume"}.issubset(levels):
                     close = _normalize_ticker_columns(_ensure_unique_sorted_index(combined["Close"]))
                     vol = _normalize_ticker_columns(_ensure_unique_sorted_index(combined["Volume"]))
-                    close = close.loc[:, [c for c in close.columns if c in safe]]
-                    vol = vol.loc[:, [c for c in vol.columns if c in safe]]
+                    c_cols = close.columns.intersection(safe)
+                    if len(c_cols) == 0:
+                        c_cols = close.columns
+                    v_cols = vol.columns.intersection(safe)
+                    if len(v_cols) == 0:
+                        v_cols = vol.columns
+                    close = close.loc[:, c_cols]
+                    close = close.sort_index().ffill(limit=5)
+                    universe_size = close.shape[1]
+                    min_days = 90 if universe_size <= 200 else 150
+                    close = _keep_if_sufficient_history(close, min_days=min_days)
+                    vol = vol.loc[:, v_cols]
+                    vol = vol.reindex_like(close).fillna(0)
+                    for col in vol.columns:
+                        s = vol[col]
+                        if s.notna().any():
+                            vol[col] = s.clip(lower=0, upper=s.quantile(0.99))
                     close, vol = _maybe_add_qqq(close, vol)
-                    vol = vol.reindex(index=close.index)
-                    vol = vol.reindex(columns=close.columns)
+                    vol = vol.reindex_like(close).fillna(0)
                     _log_stage("cache-return", close, vol)
                     return close, vol
             else:
@@ -2435,11 +2487,25 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
                         vol = vol.to_frame()
                     close = _normalize_ticker_columns(_ensure_unique_sorted_index(close))
                     vol = _normalize_ticker_columns(_ensure_unique_sorted_index(vol))
-                    close = close.loc[:, [c for c in close.columns if c in safe]]
-                    vol = vol.loc[:, [c for c in vol.columns if c in safe]]
+                    c_cols = close.columns.intersection(safe)
+                    if len(c_cols) == 0:
+                        c_cols = close.columns
+                    v_cols = vol.columns.intersection(safe)
+                    if len(v_cols) == 0:
+                        v_cols = vol.columns
+                    close = close.loc[:, c_cols]
+                    close = close.sort_index().ffill(limit=5)
+                    universe_size = close.shape[1]
+                    min_days = 90 if universe_size <= 200 else 150
+                    close = _keep_if_sufficient_history(close, min_days=min_days)
+                    vol = vol.loc[:, v_cols]
+                    vol = vol.reindex_like(close).fillna(0)
+                    for col in vol.columns:
+                        s = vol[col]
+                        if s.notna().any():
+                            vol[col] = s.clip(lower=0, upper=s.quantile(0.99))
                     close, vol = _maybe_add_qqq(close, vol)
-                    vol = vol.reindex(index=close.index)
-                    vol = vol.reindex(columns=close.columns)
+                    vol = vol.reindex_like(close).fillna(0)
                     _log_stage("cache-return", close, vol)
                     return close, vol
         except Exception:
@@ -2486,53 +2552,75 @@ def fetch_price_volume(tickers: List[str], start_date: str, end_date: str) -> Tu
             logging.error("No close parts downloaded.")
             return pd.DataFrame(), pd.DataFrame()
 
-        close = _normalize_ticker_columns(_ensure_unique_sorted_index(pd.concat(close_parts, axis=1)))
-        vol = _normalize_ticker_columns(_ensure_unique_sorted_index(pd.concat(vol_parts, axis=1)))
+        close = _normalize_ticker_columns(
+            _ensure_unique_sorted_index(pd.concat(close_parts, axis=1).dropna(axis=1, how="all"))
+        )
+        vol = _normalize_ticker_columns(
+            _ensure_unique_sorted_index(pd.concat(vol_parts, axis=1))
+        )
 
-        close = close.loc[:, [c for c in close.columns if c in safe]].dropna(how="all", axis=1)
-        vol = vol.reindex(index=close.index)
-        vol = vol.reindex(columns=close.columns)
+        vol = vol.reindex_like(close).fillna(0)
+
+        c_cols = close.columns.intersection(safe)
+        v_cols = vol.columns.intersection(safe)
+        if len(c_cols) == 0:
+            c_cols = close.columns
+        if len(v_cols) == 0:
+            v_cols = vol.columns
+        close = close.loc[:, c_cols]
+        vol = vol.loc[:, v_cols]
 
         _log_stage("raw-combined", close, vol)
 
-        close = close.ffill(limit=MAX_FFILL_DAYS).bfill(limit=MAX_FFILL_DAYS)
-        vol = vol.clip(lower=0)
-        if vol.size > 0:
-            with np.errstate(all="ignore"):
-                vol = vol.apply(lambda s: s.clip(upper=s.quantile(VOL_CLIP_Q)) if s.notna().any() else s)
-
-        _log_stage("post-gapfill", close, vol)
-
-        close = _coverage_filter(close, MIN_COVERAGE_FRAC)
-        vol = vol.reindex(index=close.index)
-        vol = vol.reindex(columns=close.columns)
-
-        _log_stage("post-coverage", close, vol)
-
         try:
-            cleaned_close, alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
+            cleaned_close, close_alerts, _, _ = validate_and_clean_market_data(close, info=logging.info)
             cleaned_close = _normalize_ticker_columns(_ensure_unique_sorted_index(cleaned_close))
-            if alerts:
-                for alert in alerts[:3]:
-                    logging.info("Price cleaning alert: %s", alert)
         except Exception:
             logging.exception("validate_and_clean_market_data failed; using pre-cleaned close")
             cleaned_close = close
+            close_alerts = []
 
-        vol = vol.reindex(index=cleaned_close.index)
-        vol = vol.reindex(columns=cleaned_close.columns)
+        cleaned_close = cleaned_close.sort_index().ffill(limit=5)
+        universe_size = cleaned_close.shape[1]
+        min_days = 90 if universe_size <= 200 else 150
+        cleaned_close = _keep_if_sufficient_history(cleaned_close, min_days=min_days)
 
-        _log_stage("post-validate", cleaned_close, vol)
+        dropped = set(close.columns) - set(cleaned_close.columns)
+        if dropped:
+            logging.info(
+                "Pruned %d tickers for insufficient history (min_days=%d). Examples: %s",
+                len(dropped),
+                min_days,
+                ", ".join(list(dropped)[:10]),
+            )
+        if close_alerts:
+            for alert in close_alerts[:3]:
+                logging.info("Price/Volume cleaning: %s", alert)
 
-        cleaned_close, vol = _maybe_add_qqq(cleaned_close, vol)
-        vol = vol.reindex(index=cleaned_close.index)
-        vol = vol.reindex(columns=cleaned_close.columns)
+        vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
+        for col in vol_aligned.columns:
+            s = vol_aligned[col]
+            if s.notna().any():
+                vol_aligned[col] = s.clip(lower=0, upper=s.quantile(0.99))
 
-        combined_out = _ensure_unique_sorted_index(pd.concat({"Close": cleaned_close, "Volume": vol}, axis=1))
+        if cleaned_close.shape[1] < 8:
+            logging.warning(
+                "Few tickers survived (%d). Relaxing history gate to min_days=60.",
+                cleaned_close.shape[1],
+            )
+            cleaned_close = _keep_if_sufficient_history(cleaned_close, min_days=60)
+            vol_aligned = vol.reindex_like(cleaned_close).fillna(0)
+
+        cleaned_close, vol_aligned = _maybe_add_qqq(cleaned_close, vol_aligned)
+        vol_aligned = vol_aligned.reindex_like(cleaned_close).fillna(0)
+
+        combined_out = _ensure_unique_sorted_index(
+            pd.concat({"Close": cleaned_close, "Volume": vol_aligned}, axis=1)
+        )
         _write_cached_dataframe(combined_out, cache_path)
 
-        _log_stage("final-return", cleaned_close, vol)
-        return cleaned_close, vol
+        _log_stage("final-return", cleaned_close, vol_aligned)
+        return cleaned_close, vol_aligned
 
     except Exception as e:
         logging.exception("fetch_price_volume failed")
@@ -2941,6 +3029,8 @@ def compute_signal_panels(daily: pd.DataFrame) -> Dict[str, pd.DataFrame | pd.Se
             "ma200": empty_df,
             "dist200": empty_df,
         }
+
+    daily = _ensure_unique_sorted_index(daily)
 
     # If your codebase has a Polars engine switch, respect it; otherwise fallback to pandas.
     if "_use_polars_engine" in globals() and callable(globals()["_use_polars_engine"]) and _use_polars_engine():
@@ -3689,6 +3779,17 @@ def generate_live_portfolio_isa_monthly(
     close, prune_meta = _prune_price_history_with_meta(close)
     sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
     _store_live_prune_meta(prune_meta)
+    survivors = close.columns
+    want = pd.Index(sorted(set(base_tickers)))
+    have = survivors.intersection(want)
+    if have.empty:
+        logging.warning(
+            "Universe filter removed everything; using survivors only (%d names).",
+            len(survivors),
+        )
+        have = survivors
+    close = close.loc[:, have]
+    sectors_map = {t: sectors_map.get(t, "Unknown") for t in close.columns}
     if close.empty:
         return None, None, "No eligible tickers after price history pruning."
 
